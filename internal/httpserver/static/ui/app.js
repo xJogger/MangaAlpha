@@ -16,13 +16,14 @@
   // Per-user web UI display preferences, stored in Komga client settings under
   // the existing webui.* namespace so they travel across devices.
   // `type: 'int'` entries are bounded counts; `type: 'bool'` entries are toggles
-  // stored as "0"/"1" so they round-trip through the plain-text setting value.
+  // stored as "0"/"1"; `type: 'enum'` entries validate against `values`.
   const DISPLAY_PREFS = {
     shelfPageSize: { key: 'webui.shelf.pageSize', type: 'int', def: 36, min: 12, max: 120 },
     shelfInfiniteScroll: { key: 'webui.shelf.infiniteScroll', type: 'bool', def: false },
     homeContinueSize: { key: 'webui.home.continueSize', type: 'int', def: 8, min: 4, max: 24 },
     homeUpdatedSize: { key: 'webui.home.updatedSize', type: 'int', def: 18, min: 4, max: 36 },
     homeAddedSize: { key: 'webui.home.addedSize', type: 'int', def: 12, min: 4, max: 36 },
+    seriesBooksView: { key: 'webui.series.booksView', type: 'enum', values: ['list', 'cover'], def: 'list' },
   };
 
   function normalizeDisplayPref(spec, raw) {
@@ -31,13 +32,18 @@
       const text = String(raw == null ? '' : raw).trim().toLowerCase();
       return text === '1' || text === 'true' || text === 'on' || text === 'yes';
     }
+    if (spec.type === 'enum') {
+      const text = String(raw == null ? '' : raw).trim().toLowerCase();
+      return Array.isArray(spec.values) && spec.values.includes(text) ? text : spec.def;
+    }
     const n = Number.parseInt(raw, 10);
     if (!Number.isFinite(n)) return spec.def;
     return Math.min(spec.max, Math.max(spec.min, n));
   }
 
   function serializeDisplayPref(spec, value) {
-    return spec.type === 'bool' ? (value ? '1' : '0') : String(value);
+    if (spec.type === 'bool') return value ? '1' : '0';
+    return String(value);
   }
 
   function defaultDisplayPrefs() {
@@ -85,6 +91,8 @@
     theme: 'dark',
     displayPrefs: defaultDisplayPrefs(),
     displayPrefsUserId: '',
+    seriesBooksViewOverride: { seriesId: '', mode: '' },
+    bookCoverObserver: null,
     libraries: [],
     taxonomies: { loaded: false, genres: [], tags: [], publishers: [] },
     pollTimer: null,
@@ -109,6 +117,7 @@
   function resetDisplayPrefs() {
     state.displayPrefs = defaultDisplayPrefs();
     state.displayPrefsUserId = '';
+    state.seriesBooksViewOverride = { seriesId: '', mode: '' };
   }
 
   // Tear down both the infinite-scroll observer and any in-flight shelf request.
@@ -118,6 +127,10 @@
     if (state.shelfObserver) {
       try { state.shelfObserver.disconnect(); } catch (_) {}
       state.shelfObserver = null;
+    }
+    if (state.bookCoverObserver) {
+      try { state.bookCoverObserver.disconnect(); } catch (_) {}
+      state.bookCoverObserver = null;
     }
     if (state.shelfAbort) {
       try { state.shelfAbort.abort(); } catch (_) {}
@@ -135,6 +148,7 @@
   function displayPref(name) {
     const spec = DISPLAY_PREFS[name];
     if (spec.type === 'bool') return Boolean(state.displayPrefs[name]);
+    if (spec.type === 'enum') return normalizeDisplayPref(spec, state.displayPrefs[name]);
     return Math.min(spec.max, Math.max(spec.min, state.displayPrefs[name] || spec.def));
   }
 
@@ -187,12 +201,31 @@
     return value;
   }
 
+  const DISPLAY_PREF_ENUM_LABELS = {
+    seriesBooksView: { list: '列表模式', cover: '封面模式' },
+  };
+
   function displayPrefSelectHTML(name, label, values, unit = '项') {
+    const spec = DISPLAY_PREFS[name];
     const current = displayPref(name);
+    const id = `disp-pref-${name}`;
+    if (spec && spec.type === 'enum') {
+      const labelsMap = DISPLAY_PREF_ENUM_LABELS[name] || {};
+      const entries = Array.isArray(values) && values.length > 0 ? values : (spec.values || []);
+      return `<div class="pref-field">
+        <label for="${esc(id)}">${esc(label)}</label>
+        <select id="${esc(id)}" data-display-pref="${esc(name)}">
+          ${entries.map((entry) => {
+            const val = (entry && typeof entry === 'object') ? entry.value : entry;
+            const text = (entry && typeof entry === 'object') ? entry.label : (labelsMap[val] || String(val));
+            return `<option value="${esc(val)}" ${val === current ? 'selected' : ''}>${esc(text)}</option>`;
+          }).join('')}
+        </select>
+      </div>`;
+    }
     const options = values.slice();
     if (!options.includes(current)) options.push(current);
     options.sort((a, b) => a - b);
-    const id = `disp-pref-${name}`;
     return `<div class="pref-field">
       <label for="${esc(id)}">${esc(label)}</label>
       <select id="${esc(id)}" data-display-pref="${esc(name)}">
@@ -227,6 +260,9 @@
           const saved = await saveDisplayPref(name, raw);
           if (spec.type === 'bool') {
             toast(saved ? '已开启无限滚动浏览' : '已切换为分页浏览');
+          } else if (spec.type === 'enum') {
+            const labelsMap = DISPLAY_PREF_ENUM_LABELS[name] || {};
+            toast(`已保存显示偏好：${labelsMap[saved] || saved}`);
           } else {
             toast(`已保存显示偏好：${saved} 项`);
           }
@@ -252,6 +288,10 @@
         ${displayPrefSelectHTML('homeContinueSize', '首页「继续阅读」', [4, 8, 12, 18, 24])}
         ${displayPrefSelectHTML('homeUpdatedSize', '首页「最近更新」', [8, 12, 18, 24, 36])}
         ${displayPrefSelectHTML('homeAddedSize', '首页「最新入库」', [8, 12, 18, 24, 36])}
+        ${displayPrefSelectHTML('seriesBooksView', '系列默认卷视图', [
+          { value: 'list', label: '列表模式' },
+          { value: 'cover', label: '封面模式' },
+        ])}
       </div>
       ${displayPrefSwitchHTML('shelfInfiniteScroll', '书架无限滚动', '不显示分页按钮，滚动到列表底部时自动加载下一页；仅影响网页端的书架与浏览书库。')}
     </div>`;
@@ -836,6 +876,55 @@
         if (e.target.id === 'confirm-backdrop') finish(false);
       });
       focusIfDesktop(document.getElementById('confirm-cancel-btn'));
+    });
+  }
+
+  function xhrUploadFormData(url, formData, { onProgress } = {}) {
+    return new Promise((resolve, reject) => {
+      const XHR = typeof XMLHttpRequest === 'function'
+        ? XMLHttpRequest
+        : (typeof window !== 'undefined' && typeof window.XMLHttpRequest === 'function' ? window.XMLHttpRequest : null);
+      if (!XHR) {
+        reject(new Error('当前环境不支持文件上传'));
+        return;
+      }
+      const xhr = new XHR();
+      xhr.open('POST', url, true);
+      xhr.withCredentials = true;
+      xhr.setRequestHeader('X-FK115-UI', '1');
+      const uid = (state.auth && state.auth.userId) || '';
+      if (uid) xhr.setRequestHeader('X-FK115-User-Id', uid);
+      if (xhr.upload && typeof onProgress === 'function') {
+        xhr.upload.onprogress = (ev) => {
+          const loaded = Number((ev && ev.loaded) || 0);
+          const total = Number((ev && ev.total) || 0);
+          const computable = Boolean(ev && ev.lengthComputable && total > 0);
+          const pct = computable ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+          onProgress({ loaded, total, computable, pct });
+        };
+      }
+      xhr.onload = () => {
+        const raw = xhr.responseText || '';
+        let data = null;
+        try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(data);
+          return;
+        }
+        if (xhr.status === 409 && data && data.error === 'USER_CONTEXT_MISMATCH') {
+          if (typeof route === 'function') route();
+          reject(new Error('登录账号已切换，页面已刷新，请重试'));
+          return;
+        }
+        const msg = (data && typeof data === 'object' && (data.message || data.error)) || `上传失败 (${xhr.status})`;
+        const err = new Error(msg);
+        err.status = xhr.status;
+        err.code = data && data.error;
+        reject(err);
+      };
+      xhr.onerror = () => reject(new Error('网络错误，上传中断'));
+      xhr.onabort = () => reject(new Error('上传已取消'));
+      xhr.send(formData);
     });
   }
 
@@ -1835,6 +1924,156 @@
 
   // --- Series Detail View (/series/:id) ---
 
+  const SERIES_BOOKS_BATCH_SIZE = 60;
+
+  function resolveSeriesBooksViewMode(seriesID) {
+    const ov = (typeof state === 'object' && state && state.seriesBooksViewOverride) || null;
+    if (ov && ov.seriesId === seriesID && (ov.mode === 'list' || ov.mode === 'cover')) {
+      return ov.mode;
+    }
+    if (typeof displayPref === 'function') {
+      return displayPref('seriesBooksView') === 'cover' ? 'cover' : 'list';
+    }
+    return 'list';
+  }
+
+  function setSeriesBooksViewOverride(seriesID, mode) {
+    if (typeof state === 'object' && state) {
+      state.seriesBooksViewOverride = {
+        seriesId: String(seriesID || ''),
+        mode: mode === 'cover' ? 'cover' : 'list',
+      };
+    }
+  }
+
+  function bookCoverSourceLabel(src) {
+    switch (String(src || 'auto').toLowerCase()) {
+      case 'custom': return '自定义';
+      case 'ext': return '离线源';
+      case 'bangumi': return 'BGM';
+      case 'book': return '首页';
+      default: return '自动';
+    }
+  }
+
+  async function runBoundedConcurrency(items, limit, worker) {
+    const queue = items.slice();
+    const width = Math.max(1, Math.min(limit, queue.length));
+    const results = [];
+    const workers = Array.from({ length: width }, async () => {
+      while (queue.length > 0) {
+        const item = queue.shift();
+        results.push(await worker(item));
+      }
+    });
+    await Promise.all(workers);
+    return results;
+  }
+
+  function disconnectBookCoverObserver() {
+    if (typeof state === 'object' && state && state.bookCoverObserver) {
+      try { state.bookCoverObserver.disconnect(); } catch (_) {}
+      state.bookCoverObserver = null;
+    }
+  }
+
+  function bindSeriesBookCovers(root) {
+    disconnectBookCoverObserver();
+    if (!root) return;
+    const imgs = Array.from(root.querySelectorAll('img[data-src]'));
+    if (imgs.length === 0) return;
+    const revealImg = (img) => {
+      const src = img.getAttribute('data-src');
+      if (!src) return;
+      img.setAttribute('src', src);
+      img.src = src;
+      if (typeof img.removeAttribute === 'function') img.removeAttribute('data-src');
+    };
+    const IO = typeof IntersectionObserver === 'function'
+      ? IntersectionObserver
+      : (typeof window !== 'undefined' && typeof window.IntersectionObserver === 'function' ? window.IntersectionObserver : null);
+    if (!IO) {
+      imgs.forEach(revealImg);
+      return;
+    }
+    const observer = new IO((entries) => {
+      entries.forEach((entry) => {
+        if (entry && (entry.isIntersecting || (typeof entry.intersectionRatio === 'number' && entry.intersectionRatio > 0))) {
+          const target = entry.target;
+          if (target) {
+            revealImg(target);
+            if (typeof observer.unobserve === 'function') {
+              try { observer.unobserve(target); } catch (_) {}
+            }
+          }
+        }
+      });
+    }, { rootMargin: '240px 0px' });
+    imgs.forEach((img) => observer.observe(img));
+    if (typeof state === 'object' && state) state.bookCoverObserver = observer;
+  }
+
+  function openBatchMaintModal({ operation, targetType, targetId, targetName, onStarted }) {
+    const isCovers = operation === 'batch_book_covers';
+    const title = isCovers ? `批量刮削卷封面 · ${targetName}` : `批量读取 ComicInfo · ${targetName}`;
+    const desc = isCovers
+      ? '按各卷匹配元数据或离线库批量缓存单卷封面；默认严守零隐式拆包原则，不读取压缩包内部字节。'
+      : '显式按需流式读取漫画归档内的 ComicInfo.xml 并缓存卷元数据（自动跳过固实 RAR、加密包及手工锁定字段）。';
+    const extraLabel = isCovers
+      ? '对仍无封面卷顺带抽归档第 1 页（默认关）'
+      : '顺带补全第 1 页卷封面';
+    const forceLabel = isCovers
+      ? '强制重刮（覆盖已缓存封面，保留自定义封面）'
+      : '强制重读（重新解析已读过 ComicInfo 的卷）';
+    openModal({
+      title,
+      maxWidth: '520px',
+      bodyHTML: `
+        <p style="margin:0 0 12px;font-size:13px;color:var(--text-secondary);line-height:1.6">${esc(desc)}</p>
+        <div class="field">
+          <label class="check-row">
+            <input type="checkbox" id="bm-job-extra">
+            <span>${esc(extraLabel)}</span>
+          </label>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label class="check-row">
+            <input type="checkbox" id="bm-job-force">
+            <span>${esc(forceLabel)}</span>
+          </label>
+        </div>
+      `,
+      footHTML: `<button type="button" class="btn btn-primary" id="bm-job-start">开始执行</button>`,
+      onMount: () => {
+        const startBtn = document.getElementById('bm-job-start');
+        if (!startBtn) return;
+        startBtn.onclick = async () => {
+          if (startBtn.disabled) return;
+          startBtn.disabled = true;
+          const extraChecked = Boolean(document.getElementById('bm-job-extra')?.checked);
+          const forceChecked = Boolean(document.getElementById('bm-job-force')?.checked);
+          const payload = {
+            operation,
+            targetType,
+            targetId,
+            force: forceChecked,
+          };
+          if (isCovers) payload.fallbackPage1 = extraChecked;
+          else payload.extractPage1 = extraChecked;
+          try {
+            await api('/admin/api/maintenance-jobs', { method: 'POST', body: payload });
+            toast(isCovers ? '批量刮削卷封面任务已加入队列' : '批量读取 ComicInfo 任务已加入队列');
+            closeModal();
+            if (onStarted) onStarted();
+          } catch (err) {
+            if (startBtn.isConnected) startBtn.disabled = false;
+            toast(err.message, 'error');
+          }
+        };
+      },
+    });
+  }
+
   function pickStartBook(books) {
     if (!books || books.length === 0) return null;
     const bookLabel = (b) => (b.metadata && b.metadata.title) ? b.metadata.title : b.name;
@@ -1902,6 +2141,7 @@
   }
 
   function paintSeriesDetail(seriesID, detail, maintJobs) {
+    disconnectBookCoverObserver();
     const s = detail.series;
     const meta = s.metadata || {};
     const rawMeta = detail.rawMeta || {};
@@ -1910,6 +2150,11 @@
     const lib = detail.library || {};
     const title = meta.title || detail.originalName;
     document.title = `${title} · MangaAlpha`;
+
+    const effectiveOneShot = Boolean(detail.effectiveOneShot ?? s.oneshot);
+    const fileBackedOneShot = Boolean(detail.fileBackedOneShot ?? (effectiveOneShot && !detail.oneShotOverride));
+    const oneShotOverride = Boolean(detail.oneShotOverride);
+    const canToggleOneShot = Boolean(detail.canToggleOneShot);
 
     const startTarget = pickStartBook(books);
     const coverSrc = rawMeta.coverSource || 'auto';
@@ -1927,6 +2172,11 @@
     const content = document.getElementById('page-content');
     if (!content) return;
     const admin = isAdminUser();
+    const initialViewMode = resolveSeriesBooksViewMode(seriesID);
+    let visibleLimit = SERIES_BOOKS_BATCH_SIZE;
+    let batchSelectMode = false;
+    let batchBusy = false;
+    const selectedBookIds = new Set();
 
     content.innerHTML = `
       <div style="margin-bottom:12px;font-size:13px;color:var(--text-muted);overflow-wrap:anywhere;word-break:break-word">
@@ -1952,7 +2202,9 @@
           <div class="detail-badges">
             <span class="badge">${esc(lib.name || '书库')}</span>
             <span class="badge">${esc(providerLabel(lib.providerType, lib.webdavAccountName))}</span>
-            <span class="badge">${s.oneshot ? '单本 One-Shot' : `共 ${books.length} 册 · ${esc(detail.totalSize)}`}</span>
+            <span class="badge">${effectiveOneShot ? `单本 One-Shot · ${esc(detail.totalSize)}` : `共 ${books.length} 册 · ${esc(detail.totalSize)}`}</span>
+            ${fileBackedOneShot ? `<span class="badge badge-accent" title="来自全单篇书库或单篇子目录配置（只读）">文件型单篇</span>` : ''}
+            ${!fileBackedOneShot && oneShotOverride ? `<span class="badge badge-accent">手工单篇</span>` : ''}
             <span class="badge badge-accent">${esc(meta.status || 'ONGOING')}</span>
             ${rawMeta.isNsfw ? `<span class="badge badge-danger">NSFW</span>` : ''}
             ${meta.publisher ? `<a href="/libraries?publisher=${encodeURIComponent(meta.publisher)}" data-nav class="badge">${esc(meta.publisher)}</a>` : ''}
@@ -1984,9 +2236,19 @@
             ${startTarget ? `<a href="/reader/series/${encodeURIComponent(seriesID)}/book/${encodeURIComponent(startTarget.book.id)}?page=${startTarget.page}" class="btn btn-primary btn-lg btn-cta-read" title="${esc(startTarget.fullLabel)}"><span class="btn-part-fixed">▶\u00a0${esc(startTarget.prefix)}</span>${startTarget.middle ? `<span class="btn-part-ellipsis">${esc(startTarget.middle)}</span>` : ''}${startTarget.suffix ? `<span class="btn-part-fixed">${esc(startTarget.suffix)}</span>` : ''}</a>` : ''}
             ${admin ? `<button type="button" class="btn" id="series-generate-cover" data-maint="series_thumbnail" data-force="false"
               ${!books.length || maintJobs.some((j) => j.operation === 'series_thumbnail' && ['queued','running'].includes(j.status)) ? 'disabled' : ''}>生成首卷封面</button>
+            <button type="button" class="btn" id="btn-series-batch-covers" ${!books.length ? 'disabled' : ''}>批量刮削卷封面</button>
+            <button type="button" class="btn" id="btn-series-batch-comicinfo" ${!books.length ? 'disabled' : ''}>批量读取 ComicInfo</button>
             <button type="button" class="btn btn-bgm" id="btn-open-bgm">元数据匹配 / 绑定</button>
             ${hasExtBind ? `<button type="button" class="btn btn-sm btn-danger" id="btn-clear-ext-meta">解除扩展源绑定</button>` : ''}
-            <button type="button" class="btn" id="btn-edit-meta">编辑元数据</button>` : ''}
+            <button type="button" class="btn" id="btn-edit-meta">编辑元数据</button>
+            ${canToggleOneShot ? `
+              <label class="series-oneshot-toggle" for="series-oneshot-toggle" title="仅单卷普通系列可手工标记为单篇 (One-shot)">
+                <span>标记为单篇 (One-shot)</span>
+                <span class="switch">
+                  <input type="checkbox" id="series-oneshot-toggle" ${oneShotOverride ? 'checked' : ''}>
+                  <span class="switch-track" aria-hidden="true"></span>
+                </span>
+              </label>` : ''}` : ''}
             <button type="button" class="btn btn-sm" id="btn-series-collections">+ 收藏夹</button>
             <button type="button" class="btn btn-sm" id="btn-mark-series-read">全部标为已读</button>
             <button type="button" class="btn btn-sm" id="btn-reset-series-read">重置未读</button>
@@ -2040,52 +2302,315 @@
         </div>
       </details>` : ''}
 
-      <section class="card">
-        <div class="section-head" style="margin-bottom:12px">
-          <h2>卷列表（${books.length}）</h2>
+      <section class="card" id="series-books-section">
+        <div class="series-books-head">
+          <div class="section-head" style="margin-bottom:0">
+            <h2>卷列表（${books.length}）</h2>
+          </div>
+          <div class="series-books-toolbar">
+            ${books.length > 0 ? `<button type="button" class="btn btn-sm" id="btn-books-batch-toggle">批量选择</button>` : ''}
+            <div class="segmented series-view-segmented" role="group" aria-label="卷列表视图切换" title="仅当前页面临时切换，默认模式可在「账号设置」修改">
+              <button type="button" data-books-view="list" class="${initialViewMode === 'list' ? 'active' : ''}">列表</button>
+              <button type="button" data-books-view="cover" class="${initialViewMode === 'cover' ? 'active' : ''}">封面</button>
+            </div>
+          </div>
         </div>
-        <div class="volume-list">
-          ${books.map((b) => {
-            const ex = extras[b.id] || {};
-            const unionSrcs = Array.isArray(ex.unionSources) ? ex.unionSources : [];
-            const activeSrc = unionSrcs[0] || null;
-            const backupSrcs = unionSrcs.slice(1);
-            const rp = b.readProgress;
-            const pgCount = (b.media && b.media.pagesCount) || 0;
-            const startPg = rp && !rp.completed && rp.page > 0 ? rp.page : 1;
-            let stateBadge = `<span class="badge">未读</span>`;
-            if (rp && rp.completed) stateBadge = `<span class="badge badge-success">已读</span>`;
-            else if (rp && rp.page > 0) stateBadge = `<span class="badge badge-accent">第 ${rp.page}${pgCount > 0 ? ` / ${pgCount}` : ''} 页</span>`;
-            return `
-              <div class="volume-row">
-                <div class="volume-info">
-                  <div class="volume-title">
-                    <a href="/book/${encodeURIComponent(b.id)}" data-nav>${esc(b.name)}</a>
-                  </div>
-                  <div class="volume-meta">
-                    ${stateBadge}
-                    ${activeSrc ? `<span class="badge" title="当前生效读取层">${esc(activeSrc.sourceLibraryName)} · ${esc(providerLabel(activeSrc.providerType, activeSrc.webdavAccountName))}</span>` : ''}
-                    ${backupSrcs.length > 0 ? `<span class="badge" title="备用回退副本：${esc(backupSrcs.map((x) => `${x.sourceLibraryName} (${providerLabel(x.providerType, x.webdavAccountName)}, ${fmtBytes(x.sourceSize)})`).join(' / '))}">+${backupSrcs.length} 备用副本</span>` : ''}
-                    <span>${esc(b.size)}</span>
-                    <span>${pgCount > 0 ? `${pgCount} 页` : '未建页数索引'}</span>
-                    ${ex.indexStatus ? `<span>${esc(ex.indexStatus)}</span>` : ''}
-                    ${ex.downloadStat ? `<span>${esc(ex.downloadStat)}</span>` : ''}
-                    ${ex.inferredProgress ? `<span>${esc(ex.inferredProgress)}</span>` : ''}
-                  </div>
-                </div>
-                <div class="volume-actions">
-                  <a href="/reader/series/${encodeURIComponent(seriesID)}/book/${encodeURIComponent(b.id)}?page=${startPg}" class="btn btn-primary btn-sm">${rp && !rp.completed && rp.page > 0 ? '继续读' : '阅读'}</a>
-                  <a href="/book/${encodeURIComponent(b.id)}" data-nav class="btn btn-sm">详情</a>
-                  <button type="button" class="btn btn-sm" data-book-readlist="${esc(b.id)}" data-book-name="${esc(b.name)}">+ 列表</button>
-                  ${rp && rp.completed
-                    ? `<button type="button" class="btn btn-sm" data-book-unread="${esc(b.id)}">标未读</button>`
-                    : `<button type="button" class="btn btn-sm" data-book-read="${esc(b.id)}">标已读</button>`}
-                </div>
-              </div>`;
-          }).join('')}
-        </div>
+        <div id="series-books-body"></div>
       </section>
     `;
+
+    const booksBody = document.getElementById('series-books-body');
+    const syncBatchStatusUI = (visibleBooks) => {
+      const countEl = document.getElementById('series-books-selected-count');
+      if (countEl) countEl.textContent = String(selectedBookIds.size);
+      const clearBtn = document.getElementById('btn-books-select-clear');
+      if (clearBtn) clearBtn.disabled = batchBusy || selectedBookIds.size === 0;
+      const readBtn = document.getElementById('btn-books-batch-read');
+      if (readBtn) readBtn.disabled = batchBusy || selectedBookIds.size === 0;
+      const unreadBtn = document.getElementById('btn-books-batch-unread');
+      if (unreadBtn) unreadBtn.disabled = batchBusy || selectedBookIds.size === 0;
+      const selAllBtn = document.getElementById('btn-books-select-all');
+      if (selAllBtn) selAllBtn.disabled = batchBusy || visibleBooks.length === 0;
+    };
+
+    const renderSeriesBooksBody = () => {
+      if (!booksBody) return;
+      disconnectBookCoverObserver();
+      if (books.length === 0) {
+        booksBody.innerHTML = `<div class="empty-box">该系列暂无漫画文件。</div>`;
+        return;
+      }
+      const mode = resolveSeriesBooksViewMode(seriesID);
+      const visibleBooks = books.slice(0, visibleLimit);
+      const visibleCount = visibleBooks.length;
+      const remaining = Math.max(0, books.length - visibleCount);
+      const nextStep = Math.min(SERIES_BOOKS_BATCH_SIZE, remaining);
+
+      const batchBarHTML = batchSelectMode ? `
+        <div class="series-books-batch-bar" id="series-books-batch-bar">
+          <span>已选 <strong id="series-books-selected-count">${selectedBookIds.size}</strong> / ${visibleCount} 卷</span>
+          <div class="series-books-batch-actions">
+            <button type="button" class="btn btn-sm" id="btn-books-select-all" ${batchBusy || visibleCount === 0 ? 'disabled' : ''}>全选已展示</button>
+            <button type="button" class="btn btn-sm" id="btn-books-select-clear" ${batchBusy || selectedBookIds.size === 0 ? 'disabled' : ''}>清空选择</button>
+            <button type="button" class="btn btn-sm btn-primary" id="btn-books-batch-read" ${batchBusy || selectedBookIds.size === 0 ? 'disabled' : ''}>批量标为已读</button>
+            <button type="button" class="btn btn-sm" id="btn-books-batch-unread" ${batchBusy || selectedBookIds.size === 0 ? 'disabled' : ''}>批量标为未读</button>
+          </div>
+        </div>` : '';
+
+      const itemsHTML = mode === 'cover'
+        ? `<div class="poster-grid series-books-cover-grid">
+            ${visibleBooks.map((b) => {
+              const ex = extras[b.id] || {};
+              const rp = b.readProgress;
+              const pgCount = (b.media && b.media.pagesCount) || 0;
+              const startPg = rp && !rp.completed && rp.page > 0 ? rp.page : 1;
+              const bookTitle = (b.metadata && b.metadata.title) ? b.metadata.title : b.name;
+              const volNum = (b.metadata && b.metadata.number) ? String(b.metadata.number) : (b.number != null ? String(b.number) : '');
+              const isSelected = selectedBookIds.has(b.id);
+              let pct = 0;
+              let statusBadge = '';
+              if (rp && rp.completed) {
+                pct = 100;
+                statusBadge = `<span class="poster-badge-top-right is-read">已读</span>`;
+              } else if (rp && rp.page > 0) {
+                pct = pgCount > 0 ? Math.min(100, Math.round((rp.page / pgCount) * 100)) : 15;
+                statusBadge = `<span class="poster-badge-top-right">${rp.page}${pgCount > 0 ? `/${pgCount}` : '页'}</span>`;
+              }
+              return `
+                <div class="poster-card book-poster-card${isSelected ? ' is-selected' : ''}" data-book-card="${esc(b.id)}">
+                  <div class="poster-thumb">
+                    <a href="/book/${encodeURIComponent(b.id)}" data-nav class="book-poster-link">
+                      <img class="book-cover-lazy" data-src="/api/v1/books/${encodeURIComponent(b.id)}/thumbnail?v=${state.coverVer}" loading="lazy" alt="${esc(bookTitle)}">
+                    </a>
+                    ${batchSelectMode ? `<label class="book-poster-select" title="选择此卷"><input type="checkbox" data-book-select="${esc(b.id)}" ${isSelected ? 'checked' : ''}></label>` : ''}
+                    ${volNum ? `<span class="poster-badge-top-left book-vol-badge${batchSelectMode ? ' has-batch-check' : ''}">#${esc(volNum)}</span>` : ''}
+                    ${statusBadge}
+                    ${pct > 0 ? `<div class="poster-progress-bar"><span style="width:${pct}%"></span></div>` : ''}
+                  </div>
+                  <div class="poster-body">
+                    <a href="/book/${encodeURIComponent(b.id)}" data-nav class="poster-title" title="${esc(bookTitle)}">${esc(bookTitle)}</a>
+                    <div class="poster-sub" title="${esc(b.name)}">${esc(b.size)}${pgCount > 0 ? ` · ${pgCount} 页` : ''}${ex.comicInfoStatus === 'parsed' ? ' · ComicInfo' : ''}</div>
+                    <div class="book-poster-actions">
+                      <a href="/reader/series/${encodeURIComponent(seriesID)}/book/${encodeURIComponent(b.id)}?page=${startPg}" class="btn btn-primary btn-sm">${rp && !rp.completed && rp.page > 0 ? '继续读' : '阅读'}</a>
+                      <a href="/book/${encodeURIComponent(b.id)}" data-nav class="btn btn-sm">详情</a>
+                      ${rp && rp.completed
+                        ? `<button type="button" class="btn btn-sm" data-book-unread="${esc(b.id)}">未读</button>`
+                        : `<button type="button" class="btn btn-sm" data-book-read="${esc(b.id)}">已读</button>`}
+                    </div>
+                  </div>
+                </div>`;
+            }).join('')}
+          </div>`
+        : `<div class="volume-list">
+            ${visibleBooks.map((b) => {
+              const ex = extras[b.id] || {};
+              const unionSrcs = Array.isArray(ex.unionSources) ? ex.unionSources : [];
+              const activeSrc = unionSrcs[0] || null;
+              const backupSrcs = unionSrcs.slice(1);
+              const rp = b.readProgress;
+              const pgCount = (b.media && b.media.pagesCount) || 0;
+              const startPg = rp && !rp.completed && rp.page > 0 ? rp.page : 1;
+              const bookTitle = (b.metadata && b.metadata.title) ? b.metadata.title : b.name;
+              const isSelected = selectedBookIds.has(b.id);
+              let stateBadge = `<span class="badge">未读</span>`;
+              if (rp && rp.completed) stateBadge = `<span class="badge badge-success">已读</span>`;
+              else if (rp && rp.page > 0) stateBadge = `<span class="badge badge-accent">第 ${rp.page}${pgCount > 0 ? ` / ${pgCount}` : ''} 页</span>`;
+              return `
+                <div class="volume-row${isSelected ? ' is-selected' : ''}" data-book-row="${esc(b.id)}">
+                  ${batchSelectMode ? `<label class="book-row-check" title="选择此卷"><input type="checkbox" data-book-select="${esc(b.id)}" ${isSelected ? 'checked' : ''}></label>` : ''}
+                  <div class="volume-info">
+                    <div class="volume-title">
+                      <a href="/book/${encodeURIComponent(b.id)}" data-nav>${esc(bookTitle)}</a>
+                    </div>
+                    <div class="volume-meta">
+                      ${stateBadge}
+                      ${bookTitle !== b.name ? `<span title="原始文件名">${esc(b.name)}</span>` : ''}
+                      ${ex.comicInfoStatus === 'parsed' ? `<span class="badge badge-success">ComicInfo</span>` : ''}
+                      ${ex.hasCustomCover ? `<span class="badge badge-accent">自定义封面</span>` : ''}
+                      ${ex.coverSource && ex.coverSource !== 'auto' ? `<span class="badge">封面：${esc(bookCoverSourceLabel(ex.coverSource))}</span>` : ''}
+                      ${ex.numberSortExplicit ? `<span class="badge">自定义排序</span>` : ''}
+                      ${activeSrc ? `<span class="badge" title="当前生效读取层">${esc(activeSrc.sourceLibraryName)} · ${esc(providerLabel(activeSrc.providerType, activeSrc.webdavAccountName))}</span>` : ''}
+                      ${backupSrcs.length > 0 ? `<span class="badge" title="备用回退副本：${esc(backupSrcs.map((x) => `${x.sourceLibraryName} (${providerLabel(x.providerType, x.webdavAccountName)}, ${fmtBytes(x.sourceSize)})`).join(' / '))}">+${backupSrcs.length} 备用副本</span>` : ''}
+                      <span>${esc(b.size)}</span>
+                      <span>${pgCount > 0 ? `${pgCount} 页` : '未建页数索引'}</span>
+                      ${ex.indexStatus ? `<span>${esc(ex.indexStatus)}</span>` : ''}
+                      ${ex.downloadStat ? `<span>${esc(ex.downloadStat)}</span>` : ''}
+                      ${ex.inferredProgress ? `<span>${esc(ex.inferredProgress)}</span>` : ''}
+                    </div>
+                  </div>
+                  <div class="volume-actions">
+                    <a href="/reader/series/${encodeURIComponent(seriesID)}/book/${encodeURIComponent(b.id)}?page=${startPg}" class="btn btn-primary btn-sm">${rp && !rp.completed && rp.page > 0 ? '继续读' : '阅读'}</a>
+                    <a href="/book/${encodeURIComponent(b.id)}" data-nav class="btn btn-sm">详情</a>
+                    <button type="button" class="btn btn-sm" data-book-readlist="${esc(b.id)}" data-book-name="${esc(bookTitle)}">+ 列表</button>
+                    ${rp && rp.completed
+                      ? `<button type="button" class="btn btn-sm" data-book-unread="${esc(b.id)}">标未读</button>`
+                      : `<button type="button" class="btn btn-sm" data-book-read="${esc(b.id)}">标已读</button>`}
+                  </div>
+                </div>`;
+            }).join('')}
+          </div>`;
+
+      const moreBarHTML = remaining > 0 ? `
+        <div class="series-books-more-bar" id="series-books-more-bar">
+          <span>已显示 <strong>${visibleCount}</strong> / ${books.length} 卷</span>
+          <button type="button" class="btn btn-sm btn-primary" id="btn-books-load-more">加载更多 ${nextStep} 卷</button>
+          <button type="button" class="btn btn-sm" id="btn-books-show-all">显示全部</button>
+        </div>` : (books.length > SERIES_BOOKS_BATCH_SIZE ? `
+        <div class="series-books-more-bar" id="series-books-more-bar">
+          <span>已显示全部 <strong>${books.length}</strong> 卷</span>
+        </div>` : '');
+
+      booksBody.innerHTML = batchBarHTML + itemsHTML + moreBarHTML;
+
+      if (mode === 'cover') {
+        bindSeriesBookCovers(booksBody);
+      }
+
+      const runBatchProgress = async (completed) => {
+        if (batchBusy || selectedBookIds.size === 0) return;
+        const seq = routeSeq;
+        const ids = Array.from(selectedBookIds);
+        batchBusy = true;
+        syncBatchStatusUI(visibleBooks);
+        const results = await runBoundedConcurrency(ids, 4, async (bid) => {
+          try {
+            if (completed) {
+              await api(`/api/v1/books/${encodeURIComponent(bid)}/read-progress`, { method: 'PATCH', body: { completed: true } });
+            } else {
+              await api(`/api/v1/books/${encodeURIComponent(bid)}/read-progress`, { method: 'DELETE' });
+            }
+            return { bid, ok: true };
+          } catch (err) {
+            return { bid, ok: false, err };
+          }
+        });
+        batchBusy = false;
+        if (seq !== routeSeq) return;
+        let okCount = 0;
+        let failCount = 0;
+        const bookMap = new Map(books.map((item) => [item.id, item]));
+        results.forEach((r) => {
+          if (r.ok) {
+            okCount += 1;
+            selectedBookIds.delete(r.bid);
+            const target = bookMap.get(r.bid);
+            if (target) {
+              if (completed) {
+                const pages = (target.media && target.media.pagesCount) || (target.readProgress && target.readProgress.page) || 1;
+                target.readProgress = { completed: true, page: pages };
+              } else {
+                target.readProgress = null;
+              }
+            }
+          } else {
+            failCount += 1;
+          }
+        });
+        if (failCount > 0) {
+          toast(`批量处理完成：成功 ${okCount} 卷，失败 ${failCount} 卷`, 'error');
+        } else {
+          toast(completed ? `已将 ${okCount} 卷标为已读` : `已将 ${okCount} 卷重置为未读`);
+        }
+        renderSeriesBooksBody();
+      };
+
+      booksBody.querySelectorAll('input[data-book-select]').forEach((cb) => {
+        cb.onchange = () => {
+          const bid = cb.getAttribute('data-book-select');
+          if (!bid) return;
+          if (cb.checked) selectedBookIds.add(bid);
+          else selectedBookIds.delete(bid);
+          const wrap = booksBody.querySelector(`[data-book-card="${CSS.escape(bid)}"],[data-book-row="${CSS.escape(bid)}"]`);
+          if (wrap && wrap.classList) wrap.classList.toggle('is-selected', cb.checked);
+          syncBatchStatusUI(visibleBooks);
+        };
+      });
+
+      const selAllBtn = document.getElementById('btn-books-select-all');
+      if (selAllBtn) {
+        selAllBtn.onclick = () => {
+          visibleBooks.forEach((b) => selectedBookIds.add(b.id));
+          renderSeriesBooksBody();
+        };
+      }
+      const selClearBtn = document.getElementById('btn-books-select-clear');
+      if (selClearBtn) {
+        selClearBtn.onclick = () => {
+          selectedBookIds.clear();
+          renderSeriesBooksBody();
+        };
+      }
+      const batchReadBtn = document.getElementById('btn-books-batch-read');
+      if (batchReadBtn) batchReadBtn.onclick = () => runBatchProgress(true);
+      const batchUnreadBtn = document.getElementById('btn-books-batch-unread');
+      if (batchUnreadBtn) batchUnreadBtn.onclick = () => runBatchProgress(false);
+
+      const loadMoreBtn = document.getElementById('btn-books-load-more');
+      if (loadMoreBtn) {
+        loadMoreBtn.onclick = () => {
+          visibleLimit = Math.min(books.length, visibleLimit + SERIES_BOOKS_BATCH_SIZE);
+          renderSeriesBooksBody();
+        };
+      }
+      const showAllBtn = document.getElementById('btn-books-show-all');
+      if (showAllBtn) {
+        showAllBtn.onclick = () => {
+          visibleLimit = books.length;
+          renderSeriesBooksBody();
+        };
+      }
+
+      booksBody.querySelectorAll('button[data-book-read]').forEach((btn) => {
+        btn.onclick = async () => {
+          const bid = btn.getAttribute('data-book-read');
+          try {
+            await api(`/api/v1/books/${encodeURIComponent(bid)}/read-progress`, { method: 'PATCH', body: { completed: true } });
+            renderSeriesDetail(seriesID);
+          } catch (err) { toast(err.message, 'error'); }
+        };
+      });
+      booksBody.querySelectorAll('button[data-book-unread]').forEach((btn) => {
+        btn.onclick = async () => {
+          const bid = btn.getAttribute('data-book-unread');
+          try {
+            await api(`/api/v1/books/${encodeURIComponent(bid)}/read-progress`, { method: 'DELETE' });
+            renderSeriesDetail(seriesID);
+          } catch (err) { toast(err.message, 'error'); }
+        };
+      });
+      booksBody.querySelectorAll('button[data-book-readlist]').forEach((btn) => {
+        btn.onclick = () => {
+          openAddBookToReadListModal(
+            btn.getAttribute('data-book-readlist'),
+            btn.getAttribute('data-book-name') || '单册',
+          );
+        };
+      });
+    };
+
+    renderSeriesBooksBody();
+
+    const batchToggleBtn = document.getElementById('btn-books-batch-toggle');
+    if (batchToggleBtn) {
+      batchToggleBtn.onclick = () => {
+        batchSelectMode = !batchSelectMode;
+        if (!batchSelectMode) selectedBookIds.clear();
+        batchToggleBtn.textContent = batchSelectMode ? '退出批量选择' : '批量选择';
+        if (batchToggleBtn.classList) batchToggleBtn.classList.toggle('btn-primary', batchSelectMode);
+        renderSeriesBooksBody();
+      };
+    }
+
+    content.querySelectorAll('button[data-books-view]').forEach((btn) => {
+      btn.onclick = () => {
+        const nextMode = btn.getAttribute('data-books-view') === 'cover' ? 'cover' : 'list';
+        setSeriesBooksViewOverride(seriesID, nextMode);
+        content.querySelectorAll('button[data-books-view]').forEach((other) => {
+          if (other.classList) other.classList.toggle('active', other === btn);
+        });
+        renderSeriesBooksBody();
+      };
+    });
 
     content.querySelectorAll('button[data-cover-src]').forEach((btn) => {
       btn.onclick = async () => {
@@ -2101,6 +2626,44 @@
         } catch (err) { toast(err.message, 'error'); }
       };
     });
+
+    const oneshotToggle = document.getElementById('series-oneshot-toggle');
+    if (oneshotToggle) {
+      oneshotToggle.onchange = async () => {
+        const nextVal = Boolean(oneshotToggle.checked);
+        oneshotToggle.disabled = true;
+        try {
+          await api(`/admin/api/series/${encodeURIComponent(seriesID)}/oneshot`, {
+            method: 'PATCH',
+            body: { oneShotOverride: nextVal },
+          });
+          toast(nextVal ? '已标记为单篇 (One-shot)' : '已取消单篇标记');
+          renderSeriesDetail(seriesID);
+        } catch (err) {
+          oneshotToggle.checked = !nextVal;
+          oneshotToggle.disabled = false;
+          toast(err.message, 'error');
+        }
+      };
+    }
+
+    const startSeriesBatchMaint = (operation) => {
+      openBatchMaintModal({
+        operation,
+        targetType: 'series',
+        targetId: seriesID,
+        targetName: title,
+        onStarted: () => {
+          const panel = document.getElementById('series-maint-panel');
+          if (panel) panel.open = true;
+          pollSeriesMaint(seriesID);
+        },
+      });
+    };
+    const batchCoversBtn = document.getElementById('btn-series-batch-covers');
+    if (batchCoversBtn) batchCoversBtn.onclick = () => startSeriesBatchMaint('batch_book_covers');
+    const batchComicInfoBtn = document.getElementById('btn-series-batch-comicinfo');
+    if (batchComicInfoBtn) batchComicInfoBtn.onclick = () => startSeriesBatchMaint('batch_comicinfo');
 
     const btnOpenBgm = document.getElementById('btn-open-bgm');
     if (btnOpenBgm) btnOpenBgm.onclick = () => openBangumiMatchModal(seriesID, detail);
@@ -2160,33 +2723,6 @@
         renderSeriesDetail(seriesID);
       } catch (err) { toast(err.message, 'error'); }
     };
-
-    content.querySelectorAll('button[data-book-read]').forEach((btn) => {
-      btn.onclick = async () => {
-        const bid = btn.getAttribute('data-book-read');
-        try {
-          await api(`/api/v1/books/${encodeURIComponent(bid)}/read-progress`, { method: 'PATCH', body: { completed: true } });
-          renderSeriesDetail(seriesID);
-        } catch (err) { toast(err.message, 'error'); }
-      };
-    });
-    content.querySelectorAll('button[data-book-unread]').forEach((btn) => {
-      btn.onclick = async () => {
-        const bid = btn.getAttribute('data-book-unread');
-        try {
-          await api(`/api/v1/books/${encodeURIComponent(bid)}/read-progress`, { method: 'DELETE' });
-          renderSeriesDetail(seriesID);
-        } catch (err) { toast(err.message, 'error'); }
-      };
-    });
-    content.querySelectorAll('button[data-book-readlist]').forEach((btn) => {
-      btn.onclick = () => {
-        openAddBookToReadListModal(
-          btn.getAttribute('data-book-readlist'),
-          btn.getAttribute('data-book-name') || '单册',
-        );
-      };
-    });
 
     content.querySelectorAll('button[data-maint]').forEach((btn) => {
       btn.onclick = async () => {
@@ -2819,6 +3355,330 @@
 
   // --- Book Detail View (/book/:id & /books/:id) ---
 
+  function comicInfoStatusMeta(status) {
+    switch (String(status || '').trim()) {
+      case 'parsed': return { label: 'ComicInfo：已解析', cls: 'badge-success' };
+      case 'absent': return { label: 'ComicInfo：归档无 XML', cls: '' };
+      case 'skipped_solid': return { label: 'ComicInfo：固实 RAR 跳过', cls: 'badge-warn' };
+      case 'skipped_encrypted': return { label: 'ComicInfo：加密归档跳过', cls: 'badge-warn' };
+      case 'skipped_unsupported': return { label: 'ComicInfo：格式不支持跳过', cls: 'badge-warn' };
+      default: return { label: 'ComicInfo：未读取', cls: '' };
+    }
+  }
+
+  function bookSafeHttpURL(raw) {
+    const val = String(raw || '').trim();
+    return /^https?:\/\/\S+$/i.test(val) ? val : '';
+  }
+
+  function openBookCoverModal(bookID, bookTitle, rawBookMeta, onUpdated) {
+    let mode = 'file';
+    openModal({
+      title: `上传 / 指定单卷封面 · ${bookTitle}`,
+      maxWidth: '520px',
+      bodyHTML: `
+        <div class="segmented extmeta-modal-tabs" role="tablist">
+          <button type="button" data-bkc-tab="file" class="active">上传本地图片</button>
+          <button type="button" data-bkc-tab="url">指定图片 URL</button>
+        </div>
+        <div id="bkc-pane-file">
+          <div class="field">
+            <label for="bkc-file">选择封面图片文件（JPG / PNG / WebP / GIF）</label>
+            <input type="file" id="bkc-file" accept="image/*">
+            <div class="extmeta-file-meta" id="bkc-file-meta">支持上传本地封面图，提交后将自动设为自定义封面来源。</div>
+          </div>
+          <div class="extmeta-upload-progress" id="bkc-upload-progress-wrap" style="display:none">
+            <div style="font-size:12px;color:var(--accent);margin-bottom:5px" id="bkc-upload-status">正在上传…</div>
+            <div class="progress-track"><span id="bkc-upload-bar" style="width:0%"></span></div>
+          </div>
+        </div>
+        <div id="bkc-pane-url" style="display:none">
+          <div class="field" style="margin-bottom:0">
+            <label for="bkc-url">远程封面图片 URL（仅支持 http / https）</label>
+            <input type="url" id="bkc-url" value="${esc((rawBookMeta && rawBookMeta.customCoverUrl) || '')}" placeholder="https://example.com/cover.jpg">
+            <div class="field-hint">服务端将校验 URL 安全性并抓取缓存到本地。</div>
+          </div>
+        </div>
+      `,
+      footHTML: `<button type="button" class="btn btn-primary" id="bkc-submit">保存封面</button>`,
+      onMount: () => {
+        const paneFile = document.getElementById('bkc-pane-file');
+        const paneUrl = document.getElementById('bkc-pane-url');
+        const fileInput = document.getElementById('bkc-file');
+        const fileMeta = document.getElementById('bkc-file-meta');
+        const urlInput = document.getElementById('bkc-url');
+        const progWrap = document.getElementById('bkc-upload-progress-wrap');
+        const progBar = document.getElementById('bkc-upload-bar');
+        const progStatus = document.getElementById('bkc-upload-status');
+        const submitBtn = document.getElementById('bkc-submit');
+
+        document.querySelectorAll('button[data-bkc-tab]').forEach((tabBtn) => {
+          tabBtn.onclick = () => {
+            mode = tabBtn.getAttribute('data-bkc-tab') === 'url' ? 'url' : 'file';
+            document.querySelectorAll('button[data-bkc-tab]').forEach((other) => {
+              if (other.classList) other.classList.toggle('active', other === tabBtn);
+            });
+            if (paneFile) paneFile.style.display = mode === 'file' ? '' : 'none';
+            if (paneUrl) paneUrl.style.display = mode === 'url' ? '' : 'none';
+          };
+        });
+
+        if (fileInput) {
+          fileInput.onchange = () => {
+            const file = fileInput.files && fileInput.files[0];
+            if (fileMeta) {
+              fileMeta.textContent = file
+                ? `已选择：${file.name}（${fmtBytes(file.size || 0)}）`
+                : '支持上传本地封面图，提交后将自动设为自定义封面来源。';
+            }
+          };
+        }
+
+        if (submitBtn) {
+          submitBtn.onclick = async () => {
+            if (submitBtn.disabled) return;
+            if (mode === 'file') {
+              const file = fileInput && fileInput.files && fileInput.files[0];
+              if (!file) {
+                toast('请先选择要上传的封面图片', 'error');
+                return;
+              }
+              const fd = new FormData();
+              fd.append('file', file);
+              submitBtn.disabled = true;
+              if (progWrap) progWrap.style.display = '';
+              if (progBar) progBar.style.width = '0%';
+              if (progStatus) progStatus.textContent = `准备上传 ${file.name}…`;
+              try {
+                await xhrUploadFormData(`/admin/api/books/${encodeURIComponent(bookID)}/cover`, fd, {
+                  onProgress: ({ loaded, total, computable, pct }) => {
+                    if (progBar) progBar.style.width = `${computable ? pct : 35}%`;
+                    if (progStatus) {
+                      progStatus.textContent = computable
+                        ? `正在上传：${pct}%（${fmtBytes(loaded)} / ${fmtBytes(total)}）`
+                        : `正在上传：${fmtBytes(loaded)}…`;
+                    }
+                  },
+                });
+                toast('单卷自定义封面已上传');
+                closeModal();
+                if (onUpdated) onUpdated();
+              } catch (err) {
+                if (submitBtn.isConnected) submitBtn.disabled = false;
+                toast(err.message, 'error');
+              }
+              return;
+            }
+
+            const url = (urlInput ? urlInput.value : '').trim();
+            if (!bookSafeHttpURL(url)) {
+              toast('请输入有效的 http / https 图片地址', 'error');
+              return;
+            }
+            submitBtn.disabled = true;
+            try {
+              await api(`/admin/api/books/${encodeURIComponent(bookID)}/cover`, {
+                method: 'POST',
+                body: { url },
+              });
+              toast('单卷自定义封面已保存');
+              closeModal();
+              if (onUpdated) onUpdated();
+            } catch (err) {
+              if (submitBtn.isConnected) submitBtn.disabled = false;
+              toast(err.message, 'error');
+            }
+          };
+        }
+      },
+    });
+  }
+
+  function openBookMetadataEditModal(bookID, detail) {
+    const b = detail.book || {};
+    const m = b.metadata || {};
+    const raw = detail.rawBookMeta || {};
+    const authorsText = (Array.isArray(m.authors) ? m.authors : [])
+      .map((a) => (a && a.name ? (a.role && a.role !== 'writer' ? `${a.name} | ${a.role}` : a.name) : ''))
+      .filter(Boolean)
+      .join('\n');
+    const tagsText = (Array.isArray(m.tags) ? m.tags : []).join(', ');
+    const linksText = (Array.isArray(m.links) ? m.links : [])
+      .map((l) => (l && l.url ? (l.label ? `${l.label} | ${l.url}` : l.url) : ''))
+      .filter(Boolean)
+      .join('\n');
+    const numSortInit = m.numberSort != null ? String(m.numberSort) : '';
+
+    openModal({
+      title: '编辑单卷元数据（支持 9 字段逐项锁定）',
+      bodyHTML: `
+        <div class="grid-2">
+          <div class="field">
+            <div class="field-label-row"><label for="bm-edit-title">卷标题</label><label class="check-row"><input type="checkbox" id="bm-edit-title-lock" ${m.titleLock ? 'checked' : ''}>锁定</label></div>
+            <input type="text" id="bm-edit-title" value="${esc(m.title || '')}">
+          </div>
+          <div class="field">
+            <div class="field-label-row"><label for="bm-edit-number">卷号 (number)</label><label class="check-row"><input type="checkbox" id="bm-edit-number-lock" ${m.numberLock ? 'checked' : ''}>锁定</label></div>
+            <input type="text" id="bm-edit-number" value="${esc(m.number || '')}">
+          </div>
+          <div class="field">
+            <div class="field-label-row"><label for="bm-edit-numberSort">排序值 (numberSort)</label><label class="check-row"><input type="checkbox" id="bm-edit-numberSort-lock" ${m.numberSortLock ? 'checked' : ''}>锁定</label></div>
+            <input type="number" step="any" id="bm-edit-numberSort" value="${esc(numSortInit)}">
+            <label class="check-row" style="margin-top:4px"><input type="checkbox" id="bm-edit-clear-numberSort"><span>清除自定义排序（恢复按文件名排序${raw.numberSortExplicit ? ' · 当前已覆盖' : ''}）</span></label>
+          </div>
+          <div class="field">
+            <div class="field-label-row"><label for="bm-edit-releaseDate">发售日期</label><label class="check-row"><input type="checkbox" id="bm-edit-releaseDate-lock" ${m.releaseDateLock ? 'checked' : ''}>锁定</label></div>
+            <input type="text" id="bm-edit-releaseDate" placeholder="YYYY-MM-DD" value="${esc(m.releaseDate || '')}">
+          </div>
+          <div class="field">
+            <div class="field-label-row"><label for="bm-edit-isbn">ISBN</label><label class="check-row"><input type="checkbox" id="bm-edit-isbn-lock" ${m.isbnLock ? 'checked' : ''}>锁定</label></div>
+            <input type="text" id="bm-edit-isbn" value="${esc(m.isbn || '')}">
+          </div>
+        </div>
+        <div class="field">
+          <div class="field-label-row"><label for="bm-edit-authors">作者（每行一位，格式：<code>姓名 | 角色</code>，角色留空默认 writer）</label><label class="check-row"><input type="checkbox" id="bm-edit-authors-lock" ${m.authorsLock ? 'checked' : ''}>锁定</label></div>
+          <textarea id="bm-edit-authors" placeholder="例如：尾田荣一郎 | writer">${esc(authorsText)}</textarea>
+        </div>
+        <div class="field">
+          <div class="field-label-row"><label for="bm-edit-tags">标签 Tags（英文逗号分隔）</label><label class="check-row"><input type="checkbox" id="bm-edit-tags-lock" ${m.tagsLock ? 'checked' : ''}>锁定</label></div>
+          <input type="text" id="bm-edit-tags" value="${esc(tagsText)}">
+        </div>
+        <div class="field">
+          <div class="field-label-row"><label for="bm-edit-links">外部链接（每行一条，格式：<code>标签 | URL</code> 或直接填 URL）</label><label class="check-row"><input type="checkbox" id="bm-edit-links-lock" ${m.linksLock ? 'checked' : ''}>锁定</label></div>
+          <textarea id="bm-edit-links" placeholder="例如：Bangumi | https://bgm.tv/subject/...">${esc(linksText)}</textarea>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <div class="field-label-row"><label for="bm-edit-summary">单卷简介 Summary</label><label class="check-row"><input type="checkbox" id="bm-edit-summary-lock" ${m.summaryLock ? 'checked' : ''}>锁定</label></div>
+          <textarea id="bm-edit-summary">${esc(m.summary || '')}</textarea>
+        </div>
+      `,
+      footHTML: `
+        <button type="button" class="btn" id="bm-edit-unlock-all">全部解除锁定</button>
+        <button type="button" class="btn btn-primary" id="bm-edit-save">保存卷元数据</button>
+      `,
+      onMount: () => {
+        const lockIds = [
+          'bm-edit-title-lock',
+          'bm-edit-number-lock',
+          'bm-edit-numberSort-lock',
+          'bm-edit-releaseDate-lock',
+          'bm-edit-isbn-lock',
+          'bm-edit-authors-lock',
+          'bm-edit-tags-lock',
+          'bm-edit-links-lock',
+          'bm-edit-summary-lock',
+        ];
+        const numSortEl = document.getElementById('bm-edit-numberSort');
+        const clearNumSortEl = document.getElementById('bm-edit-clear-numberSort');
+        if (clearNumSortEl && numSortEl) {
+          clearNumSortEl.onchange = () => {
+            numSortEl.disabled = Boolean(clearNumSortEl.checked);
+          };
+        }
+        const unlockBtn = document.getElementById('bm-edit-unlock-all');
+        if (unlockBtn) {
+          unlockBtn.onclick = () => {
+            lockIds.forEach((id) => {
+              const el = document.getElementById(id);
+              if (el) el.checked = false;
+            });
+          };
+        }
+        const saveBtn = document.getElementById('bm-edit-save');
+        if (saveBtn) {
+          saveBtn.onclick = async () => {
+            if (saveBtn.disabled) return;
+            const clearNumberSort = Boolean(clearNumSortEl && clearNumSortEl.checked);
+            const rawNumSort = (numSortEl ? numSortEl.value : '').trim();
+            let parsedNumSort;
+            if (!clearNumberSort && rawNumSort !== '') {
+              parsedNumSort = Number(rawNumSort);
+              if (!Number.isFinite(parsedNumSort)) {
+                toast('排序值 (numberSort) 必须是有效数字', 'error');
+                return;
+              }
+            }
+
+            const authors = String(document.getElementById('bm-edit-authors')?.value || '')
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean)
+              .map((line) => {
+                const pipeIdx = line.indexOf('|');
+                if (pipeIdx >= 0) {
+                  const name = line.slice(0, pipeIdx).trim();
+                  const role = line.slice(pipeIdx + 1).trim() || 'writer';
+                  return { name, role };
+                }
+                return { name: line, role: 'writer' };
+              })
+              .filter((a) => a.name);
+
+            const tags = String(document.getElementById('bm-edit-tags')?.value || '')
+              .split(/[,，]/)
+              .map((s) => s.trim())
+              .filter(Boolean);
+
+            const links = String(document.getElementById('bm-edit-links')?.value || '')
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean)
+              .map((line) => {
+                const pipeIdx = line.indexOf('|');
+                if (pipeIdx >= 0) {
+                  return {
+                    label: line.slice(0, pipeIdx).trim() || 'Link',
+                    url: line.slice(pipeIdx + 1).trim(),
+                  };
+                }
+                return { label: 'Link', url: line };
+              })
+              .filter((l) => l.url);
+
+            const patch = {
+              title: (document.getElementById('bm-edit-title')?.value || '').trim(),
+              titleLock: Boolean(document.getElementById('bm-edit-title-lock')?.checked),
+              number: (document.getElementById('bm-edit-number')?.value || '').trim(),
+              numberLock: Boolean(document.getElementById('bm-edit-number-lock')?.checked),
+              numberSortLock: Boolean(document.getElementById('bm-edit-numberSort-lock')?.checked),
+              releaseDate: (document.getElementById('bm-edit-releaseDate')?.value || '').trim(),
+              releaseDateLock: Boolean(document.getElementById('bm-edit-releaseDate-lock')?.checked),
+              isbn: (document.getElementById('bm-edit-isbn')?.value || '').trim(),
+              isbnLock: Boolean(document.getElementById('bm-edit-isbn-lock')?.checked),
+              authors,
+              authorsLock: Boolean(document.getElementById('bm-edit-authors-lock')?.checked),
+              tags,
+              tagsLock: Boolean(document.getElementById('bm-edit-tags-lock')?.checked),
+              links,
+              linksLock: Boolean(document.getElementById('bm-edit-links-lock')?.checked),
+              summary: (document.getElementById('bm-edit-summary')?.value || '').trim(),
+              summaryLock: Boolean(document.getElementById('bm-edit-summary-lock')?.checked),
+            };
+            if (clearNumberSort) {
+              patch.clearNumberSort = true;
+            } else if (parsedNumSort !== undefined) {
+              patch.numberSort = parsedNumSort;
+            }
+
+            saveBtn.disabled = true;
+            try {
+              await api(`/api/v1/books/${encodeURIComponent(bookID)}/metadata`, {
+                method: 'PATCH',
+                body: patch,
+              });
+              toast('单卷元数据已保存');
+              closeModal();
+              renderBookDetail(bookID);
+            } catch (err) {
+              if (saveBtn.isConnected) saveBtn.disabled = false;
+              toast(err.message, 'error');
+            }
+          };
+        }
+      },
+    });
+  }
+
   async function renderBookDetail(bookID) {
     const seq = routeSeq;
     const uid = state.auth.userId || '';
@@ -2840,77 +3700,157 @@
 
   function paintBookDetail(bookID, detail, jobs) {
     const b = detail.book || {};
+    const meta = b.metadata || {};
+    const rawBookMeta = detail.rawBookMeta || {};
     const rp = b.readProgress;
     const pgCount = (b.media && b.media.pagesCount) || 0;
     const startPg = rp && !rp.completed && rp.page > 0 ? rp.page : 1;
     const admin = isAdminUser();
-    document.title = `${b.name || '单册详情'} · MangaAlpha`;
+    const bookTitle = (meta.title || '').trim() || b.name || '单册详情';
+    const coverSrc = rawBookMeta.coverSource || 'auto';
+    const ciMeta = comicInfoStatusMeta(rawBookMeta.comicInfoStatus);
+    const authors = Array.isArray(meta.authors) ? meta.authors : [];
+    const tags = Array.isArray(meta.tags) ? meta.tags : [];
+    const safeLinks = (Array.isArray(meta.links) ? meta.links : [])
+      .map((l) => ({ label: (l && l.label) || (l && l.url) || '链接', url: bookSafeHttpURL(l && l.url) }))
+      .filter((l) => l.url);
+    document.title = `${bookTitle} · MangaAlpha`;
 
     const content = document.getElementById('page-content');
     if (!content) return;
 
     content.innerHTML = `
-      <div style="margin-bottom:12px;font-size:13px;color:var(--text-muted)">
+      <div style="margin-bottom:12px;font-size:13px;color:var(--text-muted);overflow-wrap:anywhere;word-break:break-word">
         <a href="/series/${encodeURIComponent(detail.seriesId)}" data-nav style="color:var(--accent)">← 返回系列：${esc(detail.seriesTitle || detail.originalSeries)}</a>
       </div>
 
-      <section class="card">
-        <div class="detail-badges">
-          <span class="badge">${esc(detail.libraryName)}</span>
-          <span class="badge">${esc(providerLabel(detail.providerType, detail.webdavAccountName))}</span>
-          <span class="badge badge-accent">${esc(detail.archiveType)}</span>
-          ${rp && rp.completed
-            ? `<span class="badge badge-success">已读完</span>`
-            : rp && rp.page > 0
-              ? `<span class="badge badge-accent">阅读中 · 第 ${rp.page}${pgCount > 0 ? ` / ${pgCount}` : ''} 页</span>`
-              : `<span class="badge">未读</span>`}
-        </div>
-        <h1 style="margin:6px 0 8px;font-size:22px">${esc(b.name)}</h1>
-        <div class="detail-orig">
-          <div>所属书库：<strong>${esc(detail.libraryName)}</strong>（${esc(providerLabel(detail.providerType, detail.webdavAccountName))}）</div>
-          <div>相对路径：${esc(detail.relativePath)}</div>
-        </div>
-        ${Array.isArray(detail.unionSources) && detail.unionSources.length > 0 ? `
-          <div class="union-source-box">
-            <div style="font-weight:600">联合库多副本来源（读取失败时按优先级自动回退）</div>
-            ${detail.unionSources.map((src, idx) => `
-              <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px">
-                <span class="badge ${idx === 0 ? 'badge-success' : ''}">${idx === 0 ? '生效层 #1' : `备用层 #${idx + 1}`}</span>
-                <strong>${esc(src.sourceLibraryName)}</strong>
-                <span style="color:var(--text-muted)">${esc(providerLabel(src.providerType, src.webdavAccountName))} · ${fmtBytes(src.sourceSize)}</span>
-              </div>`).join('')}
-          </div>` : ''}
-
-        <div class="detail-cta" style="margin-top:16px">
-          <a href="/reader/series/${encodeURIComponent(detail.seriesId)}/book/${encodeURIComponent(bookID)}?page=${startPg}" class="btn btn-primary btn-lg">
-            ▶ ${rp && !rp.completed && rp.page > 0 ? `继续阅读（第 ${rp.page} 页）` : '立即在线阅读'}
-          </a>
-          ${detail.previousBookId ? `<a href="/book/${encodeURIComponent(detail.previousBookId)}" data-nav class="btn">← 上一卷</a>` : ''}
-          ${detail.nextBookId ? `<a href="/book/${encodeURIComponent(detail.nextBookId)}" data-nav class="btn">下一卷 →</a>` : ''}
-          <button type="button" class="btn btn-sm" id="bk-add-readlist">+ 阅读列表</button>
-          <button type="button" class="btn btn-sm" id="bk-mark-read">标记已读</button>
-          <button type="button" class="btn btn-sm" id="bk-mark-unread">重置未读</button>
-        </div>
-        <div id="book-readlists-bar" class="chip-group" style="display:none;margin-top:12px"></div>
-
-        <div class="stat-grid" style="margin-top:18px">
-          <div class="stat-box"><div class="k">文件大小</div><div class="v" style="font-size:17px">${esc(b.size)}</div></div>
-          <div class="stat-box"><div class="k">页数 / 索引状态</div><div class="v" style="font-size:15px">${esc(detail.indexStatus)}${detail.indexDuration ? ` (${esc(detail.indexDuration)})` : ''}</div></div>
-          <div class="stat-box"><div class="k">真实下载速度</div><div class="v" style="font-size:15px">${esc(detail.downloadSpeed)}${detail.downloadBytes ? ` · ${esc(detail.downloadBytes)}` : ''}</div></div>
-          ${detail.inferred ? `<div class="stat-box"><div class="k">推断加载进度</div><div class="v" style="font-size:14px">最近 ${esc(detail.inferred.last)}<br>最大 ${esc(detail.inferred.max)}</div></div>` : ''}
+      <section class="detail-hero">
+        <div class="detail-cover-col">
+          <div class="detail-cover-frame">
+            <img id="book-cover-img" src="/api/v1/books/${encodeURIComponent(bookID)}/thumbnail?v=${state.coverVer}" alt="${esc(bookTitle)}">
+          </div>
+          ${admin ? `
+            <div class="segmented book-cover-segmented" title="切换单卷封面来源">
+              <button type="button" data-book-cover-src="auto" class="${coverSrc === 'auto' ? 'active' : ''}">自动</button>
+              <button type="button" data-book-cover-src="custom" class="${coverSrc === 'custom' ? 'active' : ''}">自定义</button>
+              <button type="button" data-book-cover-src="ext" class="${coverSrc === 'ext' ? 'active' : ''}">离线源</button>
+              <button type="button" data-book-cover-src="bangumi" class="${coverSrc === 'bangumi' ? 'active' : ''}">BGM</button>
+              <button type="button" data-book-cover-src="book" class="${coverSrc === 'book' ? 'active' : ''}">首页</button>
+            </div>
+            <div class="book-cover-actions">
+              <button type="button" class="btn btn-sm" id="bk-upload-cover">上传/指定封面</button>
+              ${rawBookMeta.hasCustomCover ? `<button type="button" class="btn btn-sm btn-danger" id="bk-clear-cover">清除自定义封面</button>` : ''}
+            </div>` : ''}
         </div>
 
-        ${admin ? `
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
-          <button type="button" class="btn btn-sm" id="bk-idx-build">生成归档索引</button>
-          <button type="button" class="btn btn-sm" id="bk-idx-force">强制重建归档索引</button>
+        <div class="detail-main">
+          <div class="detail-badges">
+            <span class="badge">${esc(detail.libraryName)}</span>
+            <span class="badge">${esc(providerLabel(detail.providerType, detail.webdavAccountName))}</span>
+            <span class="badge badge-accent">${esc(detail.archiveType)}</span>
+            ${rp && rp.completed
+              ? `<span class="badge badge-success">已读完</span>`
+              : rp && rp.page > 0
+                ? `<span class="badge badge-accent">阅读中 · 第 ${rp.page}${pgCount > 0 ? ` / ${pgCount}` : ''} 页</span>`
+                : `<span class="badge">未读</span>`}
+            <span class="badge ${ciMeta.cls}">${esc(ciMeta.label)}</span>
+            ${rawBookMeta.seriesGroup ? `<span class="badge" title="来自 ComicInfo SeriesGroup">分组：${esc(rawBookMeta.seriesGroup)}</span>` : ''}
+            ${rawBookMeta.storyArc ? `<span class="badge" title="来自 ComicInfo StoryArc">故事线：${esc(rawBookMeta.storyArc)}${rawBookMeta.storyArcNumber ? ` #${esc(rawBookMeta.storyArcNumber)}` : ''}</span>` : ''}
+            ${Number(rawBookMeta.bgmSubjectId || 0) > 0 ? `<span class="badge badge-bgm">BGM #${Number(rawBookMeta.bgmSubjectId)}</span>` : ''}
+            ${rawBookMeta.extSourceId && rawBookMeta.extEntryId ? `<span class="badge badge-accent">扩展源 #${esc(rawBookMeta.extEntryId)}</span>` : ''}
+          </div>
+
+          <h1>${esc(bookTitle)}</h1>
+          <div class="detail-orig">
+            ${b.name && b.name !== bookTitle ? `<div>原始文件名：<strong>${esc(b.name)}</strong></div>` : ''}
+            <div>所属系列：<a href="/series/${encodeURIComponent(detail.seriesId)}" data-nav style="color:var(--accent)">${esc(detail.seriesTitle || detail.originalSeries || '')}</a></div>
+            <div>所属书库：<strong>${esc(detail.libraryName)}</strong>（${esc(providerLabel(detail.providerType, detail.webdavAccountName))}）</div>
+            <div>相对路径：${esc(detail.relativePath)}</div>
+          </div>
+
+          <div class="book-meta-facts">
+            <div class="book-meta-fact">
+              <div class="book-meta-fact-label">卷号</div>
+              <div class="book-meta-fact-val">${esc(meta.number || '—')}</div>
+            </div>
+            <div class="book-meta-fact">
+              <div class="book-meta-fact-label">排序值 (numberSort)</div>
+              <div class="book-meta-fact-val">${meta.numberSort != null ? esc(String(meta.numberSort)) : '—'}${rawBookMeta.numberSortExplicit ? ' <span class="badge badge-accent">自定义</span>' : ''}</div>
+            </div>
+            <div class="book-meta-fact">
+              <div class="book-meta-fact-label">发售日</div>
+              <div class="book-meta-fact-val">${esc(meta.releaseDate || '—')}</div>
+            </div>
+            <div class="book-meta-fact">
+              <div class="book-meta-fact-label">ISBN</div>
+              <div class="book-meta-fact-val">${esc(meta.isbn || '—')}</div>
+            </div>
+          </div>
+
+          ${Array.isArray(detail.unionSources) && detail.unionSources.length > 0 ? `
+            <div class="union-source-box">
+              <div style="font-weight:600">联合库多副本来源（读取失败时按优先级自动回退）</div>
+              ${detail.unionSources.map((src, idx) => `
+                <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+                  <span class="badge ${idx === 0 ? 'badge-success' : ''}">${idx === 0 ? '生效层 #1' : `备用层 #${idx + 1}`}</span>
+                  <strong>${esc(src.sourceLibraryName)}</strong>
+                  <span style="color:var(--text-muted)">${esc(providerLabel(src.providerType, src.webdavAccountName))} · ${fmtBytes(src.sourceSize)}</span>
+                </div>`).join('')}
+            </div>` : ''}
+
+          <div class="detail-cta" style="margin-top:16px">
+            <a href="/reader/series/${encodeURIComponent(detail.seriesId)}/book/${encodeURIComponent(bookID)}?page=${startPg}" class="btn btn-primary btn-lg">
+              ▶ ${rp && !rp.completed && rp.page > 0 ? `继续阅读（第 ${rp.page} 页）` : '立即在线阅读'}
+            </a>
+            ${detail.previousBookId ? `<a href="/book/${encodeURIComponent(detail.previousBookId)}" data-nav class="btn">← 上一卷</a>` : ''}
+            ${detail.nextBookId ? `<a href="/book/${encodeURIComponent(detail.nextBookId)}" data-nav class="btn">下一卷 →</a>` : ''}
+            ${admin ? `<button type="button" class="btn" id="bk-edit-meta">编辑卷元数据</button>
+            <button type="button" class="btn" id="bk-refresh-comicinfo">读取 ComicInfo.xml</button>` : ''}
+            <button type="button" class="btn btn-sm" id="bk-add-readlist">+ 阅读列表</button>
+            <button type="button" class="btn btn-sm" id="bk-mark-read">标记已读</button>
+            <button type="button" class="btn btn-sm" id="bk-mark-unread">重置未读</button>
+          </div>
+          <div id="book-readlists-bar" class="chip-group" style="display:none;margin-top:12px"></div>
+
+          ${meta.summary ? `<p class="detail-summary">${esc(meta.summary)}</p>` : ''}
+
+          ${authors.length > 0 ? `
+            <div class="chip-group">
+              <span style="font-size:12px;color:var(--text-muted)">作者：</span>
+              ${authors.map((a) => `<a href="/libraries?author=${encodeURIComponent(a.name)}" data-nav class="chip">${esc(a.name)}${a.role && a.role !== 'writer' ? ` (${esc(a.role)})` : ''}</a>`).join('')}
+            </div>` : ''}
+
+          ${tags.length > 0 ? `
+            <div class="chip-group">
+              <span style="font-size:12px;color:var(--text-muted)">标签：</span>
+              ${tags.map((t) => `<a href="/libraries?tag=${encodeURIComponent(t)}" data-nav class="chip"># ${esc(t)}</a>`).join('')}
+            </div>` : ''}
+
+          ${safeLinks.length > 0 ? `
+            <div class="chip-group">
+              <span style="font-size:12px;color:var(--text-muted)">链接：</span>
+              ${safeLinks.map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener noreferrer" class="chip">${esc(l.label)} ↗</a>`).join('')}
+            </div>` : ''}
+
+          <div class="stat-grid" style="margin-top:18px">
+            <div class="stat-box"><div class="k">文件大小</div><div class="v" style="font-size:17px">${esc(b.size)}</div></div>
+            <div class="stat-box"><div class="k">页数 / 索引状态</div><div class="v" style="font-size:15px">${esc(detail.indexStatus)}${detail.indexDuration ? ` (${esc(detail.indexDuration)})` : ''}</div></div>
+            <div class="stat-box"><div class="k">真实下载速度</div><div class="v" style="font-size:15px">${esc(detail.downloadSpeed)}${detail.downloadBytes ? ` · ${esc(detail.downloadBytes)}` : ''}</div></div>
+            ${detail.inferred ? `<div class="stat-box"><div class="k">推断加载进度</div><div class="v" style="font-size:14px">最近 ${esc(detail.inferred.last)}<br>最大 ${esc(detail.inferred.max)}</div></div>` : ''}
+          </div>
+
+          ${admin ? `
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+            <button type="button" class="btn btn-sm" id="bk-idx-build">生成归档索引</button>
+            <button type="button" class="btn btn-sm" id="bk-idx-force">强制重建归档索引</button>
+          </div>
+          <div id="book-maint-jobs">${renderMaintJobRows(jobs)}</div>` : ''}
         </div>
-        <div id="book-maint-jobs">${renderMaintJobRows(jobs)}</div>` : ''}
       </section>
     `;
 
     document.getElementById('bk-add-readlist').onclick = () => {
-      openAddBookToReadListModal(bookID, b.name || '单册', () => loadBookReadListsBar(bookID));
+      openAddBookToReadListModal(bookID, bookTitle, () => loadBookReadListsBar(bookID));
     };
     loadBookReadListsBar(bookID);
     document.getElementById('bk-mark-read').onclick = async () => {
@@ -2926,6 +3866,77 @@
       } catch (err) { toast(err.message, 'error'); }
     };
     if (admin) {
+      content.querySelectorAll('button[data-book-cover-src]').forEach((btn) => {
+        btn.onclick = async () => {
+          const src = btn.getAttribute('data-book-cover-src');
+          try {
+            await api(`/admin/api/books/${encodeURIComponent(bookID)}/cover-source`, {
+              method: 'PATCH',
+              body: { coverSource: src },
+            });
+            state.coverVer = Date.now();
+            toast('单卷封面来源已切换');
+            renderBookDetail(bookID);
+          } catch (err) { toast(err.message, 'error'); }
+        };
+      });
+      const uploadCoverBtn = document.getElementById('bk-upload-cover');
+      if (uploadCoverBtn) {
+        uploadCoverBtn.onclick = () => openBookCoverModal(bookID, bookTitle, rawBookMeta, () => {
+          state.coverVer = Date.now();
+          renderBookDetail(bookID);
+        });
+      }
+      const clearCoverBtn = document.getElementById('bk-clear-cover');
+      if (clearCoverBtn) {
+        clearCoverBtn.onclick = async () => {
+          if (!(await confirmModal('确认清除此卷的自定义封面并回退默认封面策略？', { title: '清除自定义封面', confirmText: '确认清除' }))) return;
+          if (!clearCoverBtn.isConnected) return;
+          clearCoverBtn.disabled = true;
+          try {
+            await api(`/admin/api/books/${encodeURIComponent(bookID)}/cover`, { method: 'DELETE' });
+            state.coverVer = Date.now();
+            toast('已清除自定义封面');
+            renderBookDetail(bookID);
+          } catch (err) {
+            if (clearCoverBtn.isConnected) clearCoverBtn.disabled = false;
+            toast(err.message, 'error');
+          }
+        };
+      }
+      const editBookMetaBtn = document.getElementById('bk-edit-meta');
+      if (editBookMetaBtn) {
+        editBookMetaBtn.onclick = () => openBookMetadataEditModal(bookID, detail);
+      }
+      const refreshCiBtn = document.getElementById('bk-refresh-comicinfo');
+      if (refreshCiBtn) {
+        refreshCiBtn.onclick = async () => {
+          refreshCiBtn.disabled = true;
+          refreshCiBtn.textContent = '读取中…';
+          try {
+            const res = await api(`/admin/api/books/${encodeURIComponent(bookID)}/comicinfo/refresh`, {
+              method: 'POST',
+              body: { force: true },
+            });
+            const status = res && res.status;
+            const msgMap = {
+              parsed: '已从归档解析 ComicInfo.xml',
+              absent: '归档内未找到 ComicInfo.xml',
+              skipped_solid: '固实 RAR 归档已跳过 ComicInfo 解析',
+              skipped_encrypted: '加密归档已跳过 ComicInfo 解析',
+              skipped_unsupported: '当前归档格式暂不支持 ComicInfo 解析',
+            };
+            toast(msgMap[status] || 'ComicInfo 刷新完成');
+            renderBookDetail(bookID);
+          } catch (err) {
+            if (refreshCiBtn.isConnected) {
+              refreshCiBtn.disabled = false;
+              refreshCiBtn.textContent = '读取 ComicInfo.xml';
+            }
+            toast(err.message, 'error');
+          }
+        };
+      }
       const startBookIdx = async (force) => {
         try {
           await api('/admin/api/maintenance-jobs', { method: 'POST', body: { operation: 'book_index', bookId: bookID, force } });
@@ -3412,6 +4423,7 @@
               <strong style="font-size:${nested ? '14.5px' : '15.5px'};overflow-wrap:anywhere">${esc(l.name)}</strong>
               <span class="badge ${isUnion ? 'badge-accent' : ''}">${esc(providerLabel(l.providerType, l.webdavAccountName))}</span>
               ${l.oneShot ? `<span class="badge badge-accent">单本 One-Shots</span>` : ''}
+              ${l.oneshotsDirectory ? `<span class="badge badge-accent" title="单篇子目录：${esc(l.oneshotsDirectory)}">单篇目录：${esc(l.oneshotsDirectory)}</span>` : ''}
               ${isSub && !nested ? `<span class="badge">子库 · 归属：${esc(l.unionParentName)} (#${Number(l.unionPriority || 0) + 1})</span>` : ''}
               ${!l.enabled ? `<span class="badge badge-warn">已隐藏</span>` : ''}
               ${schedText ? `<span class="badge badge-success" title="服务器本机时区：${esc(serverTZ || 'Local')}">⏰ ${esc(schedText)}</span>` : ''}
@@ -3437,6 +4449,8 @@
                 <button type="button" class="btn btn-sm" data-lib-schedule="${esc(l.id)}">定时…</button>
                 <button type="button" class="btn btn-bgm btn-sm" data-lib-bgm="${esc(l.id)}">刮削</button>
                 <button type="button" class="btn btn-sm" data-lib-cover="${esc(l.id)}" data-provider="union">补封面…</button>
+                <button type="button" class="btn btn-sm" data-lib-batch-covers="${esc(l.id)}" data-lib-name="${esc(l.name)}">批量刮削卷封面</button>
+                <button type="button" class="btn btn-sm" data-lib-batch-comicinfo="${esc(l.id)}" data-lib-name="${esc(l.name)}">批量读取 ComicInfo</button>
                 <button type="button" class="btn btn-sm" data-lib-toggle-hide="${esc(l.id)}" data-lib-name="${esc(l.name)}" data-lib-next-enabled="false">隐藏</button>
               ` : `
                 <button type="button" class="btn btn-primary btn-sm" data-lib-toggle-hide="${esc(l.id)}" data-lib-name="${esc(l.name)}" data-lib-next-enabled="true">取消隐藏</button>
@@ -3457,6 +4471,8 @@
                 <button type="button" class="btn btn-sm" data-lib-schedule="${esc(l.id)}">定时…</button>
                 <button type="button" class="btn btn-bgm btn-sm" data-lib-bgm="${esc(l.id)}">刮削</button>
                 <button type="button" class="btn btn-sm" data-lib-cover="${esc(l.id)}" data-provider="${esc(l.providerType)}">补齐首卷封面…</button>
+                <button type="button" class="btn btn-sm" data-lib-batch-covers="${esc(l.id)}" data-lib-name="${esc(l.name)}">批量刮削卷封面</button>
+                <button type="button" class="btn btn-sm" data-lib-batch-comicinfo="${esc(l.id)}" data-lib-name="${esc(l.name)}">批量读取 ComicInfo</button>
                 <button type="button" class="btn btn-sm" data-lib-toggle-hide="${esc(l.id)}" data-lib-name="${esc(l.name)}" data-lib-next-enabled="false">隐藏</button>
               ` : `
                 <button type="button" class="btn btn-primary btn-sm" data-lib-toggle-hide="${esc(l.id)}" data-lib-name="${esc(l.name)}" data-lib-next-enabled="true">取消隐藏</button>
@@ -3536,6 +4552,15 @@
         </div>
 
         <div id="nl-browser-drawer" style="display:none;margin-bottom:14px"></div>
+
+        <div id="nl-oneshots-dir-wrap" class="field" style="margin-bottom:12px">
+          <div class="field-label-row">
+            <label for="nl-oneshots-dir">单篇目录名 (oneshotsDirectory，可选)</label>
+            <button type="button" class="btn btn-sm" id="nl-oneshots-fill">填入 _oneshots</button>
+          </div>
+          <input type="text" id="nl-oneshots-dir" placeholder="留空表示不启用；例如：_oneshots">
+          <div class="field-hint" id="nl-oneshots-dir-hint">普通连载库中位于该子目录下的漫画文件将自动独立识别为单篇 (One-shot)。</div>
+        </div>
 
         <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
           <label class="check-row" id="nl-oneshot-wrap">
@@ -3641,6 +4666,8 @@
       document.getElementById('nl-webdav-box').style.display = v === 'webdav' ? '' : 'none';
       document.getElementById('nl-union-box').style.display = v === 'union' ? '' : 'none';
       document.getElementById('nl-oneshot-wrap').style.display = v === 'union' ? 'none' : '';
+      const oneshotsDirWrap = document.getElementById('nl-oneshots-dir-wrap');
+      if (oneshotsDirWrap) oneshotsDirWrap.style.display = v === 'union' ? 'none' : '';
       const drawer = document.getElementById('nl-browser-drawer');
       if (drawer) {
         drawer._browseSeq = (Number(drawer._browseSeq) || 0) + 1;
@@ -3648,6 +4675,23 @@
         drawer.innerHTML = '';
       }
     };
+
+    const nlOneshotsFill = document.getElementById('nl-oneshots-fill');
+    const nlOneshotsInput = document.getElementById('nl-oneshots-dir');
+    const nlOneshotsHint = document.getElementById('nl-oneshots-dir-hint');
+    const nlOneshotCb = document.getElementById('nl-oneshot');
+    if (nlOneshotsFill && nlOneshotsInput) {
+      nlOneshotsFill.onclick = () => {
+        nlOneshotsInput.value = '_oneshots';
+      };
+    }
+    if (nlOneshotCb && nlOneshotsHint) {
+      nlOneshotCb.onchange = () => {
+        nlOneshotsHint.textContent = nlOneshotCb.checked
+          ? '已勾选全库单篇（One-Shots）模式：全库所有压缩包已作为单篇处理，此处可留空。'
+          : '普通连载库中位于该子目录下的漫画文件将自动独立识别为单篇 (One-shot)。';
+      };
+    }
 
     document.getElementById('nl-browse-115').onclick = () => browse115Drawer('0', [{ cid: '0', name: '115 根目录' }]);
     const localPath = document.getElementById('nl-local-path');
@@ -3677,6 +4721,9 @@
       const oneShot = document.getElementById('nl-oneshot').checked;
       if (!name) { toast('请输入书库名称', 'error'); return; }
       const payload = { name, providerType, oneShot, enabled: true };
+      if (providerType !== 'union') {
+        payload.oneshotsDirectory = (document.getElementById('nl-oneshots-dir')?.value || '').trim();
+      }
       if (providerType === '115') payload.rootCid = document.getElementById('nl-cid').value.trim();
       else if (providerType === 'local') payload.rootPath = document.getElementById('nl-local-path').value.trim();
       else if (providerType === 'webdav') {
@@ -4021,19 +5068,61 @@
         });
       };
     });
+    body.querySelectorAll('button[data-lib-batch-covers]').forEach((btn) => {
+      btn.onclick = () => openBatchMaintModal({
+        operation: 'batch_book_covers',
+        targetType: 'library',
+        targetId: btn.getAttribute('data-lib-batch-covers'),
+        targetName: btn.getAttribute('data-lib-name') || '书库',
+        onStarted: () => navigate('/admin?tab=jobs'),
+      });
+    });
+    body.querySelectorAll('button[data-lib-batch-comicinfo]').forEach((btn) => {
+      btn.onclick = () => openBatchMaintModal({
+        operation: 'batch_comicinfo',
+        targetType: 'library',
+        targetId: btn.getAttribute('data-lib-batch-comicinfo'),
+        targetName: btn.getAttribute('data-lib-name') || '书库',
+        onStarted: () => navigate('/admin?tab=jobs'),
+      });
+    });
     body.querySelectorAll('button[data-lib-edit]').forEach((btn) => {
       btn.onclick = () => {
         const l = JSON.parse(btn.getAttribute('data-lib-edit'));
         openModal({
           title: `编辑书库 · ${l.name}`,
-          maxWidth: '460px',
+          maxWidth: '480px',
           bodyHTML: `
             <div class="field"><label>书库名称</label><input type="text" id="el-name" value="${esc(l.name)}"></div>
             <div class="field"><label class="check-row"><input type="checkbox" id="el-hidden" ${!l.enabled ? 'checked' : ''}><span>隐藏此书库（保留全部数据，不参与展示、客户端、扫描与刮削等其余操作）</span></label></div>
             <div class="field"><label class="check-row"><input type="checkbox" id="el-oneshot" ${l.oneShot ? 'checked' : ''} ${l.unionParentId ? 'disabled' : ''}><span>One-Shots 单本漫画库模式（修改后需重扫${l.unionParentId ? '；联合子库需先移出联合库再改' : ''}）</span></label></div>
+            <div class="field" style="margin-bottom:0">
+              <div class="field-label-row">
+                <label for="el-oneshots-dir">单篇目录名 (oneshotsDirectory，可选)</label>
+                <button type="button" class="btn btn-sm" id="el-oneshots-fill" ${l.unionParentId ? 'disabled' : ''}>填入 _oneshots</button>
+              </div>
+              <input type="text" id="el-oneshots-dir" value="${esc(l.oneshotsDirectory || '')}" placeholder="留空表示不启用；例如：_oneshots" ${l.unionParentId ? 'disabled' : ''}>
+              <div class="field-hint" id="el-oneshots-dir-hint">${l.oneShot ? '当前已勾选全库单篇（One-Shots）模式：全库所有压缩包已作为单篇处理，此处可留空；修改后需重扫。' : '普通连载库中位于该子目录下的漫画文件将独立识别为单篇 (One-shot)，修改后需重扫。'}</div>
+            </div>
           `,
           footHTML: `<button type="button" class="btn btn-primary" id="el-save">保存</button>`,
           onMount: () => {
+            const fillBtn = document.getElementById('el-oneshots-fill');
+            const dirInput = document.getElementById('el-oneshots-dir');
+            const oneshotCb = document.getElementById('el-oneshot');
+            const dirHint = document.getElementById('el-oneshots-dir-hint');
+            if (fillBtn && dirInput) {
+              fillBtn.onclick = () => {
+                if (!dirInput.disabled) dirInput.value = '_oneshots';
+              };
+            }
+            if (oneshotCb && dirHint) {
+              oneshotCb.onchange = () => {
+                dirHint.textContent = oneshotCb.checked
+                  ? '当前已勾选全库单篇（One-Shots）模式：全库所有压缩包已作为单篇处理，此处可留空；修改后需重扫。'
+                  : '普通连载库中位于该子目录下的漫画文件将独立识别为单篇 (One-shot)，修改后需重扫。';
+              };
+            }
             document.getElementById('el-save').onclick = async () => {
               try {
                 await api(`/admin/api/libraries/${encodeURIComponent(l.id)}`, {
@@ -4042,6 +5131,7 @@
                     name: document.getElementById('el-name').value.trim(),
                     enabled: !document.getElementById('el-hidden').checked,
                     oneShot: document.getElementById('el-oneshot').checked,
+                    oneshotsDirectory: (document.getElementById('el-oneshots-dir')?.value || '').trim(),
                   },
                 });
                 state.libraries = [];
@@ -4288,6 +5378,121 @@
     }
   }
 
+  const EXT_LOCAL_WAL_HINT = '若挂载 Komga database.sqlite，请先停止 Komga 或执行 WAL Checkpoint，勿遗漏 -wal';
+
+  function extSchemaFormatMeta(src) {
+    const raw = String((src && (src.schemaFormat || src.schemaType)) || '').trim();
+    const key = raw.toLowerCase();
+    switch (key) {
+      case 'komga_sqlite_v1':
+        return { label: 'Komga DB', cls: 'badge-accent', raw };
+      case 'mangaalpha_meta_v2':
+        return { label: '开放规范 v2', cls: 'badge-accent', raw };
+      case 'mangaalpha_meta_v1':
+        return { label: '开放规范 v1', cls: '', raw };
+      case 'gallery_v1':
+        return { label: '图库 v1', cls: '', raw };
+      case 'tag_translation_text_v1':
+        return { label: '词典 v1', cls: '', raw };
+      case 'mangaalpha_mapping_v1':
+        return { label: '映射 v1', cls: '', raw };
+      default:
+        return { label: raw, cls: '', raw };
+    }
+  }
+
+  function extWalWarningHTML(src) {
+    if (!src || !src.walWarning) return '';
+    const bytesText = Number(src.walWarningBytes || 0) > 0 ? `（${fmtBytes(src.walWarningBytes)}）` : '';
+    const msg = src.walWarningMessage || '检测到同目录存在未 Checkpoint 的 -wal 日志，可能缺少最新增量数据；请先停止 Komga 或执行 Checkpoint 后再同步';
+    return `<div class="extmeta-wal-warning" role="alert"><strong>⚠ 未 Checkpoint 的 -wal 日志告警${bytesText}：</strong><span>${esc(msg)}</span></div>`;
+  }
+
+  function extUploadPaneHTML(prefix) {
+    return `
+      <div class="extmeta-upload-notice">
+        <strong>反向代理与大文件提示：</strong>经 Nginx 等反向代理上传时，可能受 <code>client_max_body_size</code> 或请求超时限制拦截；若离线数据库达数 GB，推荐切换至「本机路径 / 远程 URL」标签直接使用本机路径挂载 (<code>localPath</code>)。
+      </div>
+      <div class="field" style="margin-bottom:0">
+        <label for="${esc(prefix)}-upload-file">选择离线包或数据库文件（支持 <code>.sqlite</code> / <code>.sqlite3</code> / <code>.db</code> / <code>.zip</code> / <code>.gz</code> / <code>.zst</code>）</label>
+        <input type="file" id="${esc(prefix)}-upload-file" accept=".sqlite,.sqlite3,.db,.zip,.gz,.gzip,.zst,.zstd">
+        <div class="extmeta-file-meta" id="${esc(prefix)}-upload-file-meta">支持流式直传与自动格式探测（<code>komga_sqlite_v1</code> / 开放规范 v1 &amp; v2 / <code>gallery_v1</code>）。</div>
+      </div>
+      <div class="extmeta-upload-progress" id="${esc(prefix)}-upload-progress-wrap" style="display:none">
+        <div style="font-size:12px;color:var(--accent);margin-bottom:5px" id="${esc(prefix)}-upload-status">正在准备上传…</div>
+        <div class="progress-track"><span id="${esc(prefix)}-upload-bar" style="width:0%"></span></div>
+      </div>
+    `;
+  }
+
+  function bindExtUploadPane({ prefix, uploadBtnId, getOrderedFields, onSuccess }) {
+    const fileInput = document.getElementById(`${prefix}-upload-file`);
+    const fileMeta = document.getElementById(`${prefix}-upload-file-meta`);
+    const progWrap = document.getElementById(`${prefix}-upload-progress-wrap`);
+    const progBar = document.getElementById(`${prefix}-upload-bar`);
+    const progStatus = document.getElementById(`${prefix}-upload-status`);
+    const uploadBtn = document.getElementById(uploadBtnId);
+
+    if (fileInput && fileMeta) {
+      fileInput.onchange = () => {
+        const file = fileInput.files && fileInput.files[0];
+        fileMeta.textContent = file
+          ? `已选择：${file.name}（${fmtBytes(file.size || 0)}）`
+          : '支持流式直传与自动格式探测（komga_sqlite_v1 / 开放规范 v1 & v2 / gallery_v1）。';
+      };
+    }
+
+    if (uploadBtn) {
+      uploadBtn.onclick = async () => {
+        if (uploadBtn.disabled) return;
+        const file = fileInput && fileInput.files && fileInput.files[0];
+        if (!file) {
+          toast('请先选择要上传的 SQLite 或离线压缩包文件', 'error');
+          return;
+        }
+        const fd = new FormData();
+        const orderedFields = typeof getOrderedFields === 'function' ? getOrderedFields(file) : [];
+        orderedFields.forEach(([k, v]) => {
+          if (v !== undefined && v !== null && String(v) !== '') {
+            fd.append(k, String(v));
+          }
+        });
+        // Append file part last so the backend can stream directly without temp spill.
+        fd.append('file', file);
+
+        uploadBtn.disabled = true;
+        if (progWrap) progWrap.style.display = '';
+        if (progBar) progBar.style.width = '0%';
+        if (progStatus) progStatus.textContent = `准备上传 ${file.name}…`;
+
+        try {
+          const res = await xhrUploadFormData('/admin/api/metadata/sources/upload', fd, {
+            onProgress: ({ loaded, total, computable, pct }) => {
+              if (progBar) progBar.style.width = `${computable ? pct : 35}%`;
+              if (progStatus) {
+                if (computable && loaded >= total) {
+                  progStatus.textContent = `已上传 100%（${fmtBytes(total)}），服务端正在探测格式并建立索引…`;
+                } else if (computable) {
+                  progStatus.textContent = `正在上传：${pct}%（${fmtBytes(loaded)} / ${fmtBytes(total)}）`;
+                } else {
+                  progStatus.textContent = `正在上传：${fmtBytes(loaded)}…`;
+                }
+              }
+            },
+          });
+          const sf = extSchemaFormatMeta(res);
+          toast(`离线数据源已上传并导入${sf.label ? ` (${sf.label})` : ''}`);
+          closeModal();
+          if (onSuccess) onSuccess(res);
+        } catch (err) {
+          if (uploadBtn.isConnected) uploadBtn.disabled = false;
+          if (progStatus) progStatus.textContent = `上传失败：${err.message}`;
+          toast(err.message, 'error');
+        }
+      };
+    }
+  }
+
   function extTagDisplayModeLabel(mode) {
     switch ((mode || 'zh').toLowerCase()) {
       case 'bilingual': return '中英双语';
@@ -4367,6 +5572,8 @@
       dicts.push({ id: src.tagDictSourceId, name: src.tagDictSourceId });
     }
     const kindInfo = extSourceKindMeta(src.kind);
+    const schemaInfo = extSchemaFormatMeta(src);
+    const isOfflineSQLite = src.kind === 'offline_sqlite';
     const hasOnlineConfig = Boolean((src.onlineApiUrl && String(src.onlineApiUrl).trim()) || src.onlineEnabled);
     openModal({
       title: `配置数据源 · ${src.name}`,
@@ -4374,23 +5581,33 @@
       bodyHTML: `
         <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px">
           <span class="badge ${kindInfo.cls}">${esc(kindInfo.label)}</span>
-          ${src.schemaType ? `<span class="badge">${esc(src.schemaType)}</span>` : ''}
+          ${schemaInfo.label ? `<span class="badge ${schemaInfo.cls}" title="${esc(schemaInfo.raw)}">${esc(schemaInfo.label)}</span>` : ''}
           <span class="badge">${src.ready ? '已就绪' : '尚未就绪'}</span>
         </div>
+        ${extWalWarningHTML(src)}
+        ${isOfflineSQLite ? `
+        <div class="segmented extmeta-modal-tabs" role="tablist">
+          <button type="button" data-ems-tab="path" class="active">本机路径 / 远程 URL</button>
+          <button type="button" data-ems-tab="upload">Web 流式上传更新</button>
+        </div>` : ''}
         <div class="field">
           <label class="check-row">
             <input type="checkbox" id="ems-enabled" ${src.enabled ? 'checked' : ''}>
             <span>启用此数据源</span>
           </label>
         </div>
-        <div class="field">
-          <label for="ems-download-url">离线包下载地址 (Download URL)</label>
-          <input type="url" id="ems-download-url" value="${esc(src.downloadUrl || '')}" placeholder="https://... (.sqlite / .zst / .gz / .zip / .ndjson.gz)">
+        <div id="ems-pane-path">
+          <div class="field">
+            <label for="ems-download-url">离线包下载地址 (Download URL)</label>
+            <input type="url" id="ems-download-url" value="${esc(src.downloadUrl || '')}" placeholder="https://... (.sqlite / .zst / .gz / .zip / .ndjson.gz)">
+          </div>
+          <div class="field">
+            <label for="ems-local-path">服务器本地文件路径（可选，留空由同步下载管理）</label>
+            <input type="text" id="ems-local-path" value="${esc(src.localPath || '')}" placeholder="/data/metadata/custom.sqlite">
+            <div class="field-hint extmeta-local-wal-hint">${EXT_LOCAL_WAL_HINT}</div>
+          </div>
         </div>
-        <div class="field">
-          <label for="ems-local-path">服务器本地文件路径（可选，留空由同步下载管理）</label>
-          <input type="text" id="ems-local-path" value="${esc(src.localPath || '')}" placeholder="/data/metadata/custom.sqlite">
-        </div>
+        ${isOfflineSQLite ? `<div id="ems-pane-upload" style="display:none;margin-bottom:14px">${extUploadPaneHTML('ems')}</div>` : ''}
         <div class="grid-2">
           <div class="field">
             <label for="ems-tag-dict">关联标签词典</label>
@@ -4416,17 +5633,55 @@
             <option value="monthly" ${src.autoUpdate === 'monthly' ? 'selected' : ''}>每月自动更新 (monthly)</option>
           </select>
         </div>
-        ${extOnlineApiDetailsHTML({
-          detailsId: 'ems-online-details',
-          inputId: 'ems-online-url',
-          value: src.onlineApiUrl || '',
-          open: hasOnlineConfig,
-          includeToggle: true,
-          enabled: Boolean(src.onlineEnabled),
-        })}
+        <div id="ems-online-wrap">
+          ${extOnlineApiDetailsHTML({
+            detailsId: 'ems-online-details',
+            inputId: 'ems-online-url',
+            value: src.onlineApiUrl || '',
+            open: hasOnlineConfig,
+            includeToggle: true,
+            enabled: Boolean(src.onlineEnabled),
+          })}
+        </div>
       `,
-      footHTML: `<button type="button" class="btn btn-primary" id="ems-save-btn">保存配置</button>`,
+      footHTML: `
+        <button type="button" class="btn btn-primary" id="ems-save-btn">保存配置</button>
+        ${isOfflineSQLite ? `<button type="button" class="btn btn-primary" id="ems-upload-btn" style="display:none">开始流式上传更新</button>` : ''}
+      `,
       onMount: () => {
+        if (isOfflineSQLite) {
+          const panePath = document.getElementById('ems-pane-path');
+          const paneUpload = document.getElementById('ems-pane-upload');
+          const onlineWrap = document.getElementById('ems-online-wrap');
+          const saveBtn = document.getElementById('ems-save-btn');
+          const uploadBtn = document.getElementById('ems-upload-btn');
+          document.querySelectorAll('button[data-ems-tab]').forEach((tabBtn) => {
+            tabBtn.onclick = () => {
+              const isUpload = tabBtn.getAttribute('data-ems-tab') === 'upload';
+              document.querySelectorAll('button[data-ems-tab]').forEach((other) => {
+                if (other.classList) other.classList.toggle('active', other === tabBtn);
+              });
+              if (panePath) panePath.style.display = isUpload ? 'none' : '';
+              if (onlineWrap) onlineWrap.style.display = isUpload ? 'none' : '';
+              if (paneUpload) paneUpload.style.display = isUpload ? '' : 'none';
+              if (saveBtn) saveBtn.style.display = isUpload ? 'none' : '';
+              if (uploadBtn) uploadBtn.style.display = isUpload ? '' : 'none';
+            };
+          });
+          bindExtUploadPane({
+            prefix: 'ems',
+            uploadBtnId: 'ems-upload-btn',
+            getOrderedFields: () => [
+              ['sourceId', src.id],
+              ['kind', 'offline_sqlite'],
+              ['enabled', document.getElementById('ems-enabled')?.checked ? 'true' : 'false'],
+              ['tagDictSourceId', document.getElementById('ems-tag-dict')?.value || ''],
+              ['tagDisplayMode', document.getElementById('ems-tag-mode')?.value || 'zh'],
+              ['autoUpdate', document.getElementById('ems-auto-update')?.value || 'manual'],
+            ],
+            onSuccess: () => { if (onSaved) onSaved(); },
+          });
+        }
         document.getElementById('ems-save-btn').onclick = async () => {
           const btn = document.getElementById('ems-save-btn');
           btn.disabled = true;
@@ -4462,12 +5717,16 @@
       title: '手动添加自定义数据源',
       maxWidth: '580px',
       bodyHTML: `
+        <div class="segmented extmeta-modal-tabs" role="tablist">
+          <button type="button" data-emas-tab="path" class="active">本机路径 / 远程 URL</button>
+          <button type="button" data-emas-tab="upload">Web 流式上传</button>
+        </div>
         <div class="grid-2">
           <div class="field">
             <label for="emas-name">数据源名称</label>
             <input type="text" id="emas-name" placeholder="例如：本地社区离线图库">
           </div>
-          <div class="field">
+          <div class="field" id="emas-kind-field">
             <label for="emas-kind">数据源类型 (kind)</label>
             <select id="emas-kind">
               <option value="offline_sqlite">离线图库 (offline_sqlite)</option>
@@ -4478,10 +5737,12 @@
           </div>
         </div>
         <div class="grid-2">
-          <div class="field">
+          <div class="field" id="emas-schema-field">
             <label for="emas-schema">数据结构规范 (schemaType)</label>
             <select id="emas-schema">
               <option value="">自动探测（推荐）</option>
+              <option value="komga_sqlite_v1">komga_sqlite_v1（Komga database.sqlite）</option>
+              <option value="mangaalpha_meta_v2">mangaalpha_meta_v2（开放规范 v2）</option>
               <option value="mangaalpha_meta_v1">mangaalpha_meta_v1（单表标准）</option>
               <option value="gallery_v1">gallery_v1（四表图库兼容）</option>
               <option value="tag_translation_text_v1">tag_translation_text_v1（标签词典）</option>
@@ -4497,19 +5758,25 @@
             </select>
           </div>
         </div>
-        <div class="field">
-          <label for="emas-download-url">离线包下载链接（可选）</label>
-          <input type="url" id="emas-download-url" placeholder="https://... (.sqlite / .zst / .gz / .zip / .ndjson.gz)">
+        <div id="emas-pane-path">
+          <div class="field">
+            <label for="emas-download-url">离线包下载链接（可选）</label>
+            <input type="url" id="emas-download-url" placeholder="https://... (.sqlite / .zst / .gz / .zip / .ndjson.gz)">
+          </div>
+          <div class="field">
+            <label for="emas-local-path">服务器本地文件路径（可选）</label>
+            <input type="text" id="emas-local-path" placeholder="/data/metadata/my-meta.sqlite">
+            <div class="field-hint extmeta-local-wal-hint">${EXT_LOCAL_WAL_HINT}</div>
+          </div>
+          ${extOnlineApiDetailsHTML({
+            detailsId: 'emas-online-details',
+            inputId: 'emas-online-url',
+            marginBottom: '14px',
+          })}
         </div>
-        <div class="field">
-          <label for="emas-local-path">服务器本地文件路径（可选）</label>
-          <input type="text" id="emas-local-path" placeholder="/data/metadata/my-meta.sqlite">
+        <div id="emas-pane-upload" style="display:none;margin-bottom:14px">
+          ${extUploadPaneHTML('emas')}
         </div>
-        ${extOnlineApiDetailsHTML({
-          detailsId: 'emas-online-details',
-          inputId: 'emas-online-url',
-          marginBottom: '14px',
-        })}
         <div class="grid-2">
           <div class="field">
             <label for="emas-tag-dict">关联标签词典</label>
@@ -4534,8 +5801,61 @@
           </label>
         </div>
       `,
-      footHTML: `<button type="button" class="btn btn-primary" id="emas-create-btn">添加数据源</button>`,
+      footHTML: `
+        <button type="button" class="btn btn-primary" id="emas-create-btn">添加数据源</button>
+        <button type="button" class="btn btn-primary" id="emas-upload-btn" style="display:none">开始流式上传并导入</button>
+      `,
       onMount: () => {
+        const panePath = document.getElementById('emas-pane-path');
+        const paneUpload = document.getElementById('emas-pane-upload');
+        const createBtn = document.getElementById('emas-create-btn');
+        const uploadBtn = document.getElementById('emas-upload-btn');
+        const kindSel = document.getElementById('emas-kind');
+        const schemaSel = document.getElementById('emas-schema');
+        const nameInput = document.getElementById('emas-name');
+        let prevKind = kindSel ? kindSel.value : 'offline_sqlite';
+
+        document.querySelectorAll('button[data-emas-tab]').forEach((tabBtn) => {
+          tabBtn.onclick = () => {
+            const isUpload = tabBtn.getAttribute('data-emas-tab') === 'upload';
+            document.querySelectorAll('button[data-emas-tab]').forEach((other) => {
+              if (other.classList) other.classList.toggle('active', other === tabBtn);
+            });
+            if (panePath) panePath.style.display = isUpload ? 'none' : '';
+            if (paneUpload) paneUpload.style.display = isUpload ? '' : 'none';
+            if (createBtn) createBtn.style.display = isUpload ? 'none' : '';
+            if (uploadBtn) uploadBtn.style.display = isUpload ? '' : 'none';
+            if (kindSel) {
+              if (isUpload) {
+                prevKind = kindSel.value || 'offline_sqlite';
+                kindSel.value = 'offline_sqlite';
+                kindSel.disabled = true;
+              } else {
+                kindSel.disabled = false;
+                kindSel.value = prevKind;
+              }
+            }
+            if (schemaSel) schemaSel.disabled = isUpload;
+            if (nameInput) {
+              nameInput.placeholder = isUpload ? '可选，留空则自动使用上传文件名' : '例如：本地社区离线图库';
+            }
+          };
+        });
+
+        bindExtUploadPane({
+          prefix: 'emas',
+          uploadBtnId: 'emas-upload-btn',
+          getOrderedFields: () => [
+            ['name', (document.getElementById('emas-name')?.value || '').trim()],
+            ['kind', 'offline_sqlite'],
+            ['enabled', document.getElementById('emas-enabled')?.checked ? 'true' : 'false'],
+            ['tagDictSourceId', document.getElementById('emas-tag-dict')?.value || ''],
+            ['tagDisplayMode', document.getElementById('emas-tag-mode')?.value || 'zh'],
+            ['autoUpdate', document.getElementById('emas-auto-update')?.value || 'manual'],
+          ],
+          onSuccess: () => { if (onSaved) onSaved(); },
+        });
+
         document.getElementById('emas-create-btn').onclick = async () => {
           const name = document.getElementById('emas-name').value.trim();
           if (!name) {
@@ -5185,6 +6505,7 @@
             : `<div class="extmeta-source-list">
                 ${visibleMarketSources.map((s) => {
                   const km = extSourceKindMeta(s.kind);
+                  const sf = extSchemaFormatMeta(s);
                   const syncJob = activeSyncBySource.get(s.id);
                   const syncPct = syncJob && syncJob.totalBytes > 0
                     ? Math.min(100, Math.round((Number(syncJob.downloadedBytes || 0) / Number(syncJob.totalBytes)) * 100))
@@ -5207,12 +6528,13 @@
                           <div class="extmeta-source-title-row">
                             <strong>${esc(s.name)}</strong>
                             <span class="badge ${km.cls}">${esc(km.label)}</span>
-                            ${s.schemaType ? `<span class="badge">${esc(s.schemaType)}</span>` : ''}
+                            ${sf.label ? `<span class="badge ${sf.cls}" title="${esc(sf.raw)}">${esc(sf.label)}</span>` : ''}
                             <span class="badge ${s.ready ? 'badge-success' : 'badge-warn'}">${s.ready ? '已就绪' : '未就绪'}</span>
                             <span class="badge ${s.enabled ? 'badge-accent' : ''}">${s.enabled ? '已启用' : '已停用'}</span>
                             ${s.onlineEnabled ? `<span class="badge badge-warn">在线补全已开</span>` : ''}
                           </div>
                           ${s.description ? `<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">${esc(s.description)}</div>` : ''}
+                          ${extWalWarningHTML(s)}
                           <div class="extmeta-source-meta">
                             <span>条目数：<strong>${Number(s.entryCount || 0).toLocaleString()}</strong></span>
                             ${Number(s.fileSize || 0) > 0 ? `<span>体积：${fmtBytes(s.fileSize)}</span>` : ''}
@@ -8670,6 +9992,7 @@
     updateFooterVersion(state.auth);
     const p = location.pathname;
     if (!state.auth.claimed) {
+      state.seriesBooksViewOverride = { seriesId: '', mode: '' };
       if (p !== '/setup') {
         history.replaceState(null, '', '/setup');
       }
@@ -8678,11 +10001,13 @@
     }
 
     if (p === '/setup') {
+      state.seriesBooksViewOverride = { seriesId: '', mode: '' };
       navigate(state.auth.authenticated ? '/' : '/login', true);
       return;
     }
 
     if (p === '/login') {
+      state.seriesBooksViewOverride = { seriesId: '', mode: '' };
       if (state.auth.authenticated) {
         const redir = new URLSearchParams(location.search).get('redirect') || '/';
         navigate(safeRedirectTarget(redir), true);
@@ -8693,6 +10018,7 @@
     }
 
     if (!state.auth.authenticated) {
+      state.seriesBooksViewOverride = { seriesId: '', mode: '' };
       const redir = encodeURIComponent(p + location.search);
       history.replaceState(null, '', `/login?redirect=${redir}`);
       renderLogin();
@@ -8701,6 +10027,15 @@
 
     await ensureDisplayPrefs();
     if (seq !== routeSeq) return;
+
+    if (p.startsWith('/series/')) {
+      const targetSid = decodeURIComponent(p.slice('/series/'.length));
+      if (!state.seriesBooksViewOverride || state.seriesBooksViewOverride.seriesId !== targetSid) {
+        state.seriesBooksViewOverride = { seriesId: '', mode: '' };
+      }
+    } else if (!p.startsWith('/book/') && !p.startsWith('/books/') && !p.startsWith('/reader/')) {
+      state.seriesBooksViewOverride = { seriesId: '', mode: '' };
+    }
 
     if (p === '/' || p === '') {
       await renderHome();
