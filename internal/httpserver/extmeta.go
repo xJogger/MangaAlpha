@@ -319,8 +319,10 @@ func (s *Server) uploadMetadataSource(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.Enabled = &enabled
 	}
-	if v, ok := fields["tagDictSourceId"]; ok {
-		cfg.TagDictSourceID = &v
+	// An omitted multipart field preserves the binding. A present empty field clears it.
+	tagDictSourceID, hasTagDictField := fields["tagDictSourceId"]
+	if hasTagDictField {
+		cfg.TagDictSourceID = &tagDictSourceID
 	}
 	if v, ok := fields["tagDisplayMode"]; ok {
 		cfg.TagDisplayMode = &v

@@ -3,6 +3,7 @@ package httpserver
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"image"
 	"io"
@@ -334,6 +335,67 @@ func TestAdminV34BookCoverSource(t *testing.T) {
 		if err != nil || bm.CoverSource != source {
 			t.Fatalf("cover source not persisted: %q, err=%v", bm.CoverSource, err)
 		}
+	}
+}
+
+func TestAdminV34BookCustomCoverActivatesFromExternal(t *testing.T) {
+	f := newAdminV34Fixture(t)
+	f.library(t, "catalog", "Catalog", true)
+	f.book(t, "catalog", "series", "book", false)
+	f.user(t, "reader", false, "catalog")
+	const cover = "/admin/api/books/book/cover"
+	const thumbnailPath = "/api/v1/books/book/thumbnail"
+	const extURL = "https://covers.example.invalid/external.png"
+	const customURL = "https://covers.example.invalid/custom.png"
+	external := makeTestPNGBytes(t, 10, 20, 220)
+	remoteCustom := makeTestPNGBytes(t, 20, 220, 10)
+	f.thumbs.SetBookExternalCoverFetcher(func(_ context.Context, source, entry, _, url string) ([]byte, string, error) {
+		switch {
+		case source == "fixture-source" && entry == "fixture-entry" && url == extURL:
+			return external, "image/png", nil
+		case source == "" && entry == "book" && url == customURL:
+			return remoteCustom, "image/png", nil
+		default:
+			return nil, "", os.ErrNotExist
+		}
+	})
+	if err := f.store.UpsertBookScrapedMetadata(t.Context(), "book", database.BookScrapedMetadata{
+		ExtSourceID: "fixture-source", ExtEntryID: "fixture-entry", ExtCoverURL: extURL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pickExternal := func(t *testing.T) {
+		t.Helper()
+		f.jsonRequest(t, "owner", http.MethodPatch, cover+"-source", `{"coverSource":"ext"}`, http.StatusOK)
+		thumb := f.request(t, "reader", http.MethodGet, thumbnailPath, "", http.StatusOK)
+		if !bytes.Equal(thumb.Body.Bytes(), external) {
+			t.Fatal("external cover was not active")
+		}
+	}
+	pickExternal(t)
+	upload := makeTestPNGBytes(t, 220, 20, 10)
+	rec := f.coverUpload(t, "owner", "book", "file", upload, http.StatusOK)
+	assertAdminV34Fields(t, decodeV33[map[string]any](t, rec), map[string]any{
+		"coverSource": "custom", "hasCustomCover": true,
+	})
+	thumb := f.request(t, "reader", http.MethodGet, thumbnailPath, "", http.StatusOK)
+	img, _, err := image.Decode(bytes.NewReader(thumb.Body.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _, b, _ := img.At(0, 0).RGBA()
+	if r <= b {
+		t.Fatal("thumbnail did not switch to the uploaded cover")
+	}
+
+	pickExternal(t)
+	rec = f.jsonRequest(t, "owner", http.MethodPost, cover, `{"url":"`+customURL+`"}`, http.StatusOK)
+	assertAdminV34Fields(t, decodeV33[map[string]any](t, rec), map[string]any{
+		"coverSource": "custom", "hasCustomCover": true, "customCoverUrl": customURL,
+	})
+	thumb = f.request(t, "reader", http.MethodGet, thumbnailPath, "", http.StatusOK)
+	if !bytes.Equal(thumb.Body.Bytes(), remoteCustom) || thumb.Header().Get("Cache-Control") != "private, no-store" {
+		t.Fatal("thumbnail did not switch to the URL cover with private caching")
 	}
 }
 

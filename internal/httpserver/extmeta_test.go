@@ -585,14 +585,25 @@ INSERT INTO entries VALUES ('oe1','Open Entry','','[]','','[]','Manga','',9,0,1,
 		t.Fatalf("bad upload status = %d, want 400: %s", w.Code, w.Body.String())
 	}
 
-	// 3. Upload raw komga.sqlite with file part BEFORE name field -> 201 Created.
-	upResp := makeUploadReq(adminKey, "komga.sqlite", komgaRaw, false, [][2]string{{"name", "Uploaded Komga"}})
+	dict, err := store.UpsertMetadataSource(ctx, database.MetadataSource{
+		Kind: extmeta.KindTagDictionary, Name: "Fixture dictionary", Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 3. Upload raw komga.sqlite with file part BEFORE config fields -> 201 Created.
+	upResp := makeUploadReq(adminKey, "komga.sqlite", komgaRaw, false, [][2]string{
+		{"name", "Uploaded Komga"}, {"tagDictSourceId", dict.ID},
+	})
 	if upResp.Code != http.StatusCreated {
 		t.Fatalf("komga upload status = %d, want 201: %s", upResp.Code, upResp.Body.String())
 	}
 	createdView := decodeMetadataFixture[extmeta.SourceView](t, upResp)
 	if createdView.ID == "" || createdView.SchemaFormat != extmeta.FormatKomgaSQLite || !createdView.Ready || createdView.EntryCount != 1 {
 		t.Fatalf("unexpected upload response: %+v", createdView)
+	}
+	if createdView.TagDictSourceID != dict.ID {
+		t.Fatalf("new upload dictionary = %q, want %q", createdView.TagDictSourceID, dict.ID)
 	}
 
 	// 4. Entry cover served lazily from Komga BLOB.
@@ -690,6 +701,21 @@ INSERT INTO entries VALUES ('oe1','Open Entry','','[]','','[]','Manga','',9,0,1,
 	updView := decodeMetadataFixture[extmeta.SourceView](t, updResp)
 	if updView.SchemaFormat != extmeta.FormatOpenV2 {
 		t.Fatalf("expected updated schemaFormat=%q, got %+v", extmeta.FormatOpenV2, updView)
+	}
+	if updView.TagDictSourceID != dict.ID {
+		t.Fatalf("overwrite with omitted dictionary field = %q, want %q", updView.TagDictSourceID, dict.ID)
+	}
+	cleared := makeUploadReq(adminKey, "open.sqlite.gz", openGZ.Bytes(), false, [][2]string{
+		{"sourceId", createdView.ID}, {"tagDictSourceId", ""},
+	})
+	if cleared.Code != http.StatusOK {
+		t.Fatalf("overwrite clearing the dictionary = %d, want 200: %s", cleared.Code, cleared.Body.String())
+	}
+	if view := decodeMetadataFixture[extmeta.SourceView](t, cleared); view.TagDictSourceID != "" {
+		t.Fatalf("overwrite with empty dictionary field retained %q", view.TagDictSourceID)
+	}
+	if saved, err := store.GetMetadataSource(ctx, createdView.ID); err != nil || saved.TagDictSourceID != "" {
+		t.Fatalf("persisted dictionary was not cleared: %q, err=%v", saved.TagDictSourceID, err)
 	}
 	openCoverReq := httptest.NewRequest(http.MethodGet, "/admin/api/metadata/sources/"+createdView.ID+"/entries/oe1/cover", nil)
 	openCoverReq.Header.Set("X-API-Key", adminKey)

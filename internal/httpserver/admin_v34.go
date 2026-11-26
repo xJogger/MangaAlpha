@@ -87,11 +87,12 @@ func (s *Server) putBookCustomCover(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		prev, _, _ := s.store.BookMetadataByID(ctx, book.ID)
+		// Removing an uploaded file can reset an explicit custom selection.
 		if prev.CustomCoverPath != "" {
 			_ = s.thumbs.DeleteBookCustomCover(ctx, book.ID)
 		}
 		err = s.store.SetBookCustomCover(ctx, book.ID, "", rawURL)
-		if err == nil && prev.CoverSource == "custom" {
+		if err == nil && prev.CustomCoverPath != "" && prev.CoverSource == "custom" {
 			err = s.store.SetBookCoverSource(ctx, book.ID, "custom")
 		}
 	default:
@@ -109,6 +110,13 @@ func (s *Server) putBookCustomCover(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeBookCoverError(w, err)
 		return
+	}
+	if source := bookCoverSource(bm); source != database.CoverSourceAuto && source != "custom" {
+		if err := s.store.SetBookCoverSource(ctx, book.ID, "custom"); err != nil {
+			writeBookCoverError(w, err)
+			return
+		}
+		bm.CoverSource = "custom"
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"bookId":         book.ID,

@@ -183,6 +183,9 @@ function createFakeDOM() {
       get children() {
         return childNodes;
       },
+      get firstElementChild() {
+        return childNodes[0] || null;
+      },
       get classList() {
         return {
           add(...cls) {
@@ -444,12 +447,14 @@ function createV34Harness(options = {}) {
   }
 
   const prefsSlice = extractSlice('  const DISPLAY_PREFS = {', '  async function copyTextSafeGlobal(');
+  const recoverySlice = extractSlice('  function recoverUserContext()', '  let modalScroll = null;');
   const xhrSlice = extractSlice('  function xhrUploadFormData(', '  function navigate(target, replace = false)');
   const accountSlice = extractSlice('  // --- Personal Account Settings Page (/account) ---', '  // --- AI Agent One-Click Authorization Page (/agent-auth/:requestID) ---');
   const seriesDetailSlice = extractSlice('  // --- Series Detail View (/series/:id) ---', '  // --- Metadata Edit Modal ---');
   const bookDetailSlice = extractSlice('  // --- Book Detail View (/book/:id & /books/:id) ---', '  // --- Admin Console (/admin) ---');
   const adminLibsSlice = extractSlice('  // --- Admin Libraries Tab ---', '  async function browse115Drawer(');
   const scraperSlice = extractSlice('  // --- Admin Bangumi Scraper Center ---', '  // --- Admin Jobs Tab (Adaptive Polling ONLY when active!) ---');
+  const adminJobsSlice = extractSlice('  // --- Admin Jobs Tab (Adaptive Polling ONLY when active!) ---', '  // --- Admin Cache & Settings Tab ---');
   const routerSlice = extractSlice('  // --- Router ---', '  route();\n})();');
 
   let currentRenderTarget = null;
@@ -555,8 +560,8 @@ function createV34Harness(options = {}) {
     renderShell: (_active, html) => {
       appEl.innerHTML = `<main class="page-shell" id="page-content">${html}</main>`;
     },
-    schedulePoll: (fn, ms) => { pollScheduled = { fn, ms }; },
-    stopPolling: () => { pollScheduled = null; stopPollCalls += 1; },
+    schedulePoll: (fn, ms) => { pollScheduled = { fn, ms }; ctx.state.pollFn = fn; },
+    stopPolling: () => { pollScheduled = null; ctx.state.pollFn = null; stopPollCalls += 1; },
     updateFooterVersion: () => {},
     loadSeriesVersions: () => {},
     loadSeriesCollectionsBar: () => {},
@@ -599,7 +604,7 @@ function createV34Harness(options = {}) {
   if (options.disableXHR) delete ctx.XMLHttpRequest;
 
   vm.createContext(ctx);
-  vm.runInContext(prefsSlice + '\n' + xhrSlice + '\nthis.state = state; this.DISPLAY_PREFS = DISPLAY_PREFS;', ctx);
+  vm.runInContext(prefsSlice + '\n' + recoverySlice + '\n' + xhrSlice + '\nthis.state = state; this.DISPLAY_PREFS = DISPLAY_PREFS;', ctx);
 
   if (options.auth) {
     Object.assign(ctx.state.auth, options.auth);
@@ -616,9 +621,11 @@ function createV34Harness(options = {}) {
 
   if (options.includeAccount) vm.runInContext(accountSlice, ctx);
   if (options.includeSeriesDetail) vm.runInContext(seriesDetailSlice, ctx);
+  else vm.runInContext(extractSlice('  function currentUserId()', '  function isSeriesPath('), ctx);
   if (options.includeBookDetail) vm.runInContext(bookDetailSlice, ctx);
   if (options.includeAdminLibraries) vm.runInContext(adminLibsSlice, ctx);
   if (options.includeScraper) vm.runInContext(scraperSlice, ctx);
+  if (options.includeAdminJobs) vm.runInContext(adminJobsSlice, ctx);
   if (options.includeRouter) {
     vm.runInContext(routerSlice.replace('  let routeSeq = 0;', '  var routeSeq = 0;'), ctx);
   }
@@ -646,6 +653,18 @@ function createV34Harness(options = {}) {
 
 function flushMicrotasks() {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function makeSeriesFixture(seriesId, count) {
+  return {
+    series: { id: seriesId, booksCount: count, booksReadCount: 0, metadata: { title: seriesId } },
+    originalName: seriesId,
+    books: Array.from({ length: count }, (_, i) => ({
+      id: seriesId + '-b' + (i + 1),
+      name: 'Volume ' + (i + 1),
+      metadata: { number: String(i + 1) },
+    })),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -858,6 +877,7 @@ test('series cover mode renders 60 books per batch with IntersectionObserver laz
   let maxInFlight = 0;
   const h = createV34Harness({
     includeSeriesDetail: true,
+    pathname: '/series/s-long',
     storage: { 'fk115_display.u-admin.seriesBooksView': 'cover' },
     apiHandler: async (url, opts) => {
       if (url.includes('/read-progress')) {
@@ -916,7 +936,8 @@ test('series cover mode renders 60 books per batch with IntersectionObserver laz
   assert.ok(maxInFlight > 1 && maxInFlight <= 4, `expected bounded concurrency 2..4, got ${maxInFlight}`);
   const batchCalls = h.apiCalls.slice(callsBeforeBatch);
   assert.equal(batchCalls.length, 10);
-  assert.ok(batchCalls.every((c) => c.method === 'PATCH' && c.url.endsWith('/read-progress') && c.opts.body.completed === true));
+  assert.ok(batchCalls.every((c) => c.method === 'PATCH' && c.url.endsWith('/read-progress') &&
+    c.opts.body.completed === true && c.opts.headers['X-FK115-User-Id'] === 'u-admin'));
   // Partial refresh keeps 120 rendered books and updates b-3..b-12 to read
   assert.equal(h.doc.getElementById('series-books-body').querySelectorAll('.book-poster-card').length, 120);
   assert.equal(detail.books[2].readProgress.completed, true);
@@ -935,6 +956,7 @@ test('series cover mode renders 60 books per batch with IntersectionObserver laz
   await h.doc.getElementById('btn-books-batch-unread').onclick();
   const deleteCalls = h.apiCalls.filter((c) => c.method === 'DELETE' && c.url.endsWith('/read-progress'));
   assert.equal(deleteCalls.length, 2);
+  assert.ok(deleteCalls.every((c) => c.opts.headers['X-FK115-User-Id'] === 'u-admin'));
   assert.equal(detail.books[0].readProgress, null);
 
   // Fallback without IntersectionObserver sets src directly with loading="lazy"
@@ -947,6 +969,132 @@ test('series cover mode renders 60 books per batch with IntersectionObserver laz
   const fallbackImg = hNoIO.doc.getElementById('series-books-body').querySelector('img');
   assert.match(fallbackImg.getAttribute('src'), /^\/api\/v1\/books\/b-1\/thumbnail\?v=/);
   assert.equal(fallbackImg.getAttribute('loading'), 'lazy');
+});
+
+for (const [cause, method] of [['account change', 'PATCH'], ['logout', 'DELETE'],
+  ['route change', 'PATCH'], ['series change', 'DELETE'], ['409', 'DELETE']]) {
+  test('batch read progress stops dispatch on ' + cause, async () => {
+    const h = createV34Harness({ includeSeriesDetail: true, pathname: '/series/work' });
+    let refreshes = 0;
+    h.ctx.route = () => { refreshes += 1; };
+    vm.runInContext(extractSlice('  async function api(url, opts = {}) {', '  let modalScroll = null;'), h.ctx);
+    const requests = [];
+    h.ctx.fetch = (url, opts) => {
+      const { promise, resolve } = Promise.withResolvers();
+      requests.push({ url, opts, resolve });
+      if (requests.length > 4) resolve(new Response(null, { status: 204 }));
+      return promise;
+    };
+    h.ctx.paintSeriesDetail('work', makeSeriesFixture('work', 8), []);
+    h.doc.getElementById('btn-books-batch-toggle').onclick();
+    h.doc.getElementById('btn-books-select-all').onclick();
+    const pending = h.doc.getElementById(method === 'PATCH' ? 'btn-books-batch-read' : 'btn-books-batch-unread').onclick();
+    assert.equal(requests.length, 4);
+
+    if (cause === 'account change') h.state.auth.userId = 'new-user';
+    if (cause === 'logout') h.state.auth.authenticated = false;
+    if (cause === 'route change') h.ctx.routeSeq += 1;
+    if (cause === 'series change') h.setLocation('/series/another');
+    if (cause === '409') {
+      requests[0].resolve(Response.json({ error: 'USER_CONTEXT_MISMATCH' }, { status: 409 }));
+      await flushMicrotasks();
+      assert.equal(refreshes, 1);
+    }
+    requests.slice(cause === '409' ? 1 : 0, 4).forEach(({ resolve }) => {
+      resolve(new Response(null, { status: 204 }));
+    });
+    await pending;
+    assert.equal(requests.length, 4);
+    assert.ok(requests.every(({ opts }) => opts.method === method && opts.headers['X-FK115-User-Id'] === 'u-admin'));
+  });
+}
+
+test('series maintenance repaint preserves loaded batches, selections and an in-flight batch', async () => {
+  const seriesID = 'work';
+  const queued = { id: 'maintenance', status: 'queued', totalItems: 130 };
+  const finished = { id: queued.id, status: 'success', totalItems: 130, processedItems: 130, generatedCount: 130 };
+  const batchWrite = Promise.withResolvers();
+  let userId = 'u-admin';
+  const h = createV34Harness({
+    includeSeriesDetail: true,
+    includeRouter: true,
+    pathname: '/series/work',
+    apiHandler: async (url) => {
+      if (url === '/admin/api/auth/status') return { claimed: true, authenticated: true, isAdmin: true, userId };
+      if (url.startsWith('/admin/api/maintenance-jobs')) return [finished];
+      if (url.endsWith('/read-progress')) return batchWrite.promise;
+      if (url === '/admin/api/series/work/detail') return makeSeriesFixture(seriesID, 130);
+      if (url === '/admin/api/series/another/detail') return makeSeriesFixture('another', 130);
+      return {};
+    },
+  });
+  h.ctx.paintSeriesDetail(seriesID, makeSeriesFixture(seriesID, 130), [queued]);
+  h.doc.getElementById('btn-books-load-more').onclick();
+  h.doc.getElementById('btn-books-batch-toggle').onclick();
+  const firstBody = h.doc.getElementById('series-books-body');
+  const select = firstBody.querySelectorAll('input[data-book-select]')[75];
+  select.checked = true;
+  select.onchange();
+  const pending = h.doc.getElementById('btn-books-batch-read').onclick();
+
+  await h.getPollScheduled().fn();
+  assert.equal(h.getPollScheduled(), null);
+  const refreshedBody = h.doc.getElementById('series-books-body');
+  assert.notEqual(refreshedBody, firstBody);
+  assert.equal(refreshedBody.querySelectorAll('input[data-book-select]').length, 120);
+  assert.equal(refreshedBody.querySelectorAll('input[data-book-select]')[75].checked, true);
+  assert.equal(h.doc.getElementById('btn-books-batch-toggle').textContent, '退出批量选择');
+  assert.equal(h.doc.getElementById('btn-books-batch-read').disabled, true);
+  assert.equal(h.state.seriesBooks.batchBusy, true);
+  await h.doc.getElementById('btn-books-batch-read').onclick();
+  assert.equal(h.apiCalls.filter(({ url }) => url.endsWith('/read-progress')).length, 1);
+
+  batchWrite.resolve(null);
+  await pending;
+  assert.equal(h.state.seriesBooks.batchBusy, false);
+  assert.ok(refreshedBody.querySelector('button[data-book-unread="work-b76"]'));
+  assert.equal(refreshedBody.querySelectorAll('input[data-book-select]')[75].checked, false);
+  assert.equal(refreshedBody.querySelectorAll('input[data-book-select]').length, 120);
+
+  userId = 'another-user';
+  await h.ctx.route();
+  assert.equal(h.doc.getElementById('btn-books-batch-toggle').textContent, '批量选择');
+  assert.match(h.doc.getElementById('series-books-more-bar').innerHTML, /<strong>60<\/strong> \/ 130/);
+  h.doc.getElementById('btn-books-load-more').onclick();
+  h.doc.getElementById('btn-books-batch-toggle').onclick();
+  h.doc.getElementById('btn-books-select-all').onclick();
+  h.setLocation('/series/another');
+  await h.ctx.route();
+  assert.equal(h.doc.getElementById('btn-books-batch-toggle').textContent, '批量选择');
+  assert.match(h.doc.getElementById('series-books-more-bar').innerHTML, /<strong>60<\/strong> \/ 130/);
+  assert.equal(h.state.seriesBooks.selectedBookIds.size, 0);
+});
+
+test('series and admin maintenance rows render DTO progress, error lists, and all statuses', () => {
+  const h = createV34Harness({ includeSeriesDetail: true, includeAdminJobs: true });
+  const jobs = [
+    { id: 'waiting', status: 'queued', totalItems: 12, processedItems: 0 },
+    { id: 'active', status: 'running', totalItems: 12, processedItems: 7, generatedCount: 5, skippedCount: 1, failedCount: 1, errors: ['第 2 卷：读取失败 <fixture>'] },
+    { id: 'done', status: 'success', totalItems: 12, processedItems: 12, succeededItems: 10, skippedItems: 2, failedItems: 0 },
+    { id: 'partial', status: 'partial', totalItems: 12, processedItems: 12, generatedCount: 10, skippedCount: 1, failedCount: 1 },
+    { id: 'failed', status: 'failed', totalItems: 2, processedItems: 2, failedCount: 2, errors: ['索引损坏', '图片不可用'] },
+    { id: 'canceled', status: 'canceled', totalItems: 12, processedItems: 3 },
+  ];
+  h.ctx.paintSeriesDetail('work', makeSeriesFixture('work', 12), jobs);
+  const seriesJobs = h.doc.getElementById('series-maint-jobs').innerHTML;
+  const adminBody = h.doc.createElement('div');
+  h.ctx.paintAdminJobs(adminBody, [], [], [], jobs);
+  for (const html of [seriesJobs, adminBody.innerHTML]) {
+    assert.doesNotMatch(html, /0\/0/);
+    assert.match(html, /7\/12 · 成功 5 · 跳过 1 · 失败 1/);
+    assert.match(html, /12\/12 · 成功 10 · 跳过 2 · 失败 0/);
+    assert.match(html, /<li>第 2 卷：读取失败 &lt;fixture&gt;<\/li>/);
+    assert.match(html, /<li>索引损坏<\/li><li>图片不可用<\/li>/);
+    for (const label of ['排队中', '运行中', '已完成', '部分成功', '失败', '已取消']) {
+      assert.ok(html.includes('>' + label + '</span>'));
+    }
+    assert.deepEqual([...html.matchAll(/data-cancel-maint="([^"]+)"/g)].map((m) => m[1]), ['waiting', 'active']);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1082,7 +1230,7 @@ test('book detail renders two-column metadata, edits 9 fields + 9 locks + clearN
         isbnLock: true,
         authors: [{ name: '作者甲', role: 'writer' }, { name: '插画乙', role: 'illustrator' }],
         authorsLock: false,
-        tags: ['冒险', '热血'],
+        tags: ['History, Modern', '热血'],
         tagsLock: true,
         links: [{ label: 'BGM', url: 'https://bgm.tv/subject/100' }],
         linksLock: false,
@@ -1120,11 +1268,19 @@ test('book detail renders two-column metadata, edits 9 fields + 9 locks + clearN
   const h = createV34Harness({
     includeBookDetail: true,
     pathname: '/book/bk-1',
-    apiHandler: async (url) => {
+    apiHandler: async (url, opts) => {
       if (url === '/admin/api/books/bk-1/detail') return sampleBookDetail;
       if (url.startsWith('/admin/api/maintenance-jobs')) return [];
       if (url === '/admin/api/books/bk-1/comicinfo/refresh') return { bookId: 'bk-1', status: 'parsed' };
+      if (url === '/admin/api/books/bk-1/cover' && opts.method === 'POST') {
+        Object.assign(sampleBookDetail.rawBookMeta, { coverSource: 'custom', customCoverUrl: opts.body.url });
+      }
       return {};
+    },
+    xhrHandler: (xhr) => {
+      Object.assign(sampleBookDetail.rawBookMeta, { coverSource: 'custom', customCoverUrl: '' });
+      xhr.responseText = JSON.stringify({ coverSource: 'custom', hasCustomCover: true });
+      xhr.onload();
     },
   });
 
@@ -1155,6 +1311,19 @@ test('book detail renders two-column metadata, edits 9 fields + 9 locks + clearN
   assert.ok(delCoverCall);
 
   // 3. Upload custom cover file via FormData + XHR
+  const bookPage = () => h.doc.getElementById('page-content');
+  const prepareExternalCover = () => {
+    sampleBookDetail.rawBookMeta.coverSource = 'ext';
+    h.state.coverVer = 1;
+    h.ctx.paintBookDetail('bk-1', sampleBookDetail, []);
+    assert.ok(bookPage().querySelector('button[data-book-cover-src="ext"]').classList.contains('active'));
+  };
+  const assertCustomCoverReloaded = () => {
+    assert.ok(bookPage().querySelector('button[data-book-cover-src="custom"]').classList.contains('active'));
+    assert.notEqual(h.state.coverVer, 1);
+    assert.ok(bookPage().querySelector('img').src.endsWith('/thumbnail?v=' + h.state.coverVer));
+  };
+  prepareExternalCover();
   h.doc.getElementById('bk-upload-cover').onclick();
   const fakeImgFile = { name: 'cover.jpg', size: 2048 };
   h.doc.getElementById('bkc-file').files = [fakeImgFile];
@@ -1165,6 +1334,31 @@ test('book detail renders two-column metadata, edits 9 fields + 9 locks + clearN
   assert.equal(h.xhrCalls[0].withCredentials, true);
   assert.equal(h.xhrCalls[0].headers['X-FK115-User-Id'], 'u-admin');
   assert.equal(h.xhrCalls[0].body.get('file'), fakeImgFile);
+  assertCustomCoverReloaded();
+
+  prepareExternalCover();
+  h.doc.getElementById('bk-upload-cover').onclick();
+  h.modalRoot.querySelector('button[data-bkc-tab="url"]').onclick();
+  const coverURL = 'https://covers.example.invalid/another.jpg';
+  h.doc.getElementById('bkc-url').value = coverURL;
+  await h.doc.getElementById('bkc-submit').onclick();
+  await flushMicrotasks();
+  const coverURLCall = h.apiCalls.find((c) => c.url === '/admin/api/books/bk-1/cover' && c.method === 'POST');
+  assert.equal(coverURLCall.opts.body.url, coverURL);
+  assertCustomCoverReloaded();
+
+  // Saving the inherited/default values unchanged sends no PATCH.
+  sampleBookDetail.rawBookMeta.numberSortExplicit = false;
+  h.doc.getElementById('bk-edit-meta').onclick();
+  assert.equal(h.doc.getElementById('bm-edit-tags').value, 'History, Modern\n热血');
+  await h.doc.getElementById('bm-edit-save').onclick();
+  const metadataPatches = () => h.apiCalls.filter((c) => c.url === '/api/v1/books/bk-1/metadata' && c.method === 'PATCH');
+  assert.equal(metadataPatches().length, 0);
+  h.doc.getElementById('bk-edit-meta').onclick();
+  h.doc.getElementById('bm-edit-summary').value = '只改简介';
+  await h.doc.getElementById('bm-edit-save').onclick();
+  await flushMicrotasks();
+  assert.deepEqual(JSON.parse(JSON.stringify(metadataPatches()[0].opts.body)), { summary: '只改简介' });
 
   // 4. Edit 9 metadata fields + 9 locks
   h.doc.getElementById('bk-edit-meta').onclick();
@@ -1180,7 +1374,7 @@ test('book detail renders two-column metadata, edits 9 fields + 9 locks + clearN
   h.doc.getElementById('bm-edit-isbn-lock').checked = false;
   h.doc.getElementById('bm-edit-authors').value = '作者新 | writer\n助手 | inker';
   h.doc.getElementById('bm-edit-authors-lock').checked = true;
-  h.doc.getElementById('bm-edit-tags').value = '标签A, 标签B';
+  h.doc.getElementById('bm-edit-tags').value += '\n标签A';
   h.doc.getElementById('bm-edit-tags-lock').checked = true;
   h.doc.getElementById('bm-edit-links').value = '官网 | https://example.org/book';
   h.doc.getElementById('bm-edit-links-lock').checked = true;
@@ -1189,23 +1383,20 @@ test('book detail renders two-column metadata, edits 9 fields + 9 locks + clearN
 
   await h.doc.getElementById('bm-edit-save').onclick();
   await flushMicrotasks();
-  const patchMetaCall = h.apiCalls.find((c) => c.url === '/api/v1/books/bk-1/metadata' && c.method === 'PATCH');
+  const patchMetaCall = metadataPatches().at(-1);
   assert.ok(patchMetaCall);
   assert.deepEqual(JSON.parse(JSON.stringify(patchMetaCall.opts.body)), {
     title: '新卷标题',
-    titleLock: true,
     number: '01',
     numberLock: false,
     numberSort: 2.5,
-    numberSortLock: true,
     releaseDate: '2025-01-10',
     releaseDateLock: true,
     isbn: '9780000000001',
     isbnLock: false,
     authors: [{ name: '作者新', role: 'writer' }, { name: '助手', role: 'inker' }],
     authorsLock: true,
-    tags: ['标签A', '标签B'],
-    tagsLock: true,
+    tags: ['History, Modern', '热血', '标签A'],
     links: [{ label: '官网', url: 'https://example.org/book' }],
     linksLock: true,
     summary: '更新后的简介',
@@ -1232,6 +1423,45 @@ test('book detail renders two-column metadata, edits 9 fields + 9 locks + clearN
   const ciCall = h.apiCalls.find((c) => c.url === '/admin/api/books/bk-1/comicinfo/refresh' && c.method === 'POST');
   assert.deepEqual(JSON.parse(JSON.stringify(ciCall.opts.body)), { force: true });
 });
+
+for (const [stage, change] of [['jobs', 'route'], ['jobs', 'book'], ['jobs', 'user'],
+  ['detail', 'route'], ['detail', 'book'], ['detail', 'user']]) {
+  test('book maintenance drops stale ' + stage + ' response after ' + change + ' changes', async () => {
+    const deferred = Promise.withResolvers();
+    const h = createV34Harness({
+      includeBookDetail: true,
+      pathname: '/books/volume',
+      apiHandler: async (url) => {
+        if (url.startsWith('/admin/api/maintenance-jobs')) {
+          return stage === 'jobs' ? deferred.promise : [{ status: 'success' }];
+        }
+        if (url.endsWith('/detail')) return deferred.promise;
+        return {};
+      },
+    });
+    let repaints = 0;
+    h.ctx.paintBookDetail = () => { repaints += 1; };
+    h.ctx.renderShell('libraries', '<div id="book-maint-jobs">old page</div>');
+    const pending = h.ctx.pollBookMaint('volume');
+    if (stage === 'detail') {
+      await flushMicrotasks();
+      assert.equal(h.apiCalls.at(-1).url, '/admin/api/books/volume/detail');
+    }
+    if (change === 'route') h.ctx.routeSeq += 1;
+    if (change === 'book') h.setLocation('/book/another');
+    if (change === 'user') h.state.auth.userId = 'another-user';
+    h.ctx.renderShell('libraries', '<div id="book-maint-jobs">new page</div>');
+    h.ctx.schedulePoll(() => {}, 200);
+    const newPoll = h.getPollScheduled();
+
+    deferred.resolve(stage === 'jobs' ? [{ status: 'running' }] : { book: { id: 'volume' } });
+    await pending;
+    assert.equal(h.doc.getElementById('book-maint-jobs').innerHTML, 'new page');
+    assert.equal(repaints, 0);
+    assert.equal(h.getPollScheduled(), newPoll);
+    assert.ok(h.apiCalls.every(({ opts }) => opts.headers['X-FK115-User-Id'] === 'u-admin'));
+  });
+}
 
 // ---------------------------------------------------------------------------
 // 6. Admin Libraries oneshotsDirectory + batch buttons & Metadata Center streaming upload + -wal warning
@@ -1318,6 +1548,7 @@ test('metadata center renders schemaFormat badges, -wal warnings, and streams SQ
         enabled: true,
         ready: true,
         entryCount: 1200,
+        tagDictSourceId: 'dict-1',
         walWarning: true,
         walWarningBytes: 4 * 1024 * 1024,
         walWarningMessage: '检测到同目录存在未 Checkpoint 的 -wal 日志，可能缺少最新增量数据；请先停止 Komga 或执行 Checkpoint 后再同步',
@@ -1327,6 +1558,8 @@ test('metadata center renders schemaFormat badges, -wal warnings, and streams SQ
         kind: 'offline_sqlite',
         schemaFormat: 'mangaalpha_meta_v2',
         name: '开放包 v2',
+        repoId: 'fixture-repo',
+        tagDictSourceId: 'dict-1',
         enabled: true,
         ready: true,
         entryCount: 500,
@@ -1440,6 +1673,9 @@ test('metadata center renders schemaFormat badges, -wal warnings, and streams SQ
   assert.match(h.doc.getElementById('ems-pane-path').innerHTML, /请先停止 Komga 或执行 WAL Checkpoint/);
 
   h.modalRoot.querySelector('button[data-ems-tab="upload"]').onclick();
+  const dict = h.doc.getElementById('ems-tag-dict');
+  assert.equal(dict.value, 'dict-1');
+  dict.value = '';
   h.doc.getElementById('ems-upload-file').files = [fakeDbFile];
   await h.doc.getElementById('ems-upload-btn').onclick();
   await flushMicrotasks();
@@ -1448,6 +1684,69 @@ test('metadata center renders schemaFormat badges, -wal warnings, and streams SQ
   const editEntries = h.xhrCalls[1].body.entries();
   assert.deepEqual(editEntries[0], ['sourceId', 'src-komga']);
   assert.equal(editEntries[editEntries.length - 1][0], 'file');
+  assert.equal(h.xhrCalls[1].body.get('tagDictSourceId'), '');
+
+  body.querySelector('button[data-extmeta-src-edit="src-v2"]').onclick();
+  h.modalRoot.querySelector('button[data-ems-tab="upload"]').onclick();
+  assert.match(h.doc.getElementById('ems-pane-upload').innerHTML, /仓库订阅管理.*关联标签词典/);
+  for (const id of ['ems-enabled', 'ems-tag-dict', 'ems-tag-mode', 'ems-auto-update']) {
+    assert.equal(h.doc.getElementById(id).disabled, true);
+  }
+  h.doc.getElementById('ems-upload-file').files = [fakeDbFile];
+  await h.doc.getElementById('ems-upload-btn').onclick();
+  assert.equal(h.xhrCalls[2].body.get('tagDictSourceId'), 'dict-1');
+
+  body.querySelector('button[data-extmeta-src-edit="src-v2"]').onclick();
+  h.modalRoot.querySelector('button[data-ems-tab="upload"]').onclick();
+  h.modalRoot.querySelector('button[data-ems-tab="path"]').onclick();
+  assert.equal(h.doc.getElementById('ems-tag-dict').disabled, false);
+});
+
+test('upload authentication failures close the modal and recover the current route', async () => {
+  const h = createV34Harness({
+    includeRouter: true,
+    pathname: '/admin',
+    search: '?tab=bangumi',
+    apiHandler: async (url) => {
+      if (url === '/admin/api/auth/status') {
+        return { claimed: true, authenticated: true, userId: 'new-admin', isAdmin: true };
+      }
+      return {};
+    },
+    xhrHandler: () => {},
+  });
+  const upload = (status, code, changeUser = false) => {
+    h.ctx.openModal({ title: 'Upload', bodyHTML: '<input type="file">' });
+    const pending = h.ctx.xhrUploadFormData('/admin/api/metadata/sources/upload', new FakeFormData());
+    const xhr = h.xhrCalls.at(-1);
+    if (changeUser) h.state.auth.userId = 'new-admin';
+    xhr.status = status;
+    xhr.responseText = JSON.stringify({ error: code });
+    xhr.onload();
+    return pending;
+  };
+  await assert.rejects(upload(401, 'UNAUTHORIZED'), { status: 401, code: 'UNAUTHORIZED' });
+  assert.equal(h.modalRoot.innerHTML, '');
+  assert.deepEqual(h.navigated, ['/login?redirect=%2Fadmin%3Ftab%3Dbangumi']);
+
+  h.setLocation('/admin', '?tab=bangumi');
+  await assert.rejects(upload(409, 'OTHER_CONFLICT'), { status: 409, code: 'OTHER_CONFLICT' });
+  assert.ok(h.modalRoot.firstElementChild);
+  await assert.rejects(upload(409, 'USER_CONTEXT_MISMATCH'), { status: 409, code: 'USER_CONTEXT_MISMATCH' });
+  await flushMicrotasks();
+  assert.equal(h.modalRoot.innerHTML, '');
+  assert.equal(h.state.auth.userId, 'new-admin');
+  assert.equal(h.getCurrentRenderTarget(), 'admin');
+
+  h.state.auth.userId = 'old-admin';
+  await assert.rejects(upload(200, '', true), { code: 'USER_CONTEXT_MISMATCH' });
+  await flushMicrotasks();
+  assert.equal(h.modalRoot.innerHTML, '');
+
+  h.state.auth.userId = 'old-admin';
+  h.ctx.openModal({ title: 'Upload', bodyHTML: '<input type="file">' });
+  await h.ctx.route();
+  assert.equal(h.modalRoot.innerHTML, '');
 });
 
 // ---------------------------------------------------------------------------
@@ -1459,4 +1758,6 @@ test('app.css v3.4.0 additions use theme CSS variables without hardcoded colors'
   const slice = cssSource.slice(start);
   assert.doesNotMatch(slice, /#[0-9a-fA-F]{3,8}\b/);
   assert.doesNotMatch(slice, /\brgba?\(/);
+  assert.match(cssSource, /\.poster-badge-top-left\s*\{[^}]*color:\s*var\(--warn\)[^}]*background:\s*var\(--overlay-strong\)/);
+  assert.doesNotMatch(slice, /\.book-vol-badge\s*\{/);
 });

@@ -3639,11 +3639,6 @@ table.data-table .btn {
   height: 100%;
 }
 
-.book-vol-badge {
-  color: var(--text);
-  border-color: var(--border-strong);
-}
-
 .book-vol-badge.has-batch-check {
   left: 38px;
 }

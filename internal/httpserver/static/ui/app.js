@@ -92,6 +92,7 @@
     displayPrefs: defaultDisplayPrefs(),
     displayPrefsUserId: '',
     seriesBooksViewOverride: { seriesId: '', mode: '' },
+    seriesBooks: null,
     bookCoverObserver: null,
     libraries: [],
     taxonomies: { loaded: false, genres: [], tags: [], publishers: [] },
@@ -659,7 +660,7 @@
 
   async function api(url, opts = {}) {
     const throwIfAborted = () => {
-      if (opts.signal && opts.signal.aborted) {
+      if (opts.signal?.aborted || (opts.isCurrent && !opts.isCurrent())) {
         const err = new Error('Aborted');
         err.name = 'AbortError';
         throw err;
@@ -674,7 +675,7 @@
       !url.startsWith('/admin/api/auth/logout') &&
       !url.startsWith('/admin/api/auth/setup')
     ) {
-      headers['X-FK115-User-Id'] = state.auth.userId;
+      headers['X-FK115-User-Id'] ??= state.auth.userId;
     }
     const fetchOpts = {
       method,
@@ -695,8 +696,7 @@
       try { errData = await resp.clone().json(); } catch (_) {}
       throwIfAborted();
       if (errData && errData.error === 'USER_CONTEXT_MISMATCH') {
-        route();
-        throw new Error('登录账号已切换，页面已刷新，请重试');
+        throw recoverUserContext();
       }
     }
     if (resp.status === 401 && !opts.allow401 && !(opts.signal && opts.signal.aborted)) {
@@ -704,13 +704,7 @@
       try { errData = await resp.json(); } catch (_) {}
       // The signal can abort during body parsing; re-check before redirecting.
       throwIfAborted();
-      if (errData.error === 'SETUP_REQUIRED') {
-        navigate('/setup', true);
-      } else if (location.pathname !== '/login') {
-        const redir = encodeURIComponent(location.pathname + location.search);
-        navigate(`/login?redirect=${redir}`, true);
-      }
-      throw new Error(errData.message || '请先登录');
+      throw recoverUnauthorized(errData);
     }
     if (resp.status === 204) return null;
     const ct = resp.headers.get('content-type') || '';
@@ -723,6 +717,29 @@
       throw err;
     }
     return data;
+  }
+
+  function recoverUserContext() {
+    closeModal();
+    route();
+    const err = new Error('登录账号已切换，页面已刷新，请重试');
+    err.status = 409;
+    err.code = 'USER_CONTEXT_MISMATCH';
+    return err;
+  }
+
+  function recoverUnauthorized(data) {
+    closeModal();
+    if (data?.error === 'SETUP_REQUIRED') {
+      navigate('/setup', true);
+    } else if (location.pathname !== '/login') {
+      const redir = encodeURIComponent(location.pathname + location.search);
+      navigate(`/login?redirect=${redir}`, true);
+    }
+    const err = new Error(data?.message || '请先登录');
+    err.status = 401;
+    err.code = data?.error;
+    return err;
   }
 
   let modalScroll = null;
@@ -892,7 +909,7 @@
       xhr.open('POST', url, true);
       xhr.withCredentials = true;
       xhr.setRequestHeader('X-FK115-UI', '1');
-      const uid = (state.auth && state.auth.userId) || '';
+      const uid = currentUserId();
       if (uid) xhr.setRequestHeader('X-FK115-User-Id', uid);
       if (xhr.upload && typeof onProgress === 'function') {
         xhr.upload.onprogress = (ev) => {
@@ -907,13 +924,16 @@
         const raw = xhr.responseText || '';
         let data = null;
         try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
-        if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(data);
+        if (xhr.status === 401) {
+          reject(recoverUnauthorized(data));
           return;
         }
-        if (xhr.status === 409 && data && data.error === 'USER_CONTEXT_MISMATCH') {
-          if (typeof route === 'function') route();
-          reject(new Error('登录账号已切换，页面已刷新，请重试'));
+        if (currentUserId() !== uid || (xhr.status === 409 && data?.error === 'USER_CONTEXT_MISMATCH')) {
+          reject(recoverUserContext());
+          return;
+        }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(data);
           return;
         }
         const msg = (data && typeof data === 'object' && (data.message || data.error)) || `上传失败 (${xhr.status})`;
@@ -1926,6 +1946,14 @@
 
   const SERIES_BOOKS_BATCH_SIZE = 60;
 
+  function currentUserId() {
+    return state.auth?.authenticated ? state.auth.userId || '' : '';
+  }
+
+  function isSeriesPath(seriesID) {
+    return location.pathname === `/series/${encodeURIComponent(seriesID)}` || location.pathname === `/series/${seriesID}`;
+  }
+
   function resolveSeriesBooksViewMode(seriesID) {
     const ov = (typeof state === 'object' && state && state.seriesBooksViewOverride) || null;
     if (ov && ov.seriesId === seriesID && (ov.mode === 'list' || ov.mode === 'cover')) {
@@ -1956,13 +1984,13 @@
     }
   }
 
-  async function runBoundedConcurrency(items, limit, worker) {
-    const queue = items.slice();
-    const width = Math.max(1, Math.min(limit, queue.length));
+  async function runBoundedConcurrency(items, limit, shouldContinue, worker) {
+    const width = Math.min(limit, items.length);
     const results = [];
+    let next = 0;
     const workers = Array.from({ length: width }, async () => {
-      while (queue.length > 0) {
-        const item = queue.shift();
+      while (next < items.length && shouldContinue()) {
+        const item = items[next++];
         results.push(await worker(item));
       }
     });
@@ -2125,6 +2153,7 @@
 
   async function renderSeriesDetail(seriesID) {
     const seq = routeSeq;
+    const uid = currentUserId();
     renderShell('libraries', `<div class="boot-splash" style="min-height:45vh"><div class="spinner"></div><p>正在读取作品详情…</p></div>`);
     try {
       const [detail, maintJobs] = await Promise.all([
@@ -2133,10 +2162,10 @@
           ? api(`/admin/api/maintenance-jobs?targetType=series&targetId=${encodeURIComponent(seriesID)}&limit=6`).catch(() => [])
           : Promise.resolve([]),
       ]);
-      if (seq !== routeSeq) return;
+      if (seq !== routeSeq || uid !== currentUserId()) return;
       paintSeriesDetail(seriesID, detail, maintJobs || []);
     } catch (err) {
-      toast(err.message, 'error');
+      if (seq === routeSeq && uid === currentUserId()) toast(err.message, 'error');
     }
   }
 
@@ -2173,10 +2202,24 @@
     if (!content) return;
     const admin = isAdminUser();
     const initialViewMode = resolveSeriesBooksViewMode(seriesID);
-    let visibleLimit = SERIES_BOOKS_BATCH_SIZE;
-    let batchSelectMode = false;
-    let batchBusy = false;
-    const selectedBookIds = new Set();
+    const userId = currentUserId();
+    if (state.seriesBooks?.seriesId !== seriesID || state.seriesBooks.userId !== userId) {
+      state.seriesBooks = {
+        seriesId: seriesID,
+        userId,
+        seriesBooksBatchLimit: SERIES_BOOKS_BATCH_SIZE,
+        batchSelectMode: false,
+        batchBusy: false,
+        selectedBookIds: new Set(),
+        progressVersion: 0,
+      };
+    }
+    const seriesBooks = state.seriesBooks;
+    const { selectedBookIds } = seriesBooks;
+    const seq = routeSeq;
+    const onSameSeries = () => state.seriesBooks === seriesBooks &&
+      isSeriesPath(seriesID) && currentUserId() === userId;
+    const onCurrentSeries = () => seq === routeSeq && onSameSeries();
 
     content.innerHTML = `
       <div style="margin-bottom:12px;font-size:13px;color:var(--text-muted);overflow-wrap:anywhere;word-break:break-word">
@@ -2308,7 +2351,7 @@
             <h2>卷列表（${books.length}）</h2>
           </div>
           <div class="series-books-toolbar">
-            ${books.length > 0 ? `<button type="button" class="btn btn-sm" id="btn-books-batch-toggle">批量选择</button>` : ''}
+            ${books.length > 0 ? `<button type="button" class="btn btn-sm${seriesBooks.batchSelectMode ? ' btn-primary' : ''}" id="btn-books-batch-toggle">${seriesBooks.batchSelectMode ? '退出批量选择' : '批量选择'}</button>` : ''}
             <div class="segmented series-view-segmented" role="group" aria-label="卷列表视图切换" title="仅当前页面临时切换，默认模式可在「账号设置」修改">
               <button type="button" data-books-view="list" class="${initialViewMode === 'list' ? 'active' : ''}">列表</button>
               <button type="button" data-books-view="cover" class="${initialViewMode === 'cover' ? 'active' : ''}">封面</button>
@@ -2324,13 +2367,13 @@
       const countEl = document.getElementById('series-books-selected-count');
       if (countEl) countEl.textContent = String(selectedBookIds.size);
       const clearBtn = document.getElementById('btn-books-select-clear');
-      if (clearBtn) clearBtn.disabled = batchBusy || selectedBookIds.size === 0;
+      if (clearBtn) clearBtn.disabled = seriesBooks.batchBusy || selectedBookIds.size === 0;
       const readBtn = document.getElementById('btn-books-batch-read');
-      if (readBtn) readBtn.disabled = batchBusy || selectedBookIds.size === 0;
+      if (readBtn) readBtn.disabled = seriesBooks.batchBusy || selectedBookIds.size === 0;
       const unreadBtn = document.getElementById('btn-books-batch-unread');
-      if (unreadBtn) unreadBtn.disabled = batchBusy || selectedBookIds.size === 0;
+      if (unreadBtn) unreadBtn.disabled = seriesBooks.batchBusy || selectedBookIds.size === 0;
       const selAllBtn = document.getElementById('btn-books-select-all');
-      if (selAllBtn) selAllBtn.disabled = batchBusy || visibleBooks.length === 0;
+      if (selAllBtn) selAllBtn.disabled = seriesBooks.batchBusy || visibleBooks.length === 0;
     };
 
     const renderSeriesBooksBody = () => {
@@ -2341,7 +2384,8 @@
         return;
       }
       const mode = resolveSeriesBooksViewMode(seriesID);
-      const visibleBooks = books.slice(0, visibleLimit);
+      const { seriesBooksBatchLimit, batchSelectMode, batchBusy } = seriesBooks;
+      const visibleBooks = books.slice(0, seriesBooksBatchLimit);
       const visibleCount = visibleBooks.length;
       const remaining = Math.max(0, books.length - visibleCount);
       const nextStep = Math.min(SERIES_BOOKS_BATCH_SIZE, remaining);
@@ -2467,51 +2511,41 @@
       }
 
       const runBatchProgress = async (completed) => {
-        if (batchBusy || selectedBookIds.size === 0) return;
-        const seq = routeSeq;
+        const initiatorUserId = currentUserId();
+        if (!initiatorUserId || !onCurrentSeries() || seriesBooks.batchBusy || selectedBookIds.size === 0) return;
         const ids = Array.from(selectedBookIds);
-        batchBusy = true;
+        let contextMismatch = false;
+        const canDispatch = () => !contextMismatch && onCurrentSeries() && currentUserId() === initiatorUserId;
+        const opts = {
+          method: completed ? 'PATCH' : 'DELETE',
+          body: completed ? { completed: true } : undefined,
+          headers: { 'X-FK115-User-Id': initiatorUserId },
+          isCurrent: canDispatch,
+        };
+        seriesBooks.batchBusy = true;
         syncBatchStatusUI(visibleBooks);
-        const results = await runBoundedConcurrency(ids, 4, async (bid) => {
+        const results = await runBoundedConcurrency(ids, 4, canDispatch, async (bid) => {
           try {
-            if (completed) {
-              await api(`/api/v1/books/${encodeURIComponent(bid)}/read-progress`, { method: 'PATCH', body: { completed: true } });
-            } else {
-              await api(`/api/v1/books/${encodeURIComponent(bid)}/read-progress`, { method: 'DELETE' });
-            }
+            await api(`/api/v1/books/${encodeURIComponent(bid)}/read-progress`, opts);
             return { bid, ok: true };
           } catch (err) {
-            return { bid, ok: false, err };
+            if (err.status === 409 && err.code === 'USER_CONTEXT_MISMATCH') contextMismatch = true;
+            return { bid, ok: false };
           }
         });
-        batchBusy = false;
-        if (seq !== routeSeq) return;
-        let okCount = 0;
-        let failCount = 0;
-        const bookMap = new Map(books.map((item) => [item.id, item]));
-        results.forEach((r) => {
-          if (r.ok) {
-            okCount += 1;
-            selectedBookIds.delete(r.bid);
-            const target = bookMap.get(r.bid);
-            if (target) {
-              if (completed) {
-                const pages = (target.media && target.media.pagesCount) || (target.readProgress && target.readProgress.page) || 1;
-                target.readProgress = { completed: true, page: pages };
-              } else {
-                target.readProgress = null;
-              }
-            }
-          } else {
-            failCount += 1;
-          }
-        });
+        seriesBooks.batchBusy = false;
+        if (contextMismatch || !onSameSeries()) return;
+        const succeeded = new Set(results.filter((r) => r.ok).map((r) => r.bid));
+        const okCount = succeeded.size;
+        const failCount = results.length - okCount;
+        if (okCount > 0) seriesBooks.progressVersion += 1;
+        seriesBooks.applyBatchProgress(succeeded, completed);
+        if (!onCurrentSeries()) return;
         if (failCount > 0) {
           toast(`批量处理完成：成功 ${okCount} 卷，失败 ${failCount} 卷`, 'error');
         } else {
           toast(completed ? `已将 ${okCount} 卷标为已读` : `已将 ${okCount} 卷重置为未读`);
         }
-        renderSeriesBooksBody();
       };
 
       booksBody.querySelectorAll('input[data-book-select]').forEach((cb) => {
@@ -2548,14 +2582,14 @@
       const loadMoreBtn = document.getElementById('btn-books-load-more');
       if (loadMoreBtn) {
         loadMoreBtn.onclick = () => {
-          visibleLimit = Math.min(books.length, visibleLimit + SERIES_BOOKS_BATCH_SIZE);
+          seriesBooks.seriesBooksBatchLimit = Math.min(books.length, seriesBooks.seriesBooksBatchLimit + SERIES_BOOKS_BATCH_SIZE);
           renderSeriesBooksBody();
         };
       }
       const showAllBtn = document.getElementById('btn-books-show-all');
       if (showAllBtn) {
         showAllBtn.onclick = () => {
-          visibleLimit = books.length;
+          seriesBooks.seriesBooksBatchLimit = books.length;
           renderSeriesBooksBody();
         };
       }
@@ -2588,15 +2622,26 @@
       });
     };
 
+    seriesBooks.applyBatchProgress = (succeeded, completed) => {
+      succeeded.forEach((bid) => selectedBookIds.delete(bid));
+      if (succeeded.size > 0) {
+        for (const book of books) {
+          if (!succeeded.has(book.id)) continue;
+          const page = book.media?.pagesCount || book.readProgress?.page || 1;
+          book.readProgress = completed ? { completed: true, page } : null;
+        }
+      }
+      if (booksBody?.isConnected && onCurrentSeries()) renderSeriesBooksBody();
+    };
     renderSeriesBooksBody();
 
     const batchToggleBtn = document.getElementById('btn-books-batch-toggle');
     if (batchToggleBtn) {
       batchToggleBtn.onclick = () => {
-        batchSelectMode = !batchSelectMode;
-        if (!batchSelectMode) selectedBookIds.clear();
-        batchToggleBtn.textContent = batchSelectMode ? '退出批量选择' : '批量选择';
-        if (batchToggleBtn.classList) batchToggleBtn.classList.toggle('btn-primary', batchSelectMode);
+        seriesBooks.batchSelectMode = !seriesBooks.batchSelectMode;
+        if (!seriesBooks.batchSelectMode) selectedBookIds.clear();
+        batchToggleBtn.textContent = seriesBooks.batchSelectMode ? '退出批量选择' : '批量选择';
+        batchToggleBtn.classList.toggle('btn-primary', seriesBooks.batchSelectMode);
         renderSeriesBooksBody();
       };
     }
@@ -2814,11 +2859,14 @@
   }
 
   async function pollSeriesMaint(seriesID) {
-    if (location.pathname !== `/series/${encodeURIComponent(seriesID)}` && location.pathname !== `/series/${seriesID}`) return;
     const seq = routeSeq;
+    const uid = currentUserId();
+    const isCurrent = () => uid && seq === routeSeq && isSeriesPath(seriesID) && uid === currentUserId();
+    if (!isCurrent()) return;
+    const opts = { headers: { 'X-FK115-User-Id': uid }, isCurrent };
     try {
-      const jobs = await api(`/admin/api/maintenance-jobs?targetType=series&targetId=${encodeURIComponent(seriesID)}&limit=6`);
-      if (seq !== routeSeq) return;
+      const jobs = await api(`/admin/api/maintenance-jobs?targetType=series&targetId=${encodeURIComponent(seriesID)}&limit=6`, opts);
+      if (!isCurrent()) return;
       const coverButton = document.getElementById('series-generate-cover');
       if (coverButton) coverButton.disabled = (jobs || []).some((j) => j.operation === 'series_thumbnail' && ['queued', 'running'].includes(j.status));
       const box = document.getElementById('series-maint-jobs');
@@ -2830,28 +2878,45 @@
         schedulePoll(() => pollSeriesMaint(seriesID), 2000);
       } else {
         stopPolling();
-        state.coverVer = Date.now();
         const panelOpen = document.getElementById('series-maint-panel')?.open;
-        const detail = await api(`/admin/api/series/${encodeURIComponent(seriesID)}/detail`);
-        if (seq !== routeSeq) return;
+        const progressVersion = state.seriesBooks?.progressVersion;
+        const detail = await api(`/admin/api/series/${encodeURIComponent(seriesID)}/detail`, opts);
+        if (!isCurrent()) return;
+        if (progressVersion !== state.seriesBooks?.progressVersion) {
+          await pollSeriesMaint(seriesID);
+          return;
+        }
+        state.coverVer = Date.now();
         paintSeriesDetail(seriesID, detail, jobs || []);
-        if (panelOpen) document.getElementById('series-maint-panel').open = true;
+        const panel = document.getElementById('series-maint-panel');
+        if (panelOpen && panel) panel.open = true;
       }
-    } catch (_) { if (seq === routeSeq) stopPolling(); }
+    } catch (_) { if (isCurrent()) stopPolling(); }
   }
 
   function renderMaintJobRows(jobs) {
     if (!jobs || jobs.length === 0) return '';
-    return `<div style="margin-top:8px;display:grid;gap:6px">${jobs.map((j) => `
+    const statusBadges = {
+      queued: ['排队中', 'badge-accent'],
+      running: ['运行中', 'badge-accent'],
+      success: ['已完成', 'badge-success'],
+      partial: ['部分成功', 'badge-warn'],
+      failed: ['失败', 'badge-danger'],
+      canceled: ['已取消', ''],
+    };
+    return `<div style="margin-top:8px;display:grid;gap:6px">${jobs.map((j) => {
+      const [label, badge] = statusBadges[j.status] || [j.status, ''];
+      return `
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px 10px;padding:7px 10px;border-radius:6px;background:var(--bg-input);border:1px solid var(--border)">
-        <span style="min-width:0;overflow-wrap:anywhere;word-break:break-word">
-          <span class="badge ${j.status === 'completed' ? 'badge-success' : j.status === 'failed' ? 'badge-danger' : 'badge-accent'}">${esc(j.status)}</span>
+        <div style="min-width:0;overflow-wrap:anywhere;word-break:break-word">
+          <span class="badge ${badge}">${esc(label)}</span>
           <strong style="margin-left:6px">${esc(j.operation)}</strong>
-          <span style="color:var(--text-muted);margin-left:8px">${j.processedBooks || 0}/${j.totalBooks || 0}</span>
-          ${j.error ? `<span style="color:var(--danger);margin-left:8px">${esc(j.error)}</span>` : ''}
-        </span>
+          <span style="color:var(--text-secondary);margin-left:8px">${j.processedItems ?? 0}/${j.totalItems ?? 0} · 成功 ${j.succeededItems ?? j.generatedCount ?? 0} · 跳过 ${j.skippedItems ?? j.skippedCount ?? 0} · 失败 ${j.failedItems ?? j.failedCount ?? 0}</span>
+          ${Array.isArray(j.errors) && j.errors.length ? `<ul style="color:var(--danger);margin:4px 0 0;padding-inline-start:20px">${j.errors.map((err) => `<li>${esc(err)}</li>`).join('')}</ul>` : ''}
+        </div>
         ${(j.status === 'queued' || j.status === 'running') ? `<button type="button" class="btn btn-sm btn-danger" data-cancel-maint="${esc(j.id)}">取消</button>` : ''}
-      </div>`).join('')}</div>`;
+      </div>`;
+    }).join('')}</div>`;
   }
 
   function bindMaintCancelButtons(root, onDone) {
@@ -2859,7 +2924,7 @@
       btn.onclick = async () => {
         try {
           await api(`/admin/api/maintenance-jobs/${encodeURIComponent(btn.getAttribute('data-cancel-maint'))}/cancel`, { method: 'POST' });
-          if (onDone) onDone();
+          if (btn.isConnected && onDone) onDone();
         } catch (err) { toast(err.message, 'error'); }
       };
     });
@@ -3385,7 +3450,7 @@
           <div class="field">
             <label for="bkc-file">选择封面图片文件（JPG / PNG / WebP / GIF）</label>
             <input type="file" id="bkc-file" accept="image/*">
-            <div class="extmeta-file-meta" id="bkc-file-meta">支持上传本地封面图，提交后将自动设为自定义封面来源。</div>
+            <div class="extmeta-file-meta" id="bkc-file-meta">保存后立即使用新封面。</div>
           </div>
           <div class="extmeta-upload-progress" id="bkc-upload-progress-wrap" style="display:none">
             <div style="font-size:12px;color:var(--accent);margin-bottom:5px" id="bkc-upload-status">正在上传…</div>
@@ -3396,7 +3461,7 @@
           <div class="field" style="margin-bottom:0">
             <label for="bkc-url">远程封面图片 URL（仅支持 http / https）</label>
             <input type="url" id="bkc-url" value="${esc((rawBookMeta && rawBookMeta.customCoverUrl) || '')}" placeholder="https://example.com/cover.jpg">
-            <div class="field-hint">服务端将校验 URL 安全性并抓取缓存到本地。</div>
+            <div class="field-hint">保存后，服务端将校验并抓取图片作为新封面。</div>
           </div>
         </div>
       `,
@@ -3429,7 +3494,7 @@
             if (fileMeta) {
               fileMeta.textContent = file
                 ? `已选择：${file.name}（${fmtBytes(file.size || 0)}）`
-                : '支持上传本地封面图，提交后将自动设为自定义封面来源。';
+                : '保存后立即使用新封面。';
             }
           };
         }
@@ -3460,6 +3525,7 @@
                     }
                   },
                 });
+                if (!submitBtn.isConnected) return;
                 toast('单卷自定义封面已上传');
                 closeModal();
                 if (onUpdated) onUpdated();
@@ -3481,6 +3547,7 @@
                 method: 'POST',
                 body: { url },
               });
+              if (!submitBtn.isConnected) return;
               toast('单卷自定义封面已保存');
               closeModal();
               if (onUpdated) onUpdated();
@@ -3502,7 +3569,7 @@
       .map((a) => (a && a.name ? (a.role && a.role !== 'writer' ? `${a.name} | ${a.role}` : a.name) : ''))
       .filter(Boolean)
       .join('\n');
-    const tagsText = (Array.isArray(m.tags) ? m.tags : []).join(', ');
+    const tagsText = (Array.isArray(m.tags) ? m.tags : []).join('\n');
     const linksText = (Array.isArray(m.links) ? m.links : [])
       .map((l) => (l && l.url ? (l.label ? `${l.label} | ${l.url}` : l.url) : ''))
       .filter(Boolean)
@@ -3540,8 +3607,8 @@
           <textarea id="bm-edit-authors" placeholder="例如：尾田荣一郎 | writer">${esc(authorsText)}</textarea>
         </div>
         <div class="field">
-          <div class="field-label-row"><label for="bm-edit-tags">标签 Tags（英文逗号分隔）</label><label class="check-row"><input type="checkbox" id="bm-edit-tags-lock" ${m.tagsLock ? 'checked' : ''}>锁定</label></div>
-          <input type="text" id="bm-edit-tags" value="${esc(tagsText)}">
+          <div class="field-label-row"><label for="bm-edit-tags">标签 Tags（每行一个，保留标签内的逗号）</label><label class="check-row"><input type="checkbox" id="bm-edit-tags-lock" ${m.tagsLock ? 'checked' : ''}>锁定</label></div>
+          <textarea id="bm-edit-tags" placeholder="每行一个标签，例如 History, Modern">${esc(tagsText)}</textarea>
         </div>
         <div class="field">
           <div class="field-label-row"><label for="bm-edit-links">外部链接（每行一条，格式：<code>标签 | URL</code> 或直接填 URL）</label><label class="check-row"><input type="checkbox" id="bm-edit-links-lock" ${m.linksLock ? 'checked' : ''}>锁定</label></div>
@@ -3557,18 +3624,13 @@
         <button type="button" class="btn btn-primary" id="bm-edit-save">保存卷元数据</button>
       `,
       onMount: () => {
-        const lockIds = [
-          'bm-edit-title-lock',
-          'bm-edit-number-lock',
-          'bm-edit-numberSort-lock',
-          'bm-edit-releaseDate-lock',
-          'bm-edit-isbn-lock',
-          'bm-edit-authors-lock',
-          'bm-edit-tags-lock',
-          'bm-edit-links-lock',
-          'bm-edit-summary-lock',
-        ];
-        const numSortEl = document.getElementById('bm-edit-numberSort');
+        const fields = ['title', 'number', 'numberSort', 'releaseDate', 'isbn', 'authors', 'tags', 'links', 'summary']
+          .map((key) => {
+            const input = document.getElementById('bm-edit-' + key);
+            const lock = document.getElementById('bm-edit-' + key + '-lock');
+            return { key, input, lock, initialValue: input.value.trim(), initialLock: lock.checked };
+          });
+        const numSortEl = fields.find(({ key }) => key === 'numberSort').input;
         const clearNumSortEl = document.getElementById('bm-edit-clear-numberSort');
         if (clearNumSortEl && numSortEl) {
           clearNumSortEl.onchange = () => {
@@ -3578,86 +3640,50 @@
         const unlockBtn = document.getElementById('bm-edit-unlock-all');
         if (unlockBtn) {
           unlockBtn.onclick = () => {
-            lockIds.forEach((id) => {
-              const el = document.getElementById(id);
-              if (el) el.checked = false;
-            });
+            fields.forEach(({ lock }) => { lock.checked = false; });
           };
         }
         const saveBtn = document.getElementById('bm-edit-save');
         if (saveBtn) {
           saveBtn.onclick = async () => {
             if (saveBtn.disabled) return;
-            const clearNumberSort = Boolean(clearNumSortEl && clearNumSortEl.checked);
-            const rawNumSort = (numSortEl ? numSortEl.value : '').trim();
-            let parsedNumSort;
-            if (!clearNumberSort && rawNumSort !== '') {
-              parsedNumSort = Number(rawNumSort);
-              if (!Number.isFinite(parsedNumSort)) {
+            const lines = (value) => value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+            const parsers = {
+              authors: (value) => lines(value).map((line) => {
+                const pipe = line.indexOf('|');
+                return pipe < 0
+                  ? { name: line, role: 'writer' }
+                  : { name: line.slice(0, pipe).trim(), role: line.slice(pipe + 1).trim() || 'writer' };
+              }).filter((author) => author.name),
+              tags: lines,
+              links: (value) => lines(value).map((line) => {
+                const pipe = line.indexOf('|');
+                return pipe < 0
+                  ? { label: 'Link', url: line }
+                  : { label: line.slice(0, pipe).trim() || 'Link', url: line.slice(pipe + 1).trim() };
+              }).filter((link) => link.url),
+            };
+
+            const patch = {};
+            for (const { key, input, lock, initialValue, initialLock } of fields) {
+              if (lock.checked !== initialLock) patch[key + 'Lock'] = lock.checked;
+              const value = input.value.trim();
+              if (key !== 'numberSort') {
+                if (value !== initialValue) patch[key] = parsers[key] ? parsers[key](value) : value;
+                continue;
+              }
+              if (clearNumSortEl.checked) {
+                patch.clearNumberSort = true;
+              } else if (input.validity?.badInput || (value && !Number.isFinite(Number(value)))) {
                 toast('排序值 (numberSort) 必须是有效数字', 'error');
                 return;
+              } else if (value && value !== initialValue && (!initialValue || Number(value) !== Number(initialValue))) {
+                patch.numberSort = Number(value);
               }
             }
-
-            const authors = String(document.getElementById('bm-edit-authors')?.value || '')
-              .split(/\r?\n/)
-              .map((line) => line.trim())
-              .filter(Boolean)
-              .map((line) => {
-                const pipeIdx = line.indexOf('|');
-                if (pipeIdx >= 0) {
-                  const name = line.slice(0, pipeIdx).trim();
-                  const role = line.slice(pipeIdx + 1).trim() || 'writer';
-                  return { name, role };
-                }
-                return { name: line, role: 'writer' };
-              })
-              .filter((a) => a.name);
-
-            const tags = String(document.getElementById('bm-edit-tags')?.value || '')
-              .split(/[,，]/)
-              .map((s) => s.trim())
-              .filter(Boolean);
-
-            const links = String(document.getElementById('bm-edit-links')?.value || '')
-              .split(/\r?\n/)
-              .map((line) => line.trim())
-              .filter(Boolean)
-              .map((line) => {
-                const pipeIdx = line.indexOf('|');
-                if (pipeIdx >= 0) {
-                  return {
-                    label: line.slice(0, pipeIdx).trim() || 'Link',
-                    url: line.slice(pipeIdx + 1).trim(),
-                  };
-                }
-                return { label: 'Link', url: line };
-              })
-              .filter((l) => l.url);
-
-            const patch = {
-              title: (document.getElementById('bm-edit-title')?.value || '').trim(),
-              titleLock: Boolean(document.getElementById('bm-edit-title-lock')?.checked),
-              number: (document.getElementById('bm-edit-number')?.value || '').trim(),
-              numberLock: Boolean(document.getElementById('bm-edit-number-lock')?.checked),
-              numberSortLock: Boolean(document.getElementById('bm-edit-numberSort-lock')?.checked),
-              releaseDate: (document.getElementById('bm-edit-releaseDate')?.value || '').trim(),
-              releaseDateLock: Boolean(document.getElementById('bm-edit-releaseDate-lock')?.checked),
-              isbn: (document.getElementById('bm-edit-isbn')?.value || '').trim(),
-              isbnLock: Boolean(document.getElementById('bm-edit-isbn-lock')?.checked),
-              authors,
-              authorsLock: Boolean(document.getElementById('bm-edit-authors-lock')?.checked),
-              tags,
-              tagsLock: Boolean(document.getElementById('bm-edit-tags-lock')?.checked),
-              links,
-              linksLock: Boolean(document.getElementById('bm-edit-links-lock')?.checked),
-              summary: (document.getElementById('bm-edit-summary')?.value || '').trim(),
-              summaryLock: Boolean(document.getElementById('bm-edit-summary-lock')?.checked),
-            };
-            if (clearNumberSort) {
-              patch.clearNumberSort = true;
-            } else if (parsedNumSort !== undefined) {
-              patch.numberSort = parsedNumSort;
+            if (Object.keys(patch).length === 0) {
+              closeModal();
+              return;
             }
 
             saveBtn.disabled = true;
@@ -3666,6 +3692,7 @@
                 method: 'PATCH',
                 body: patch,
               });
+              if (!saveBtn.isConnected) return;
               toast('单卷元数据已保存');
               closeModal();
               renderBookDetail(bookID);
@@ -3938,8 +3965,11 @@
         };
       }
       const startBookIdx = async (force) => {
+        const seq = routeSeq;
+        const uid = currentUserId();
         try {
           await api('/admin/api/maintenance-jobs', { method: 'POST', body: { operation: 'book_index', bookId: bookID, force } });
+          if (seq !== routeSeq || uid !== currentUserId()) return;
           toast('归档索引任务已提交');
           pollBookMaint(bookID);
         } catch (err) { toast(err.message, 'error'); }
@@ -3956,9 +3986,17 @@
   }
 
   async function pollBookMaint(bookID) {
-    if (!location.pathname.endsWith(`/${encodeURIComponent(bookID)}`) && !location.pathname.endsWith(`/${bookID}`)) return;
+    const pathname = location.pathname;
+    const routeBookID = pathname.match(/^\/books?\/([^/]+)$/)?.[1];
+    if (routeBookID !== encodeURIComponent(bookID) && routeBookID !== bookID) return;
+    const seq = routeSeq;
+    const uid = currentUserId();
+    const isCurrent = () => uid && seq === routeSeq && pathname === location.pathname && uid === currentUserId();
+    if (!isCurrent()) return;
+    const opts = { headers: { 'X-FK115-User-Id': uid }, isCurrent };
     try {
-      const jobs = await api(`/admin/api/maintenance-jobs?targetType=book&targetId=${encodeURIComponent(bookID)}&limit=6`);
+      const jobs = await api(`/admin/api/maintenance-jobs?targetType=book&targetId=${encodeURIComponent(bookID)}&limit=6`, opts);
+      if (!isCurrent()) return;
       const box = document.getElementById('book-maint-jobs');
       if (box) {
         box.innerHTML = renderMaintJobRows(jobs || []);
@@ -3968,10 +4006,11 @@
         schedulePoll(() => pollBookMaint(bookID), 1800);
       } else {
         stopPolling();
-        const detail = await api(`/admin/api/books/${encodeURIComponent(bookID)}/detail`);
+        const detail = await api(`/admin/api/books/${encodeURIComponent(bookID)}/detail`, opts);
+        if (!isCurrent()) return;
         paintBookDetail(bookID, detail, jobs || []);
       }
-    } catch (_) { stopPolling(); }
+    } catch (_) { if (isCurrent()) stopPolling(); }
   }
 
   // --- Admin Console (/admin) ---
@@ -5453,7 +5492,7 @@
         const fd = new FormData();
         const orderedFields = typeof getOrderedFields === 'function' ? getOrderedFields(file) : [];
         orderedFields.forEach(([k, v]) => {
-          if (v !== undefined && v !== null && String(v) !== '') {
+          if (v != null && (k === 'tagDictSourceId' || String(v) !== '')) {
             fd.append(k, String(v));
           }
         });
@@ -5480,6 +5519,7 @@
               }
             },
           });
+          if (!uploadBtn.isConnected) return;
           const sf = extSchemaFormatMeta(res);
           toast(`离线数据源已上传并导入${sf.label ? ` (${sf.label})` : ''}`);
           closeModal();
@@ -5574,6 +5614,7 @@
     const kindInfo = extSourceKindMeta(src.kind);
     const schemaInfo = extSchemaFormatMeta(src);
     const isOfflineSQLite = src.kind === 'offline_sqlite';
+    const isRepoSource = Boolean(src.repoId);
     const hasOnlineConfig = Boolean((src.onlineApiUrl && String(src.onlineApiUrl).trim()) || src.onlineEnabled);
     openModal({
       title: `配置数据源 · ${src.name}`,
@@ -5607,7 +5648,11 @@
             <div class="field-hint extmeta-local-wal-hint">${EXT_LOCAL_WAL_HINT}</div>
           </div>
         </div>
-        ${isOfflineSQLite ? `<div id="ems-pane-upload" style="display:none;margin-bottom:14px">${extUploadPaneHTML('ems')}</div>` : ''}
+        ${isOfflineSQLite ? `
+        <div id="ems-pane-upload" style="display:none;margin-bottom:14px">
+          ${isRepoSource ? '<p class="field-hint">此源由仓库订阅管理。覆盖上传保留名称、说明、下载地址、启用状态、关联标签词典、标签展示模式及自动更新频率。可在「本机路径 / 远程 URL」标签保存启用状态、词典、展示模式和更新频率的更改。</p>' : ''}
+          ${extUploadPaneHTML('ems')}
+        </div>` : ''}
         <div class="grid-2">
           <div class="field">
             <label for="ems-tag-dict">关联标签词典</label>
@@ -5655,6 +5700,8 @@
           const onlineWrap = document.getElementById('ems-online-wrap');
           const saveBtn = document.getElementById('ems-save-btn');
           const uploadBtn = document.getElementById('ems-upload-btn');
+          const configInputs = ['enabled', 'tag-dict', 'tag-mode', 'auto-update']
+            .map((suffix) => document.getElementById('ems-' + suffix));
           document.querySelectorAll('button[data-ems-tab]').forEach((tabBtn) => {
             tabBtn.onclick = () => {
               const isUpload = tabBtn.getAttribute('data-ems-tab') === 'upload';
@@ -5666,6 +5713,7 @@
               if (paneUpload) paneUpload.style.display = isUpload ? '' : 'none';
               if (saveBtn) saveBtn.style.display = isUpload ? 'none' : '';
               if (uploadBtn) uploadBtn.style.display = isUpload ? '' : 'none';
+              if (isRepoSource) configInputs.forEach((input) => { input.disabled = isUpload; });
             };
           });
           bindExtUploadPane({
@@ -9967,6 +10015,7 @@
   let routeSeq = 0;
   async function route() {
     const seq = ++routeSeq;
+    if (state.pollFn) stopPolling();
     teardownShelfObserver();
     closeConfirmModal(false);
     const prevUserId = (state.auth && state.auth.userId) || '';
@@ -9980,7 +10029,9 @@
     if (seq !== routeSeq) return;
     closeConfirmModal(false);
     const nextUserId = (state.auth && state.auth.userId) || '';
-    if ((prevUserId || prevAuthenticated) && nextUserId !== prevUserId) {
+    if (nextUserId !== prevUserId || prevAuthenticated !== Boolean(state.auth.authenticated)) {
+      if (document.getElementById('modal-root')?.firstElementChild) closeModal();
+      state.seriesBooks = null;
       state.libraries = [];
       state.taxonomies = { loaded: false, genres: [], tags: [], publishers: [] };
       resetDisplayPrefs();
@@ -9991,6 +10042,7 @@
     }
     updateFooterVersion(state.auth);
     const p = location.pathname;
+    if (state.seriesBooks && !isSeriesPath(state.seriesBooks.seriesId)) state.seriesBooks = null;
     if (!state.auth.claimed) {
       state.seriesBooksViewOverride = { seriesId: '', mode: '' };
       if (p !== '/setup') {
