@@ -38,7 +38,7 @@ MangaAlpha 采用声明式元数据市场 `repo.json` 规范。管理后台提�
 | --- | --- | --- | --- |
 | `id` | `string` | 是 | 源唯一 ID；仅允许 `[a-zA-Z0-9._-]`，长度 `1..128`，禁止 `.` / `..` 及仓库内重复 |
 | `kind` | `string` | 是 | 源类型：`bangumi_archive` / `offline_sqlite` / `tag_dictionary` / `mapping_pack` |
-| `schema` | `string` | 否 | 数据格式标识，如 `mangaalpha_meta_v1`、`gallery_v1`、`tag_translation_text_v1`、`mangaalpha_mapping_v1`（`offline_sqlite` 留空时自动探测） |
+| `schema` | `string` | 否 | 数据格式标识，如 `mangaalpha_meta_v1`、`mangaalpha_meta_v2`、`komga_sqlite_v1`、`gallery_v1`、`tag_translation_text_v1`、`mangaalpha_mapping_v1`（`offline_sqlite` 留空时自动探测） |
 | `name` | `string` | 是 | 源显示名称 |
 | `description` | `string` | 否 | 源描述信息 |
 | `manifestUrl` | `string` | 否 | 清单地址（如 `bangumi_archive` 的 `aux/latest.json`，需 `http/https`） |
@@ -145,16 +145,97 @@ CREATE TABLE entries (
 
 ### 3.3 流式解压与只读 Sidecar 机制
 
-- 下载同步支持 **纯 Go 流式解压**（`.zst`/`.zstd`、`gzip`、`.zip` 自动提取首个 `.sqlite`/`.sqlite3`/`.db` 并跳过 `__MACOSX/`，以及未压缩 `.sqlite`），解压输出受 **8 GiB** 安全上限约束，采用临时文件校验后原子替换，失败绝不破坏旧库。
-- 服务端严格以 `mode=ro&immutable=1&_pragma=query_only(1)` 只读打开上游 SQLite，绝不修改上游文件；并在旁边构建伴随 Sidecar 索引（`ext_meta`、`ext_entries`、`ext_fts` FTS5 虚表），实现 `< 5ms` 标题召回与 SHA-1 指纹反查。
+- 下载同步支持 **纯 Go 流式解压**（`.zst`/`.zstd`、`gzip`、`.zip` 自动提取首个 `.sqlite`/`.sqlite3`/`.db` 并跳过 `__MACOSX/`，以及未压缩 `.sqlite`），解压输出受 **8 GiB**（Web 流式上传支持 **10 GiB**）安全上限约束，采用临时文件校验后原子替换，失败绝不破坏旧库。
+- 服务端严格以 `mode=ro&_pragma=query_only(1)`（无 `-wal` 时附加 `immutable=1`）只读打开上游 SQLite，绝不修改上游文件；并在旁边构建伴随 Sidecar 索引（`ext_meta`、`ext_entries`、`ext_entry_keys`、`ext_fts` FTS5 虚表），实现 `< 5ms` 标题召回、多别名检索与 SHA-1 指纹反查。
+
+### 3.4 向后兼容扩展规范：`mangaalpha_meta_v2`、可选列、`cover_blob` 与 `books` 分表
+
+`mangaalpha_meta_v2` 是 `mangaalpha_meta_v1` 的完全向后兼容扩展别名：未声明扩展列时退化为标准 `mangaalpha_meta_v1` 单表，检测到 `entries` 存在扩展列/`cover_blob`、`books` 分表或 `meta`/`ext_meta` 表中 `key='schema'` 为 `'mangaalpha_meta_v2'` 时自动识别为 `mangaalpha_meta_v2`。
+
+#### 可选 `entries` 扩展列
+
+| 列名 | 类型 | 说明 |
+| --- | --- | --- |
+| `status` | `TEXT` | 连载状态（如 `ONGOING`、`ENDED`、`HIATUS`、`ABANDONED`） |
+| `title_sort` | `TEXT` | 排序标题（参与 Sidecar 别名精确检索与 FTS5） |
+| `publisher` | `TEXT` | 出版社 / 发行方 |
+| `language` | `TEXT` | 语言代码（如 `zh`、`ja`、`en`） |
+| `release_date` | `TEXT` | 出版/发布日期（建议 `YYYY-MM-DD`） |
+| `total_book_count` | `INTEGER` | 计划总卷数 |
+| `age_rating` | `INTEGER` | 年龄分级；`>= 18` 时自动保守标记 `is_nsfw = true` |
+| `reading_direction` | `TEXT` | 阅读方向（如 `RIGHT_TO_LEFT`、`LEFT_TO_RIGHT`、`VERTICAL`、`WEBTOON`） |
+| `links_json` | `TEXT` | 外部链接 JSON 数组，格式 `[{"label":"Bangumi","url":"https://..."}]` |
+| `sharing_labels_json` | `TEXT` | 共享标签 JSON 数组或分隔文本（含成人关键词时标记 NSFW） |
+| `cover_blob` | `BLOB` | 系列封面二进制图片（JPEG/PNG/WebP/GIF，上限 16 MiB） |
+
+当 `entries.cover_url` 为空且存在非空 `cover_blob` 时，Sidecar 仅编码虚拟引用 `sqlite-blob://<sourceID>/open-entry/<entryID>`（不在同步阶段提取 BLOB 到磁盘），仅在封面首次访问时按需懒加载、校验证书魔数并原子落盘缓存。
+
+#### 可选 `books` 分表结构
+
+```sql
+CREATE TABLE books (
+  series_entry_id TEXT NOT NULL,
+  book_key TEXT NOT NULL,
+  file_name TEXT DEFAULT '',
+  number TEXT DEFAULT '',
+  number_sort REAL,
+  title TEXT DEFAULT '',
+  summary TEXT DEFAULT '',
+  release_date TEXT DEFAULT '',
+  authors_json TEXT DEFAULT '[]',
+  tags_json TEXT DEFAULT '[]',
+  isbn TEXT DEFAULT '',
+  links_json TEXT DEFAULT '[]',
+  cover_url TEXT DEFAULT '',
+  cover_blob BLOB,
+  PRIMARY KEY (series_entry_id, book_key)
+);
+```
+
+- 当系列通过自动刮削或手工绑定命中含 `books` 分表的 `mangaalpha_meta_v1` / `v2` 条目时，系统会自动将旗下分册与本地单册按三层瀑布流对齐：
+  1. 归一化文件名精确匹配（去归档扩展名、剥离常见方括号组名标签、繁简/日文异体字折叠）；
+  2. 明确无歧义卷号匹配（识别 `Vol.XX`、`第XX巻/卷` 及结构化 `number`/`number_sort`，隔离章节与卷号防串书）；
+  3. 归一化标题相似度或唯一单册（One-shot）安全一对一对齐。
+- 写入 `book_metadata` 时严格遵守 9 个分册字段锁（`TitleLock`、`SummaryLock`、`NumberLock`、`NumberSortLock`、`ReleaseDateLock`、`ISBNLock`、`AuthorsLock`、`TagsLock`、`LinksLock`），自动刮削严格跳过 `match_origin IN ('manual', 'agent')` 的已锁定单册；`books.cover_blob`（当 `books.cover_url` 为空时）同样编码为 `sqlite-blob://<sourceID>/open-book/<seriesEntryID>:<bookKey>` 懒加载缓存，非 Bangumi 外部源写入期间始终保留系列已有 `bgm_subject_id`。
 
 ---
 
-## 4. 通用四表图库 SQLite 兼容规范：`gallery_v1`
+## 4. Komga 离线数据库直连规范：`komga_sqlite_v1`
+
+MangaAlpha 原生支持将导出的只读 Komga `database.sqlite` 作为离线元数据与封面来源，支持 **Web 流式上传** 与 **本机 `localPath` 只读挂载** 两种接入方式。服务端使用 `ProbeSQLiteFile` 检测包含 `SERIES`、`SERIES_METADATA`、`BOOK`、`BOOK_METADATA` 等核心表时自动识别为 `komga_sqlite_v1`。
+
+### 4.1 Web 流式大文件上传接入
+
+- **接口端点**：`POST /admin/api/metadata/sources/upload`（受 `requireAdmin`、同源 CSRF 与 `X-FK115-User-Id` 校验保护）。
+- **流式协议**：使用 `multipart/form-data`（可传 `name`、`sourceId`、`description`、`enabled`、`tagDictSourceId`、`tagDisplayMode`、`autoUpdate` 与 `file` 字段）；服务端基于流式 `MultipartReader` 逐块读写落盘（**不触发 `ParseMultipartForm` 双份落盘与内存缓冲**），支持直接上传 `.sqlite` / `.sqlite3` / `.db` 以及 `.zip` / `.gz` / `.zst` 压缩包，单文件流式上限 **10 GiB**。
+- **格式校验**：落盘前校验 SQLite3 文件头魔数 `SQLite format 3\x00` 与 `ProbeSQLiteFile` 结构合法性，非法格式直接拒绝并原子清理临时文件；支持创建新源（`201 Created`）或覆盖更新已有源并自动重建 Sidecar 索引。
+- **反向代理配置提示**：上传大型 Komga `database.sqlite`（数百 MB 至数 GB）时，请务必调大前置反向代理的请求体上限与超时设置，例如：
+  - **Nginx**：`client_max_body_size 10G;` 并适当调高 `proxy_read_timeout` / `proxy_send_timeout`；
+  - **Caddy**：在站点块配置 `request_body { max_size 10GB }`。
+
+### 4.2 本机 `localPath` 挂载与 `-wal` Checkpoint 注意事项
+
+- 支持在管理后台创建或编辑 `offline_sqlite` 源时填写绝对路径 `localPath`（禁止软链接逃逸与 `..` 路径穿越）。
+- **WAL 日志与 Checkpoint 告警**：运行中的 Komga 可能将最新修改写入同目录的 `database.sqlite-wal` 尚未合并回主库。MangaAlpha 对只读挂载源采用安全只读打开策略（仅当 `-wal` 与 `-shm` 同时可读时附带 WAL 读取，若仅存在孤立 `-wal` 则以 `immutable=1` 打开避免在只读挂载点创建 `-shm` 报错）。同时源列表（`GET /admin/api/metadata/sources`）与概览（`GET /admin/api/metadata/overview`）会返回：
+  - `schemaFormat`：识别出的数据库格式（如 `komga_sqlite_v1`、`mangaalpha_meta_v2`）；
+  - `walWarning` / `walWarningBytes` / `walWarningMessage`：当同目录检测到非空 `-wal` 文件时置为 `true` 并提示管理员先停止 Komga 或执行 `PRAGMA wal_checkpoint(TRUNCATE);` 后再复制或同步，避免缺失最新增量数据。
+
+### 4.3 系列/分册刮削与 BLOB 封面按需懒缓存
+
+- **系列全量字段映射**：同步索引系列主标题、目录名、排序标题、`alternateTitles`、URL 路径末段、`authors`（保留 `writer`/`penciller` 等角色）、`genres`、`tags`、`sharingLabels`、`links`、`publisher`、`language`、`status`、`ageRating`、`readingDirection`、`totalBookCount`、`releaseDate` 与 `isNsfw`（尊重年龄分级、`AGE_RATING >= 18` 与分享标签判定，同时在系列写入时严格保留已有 `bgm_subject_id`）。
+- **分册同步对齐**：刮削或手工绑定命中 Komga 系列时，自动使用与 `3.4` 相同的三层瀑布流（文件名 → 卷号 → 标题/单册）将 Komga `BOOK` / `BOOK_METADATA` 对齐写入 `book_metadata` 并严格遵守 9 项分册字段锁。
+- **零预解压 BLOB 封面懒加载**：Sidecar 索引与系列/分册元数据仅保存虚拟引用：
+  - 系列封面：`sqlite-blob://<sourceID>/komga-series/<thumbnailID>`（对应 `thumbnail_series`）
+  - 分册封面：`sqlite-blob://<sourceID>/komga-book/<thumbnailID>`（对应 `thumbnail_book`）
+  索引同步阶段绝不提取或转存任何 BLOB 图片到磁盘；仅当用户或阅读器实际请求某系列/分册封面，或管理员通过 `GET /admin/api/metadata/sources/{sourceID}/entries/{entryID}/cover` 预览条目封面时，才按需读取对应行 BLOB、校验 JPEG/PNG/WebP/GIF 魔数（上限 16 MiB）并以 `singleflight` 原子缓存到 `<DataDir>/thumbnails/extmeta/`，全程零外网请求、零 SSRF 误拦截。
+
+---
+
+## 5. 通用四表图库 SQLite 兼容规范：`gallery_v1`
 
 `gallery_v1` 兼容开源社区广泛存在的四表归档图库离线数据库结构（由 `sqlite_master` 检测存在 `gallery` 表时自动识别，或显式配置 `schemaType = "gallery_v1"`）。
 
-### 4.1 标准四表结构
+### 5.1 标准四表结构
 
 ```sql
 CREATE TABLE gallery (
@@ -192,13 +273,13 @@ CREATE TABLE gallery_meta (
 );
 ```
 
-### 4.2 标签拆分与作者提取规则
+### 5.2 标签拆分与作者提取规则
 
 `tag.name` 通常采用 `namespace:tag` 形式（通过 `gid_tid` 关联）：
 - `artist:<name>` 与 `group:<name>`：自动提取并去重归入作品 `authors` 列表，不再混入普通标签；
 - 其余 `namespace:tag`（如 `female:...`、`parody:...`、`language:...`、`other:...`）：保留在 `tags` 列表中，并可由关联的 `tag_dictionary` 按展示模式翻译。
 
-### 4.3 严格的 NSFW 分类规则
+### 5.3 严格的 NSFW 分类规则
 
 为确保前台默认隐藏 NSFW 策略不发生漏判，`gallery_v1` 采用保守安全判定：
 - **仅当 `gallery.category` 去除首尾空白并忽略大小写后严格等于 `"Non-H"` 时，判定 `isNsfw = false`**；
@@ -206,11 +287,11 @@ CREATE TABLE gallery_meta (
 
 ---
 
-## 5. 离线标签翻译词典：`tag_translation_text_v1`
+## 6. 离线标签翻译词典：`tag_translation_text_v1`
 
 支持纯文本 JSON（`db.text.json`）或 Gzip 压缩（`db.text.json.gz`），解压上限为 `64 MiB`。
 
-### 5.1 文件格式
+### 6.1 文件格式
 
 ```json
 {
@@ -232,7 +313,7 @@ CREATE TABLE gallery_meta (
 }
 ```
 
-### 5.2 查找与显示模式 (`tagDisplayMode`)
+### 6.2 查找与显示模式 (`tagDisplayMode`)
 
 1. 带命名空间的标签（如 `female:glasses`）：精确按 `namespace` + 小写 `tag` 查表；
 2. 无命名空间的裸标签（如 `full color`）：从非 `rows` 命名空间的汇总映射表中兜底查找。
@@ -243,11 +324,11 @@ CREATE TABLE gallery_meta (
 
 ---
 
-## 6. 社区脱敏映射包：`mangaalpha_mapping_v1`
+## 7. 社区脱敏映射包：`mangaalpha_mapping_v1`
 
 `mangaalpha_mapping_v1` 是轻量级换行分隔 JSON（`.ndjson` 或 `.ndjson.gz`，流式上限 `64 MiB`），用于在多个用户间安全共享“目录/作品名 → 目标元数据 ID”的人工校对成果。空映射包（`packs: []` 或空 `.ndjson`）可零报错正常同步（计为 `0` 条记录，但不会单独满足“存在已就绪离线源”的批量刮削前置校验）。
 
-### 6.1 单行记录字段
+### 7.1 单行记录字段
 
 导入时兼容 camelCase 与 snake_case 字段，导出统一输出标准 camelCase：
 
@@ -266,7 +347,7 @@ CREATE TABLE gallery_meta (
 | `isNsfw` | `bool` | 否 | 是否 NSFW；导出时默认严格排除 |
 | `origin` | `string` | 否 | 绑定来源标识，如 `"manual"`、`"agent"`、`"auto"` |
 
-### 6.2 四级双键匹配与作者消歧逻辑
+### 7.2 四级双键匹配与作者消歧逻辑
 
 映射索引（`MappingIndex.Lookup`）严格按以下优先级查询：
 1. **`normKey + normAuthor`**：主键与作者同时命中；
@@ -276,7 +357,7 @@ CREATE TABLE gallery_meta (
 
 若同一作品名存在多条不同作者映射到不同 `targetId` 的冲突记录，系统拒绝盲目猜测，确保不串书。
 
-### 6.3 脱敏红线规则
+### 7.3 脱敏红线规则
 
 导入与导出均强制执行以下脱敏过滤，凡命中任一条的记录将被自动丢弃：
 - 含有控制字符；
@@ -285,7 +366,7 @@ CREATE TABLE gallery_meta (
 - 含有合法 IPv4 或 IPv6 地址字面量；
 - 含有 JWT 字符串或凭据关键字（如 `fk115_`、`Bearer `、`access_token`、`refresh_token`、`downurl`、`password=`、`api_key=`、`ghp_`、`github_pat_` 等）。
 
-### 6.4 导出与社区仓库提 PR 共建流程
+### 7.4 导出与社区仓库提 PR 共建流程
 
 1. 进入管理后台「元数据刮削 → 社区脱敏映射包导出」；
 2. 选择要导出的书库范围，保留默认勾选的绑定来源（`manual` 与 `agent`，人工与 AI 审核准确度最高）；
@@ -296,9 +377,9 @@ CREATE TABLE gallery_meta (
 
 ---
 
-## 7. 包内嵌入式元数据支持（`ComicInfo.xml` / `galleryinfo.txt`）
+## 8. 包内嵌入式元数据支持（`ComicInfo.xml` / `galleryinfo.txt`）
 
-对单文件安全上限为 `512 KiB`（自动剥离 UTF-8 BOM）：
+为严守 **零隐式拆包** 铁律，批量多源刮削阶段绝不隐式打开或读取漫画归档内部字节，而是仅复用数据库中已缓存的首卷 `book_metadata`（如用户/管理员此前打开阅读或显式执行批量维护任务时解析保存的 `ComicInfo.xml` 标题、作者与链接）作为辅助匹配线索。对单文件安全上限为 `512 KiB`（自动剥离 UTF-8 BOM）：
 
 1. **`ComicInfo.xml`**：
    - 使用标准 `encoding/xml` 严格模式解析，天然免疫外部实体注入（XXE）；
@@ -310,7 +391,7 @@ CREATE TABLE gallery_meta (
 
 ---
 
-## 8. 安全、SSRF 防护与限流熔断机制
+## 9. 安全、SSRF 防护与限流熔断机制
 
 1. **防 SSRF 网络客户端与透明代理 Fake-IP 兼容**：
    - 仓库拉取、离线包下载、在线补全与外部封面代理统一使用安全 HTTP 客户端：

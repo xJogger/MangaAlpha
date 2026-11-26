@@ -227,6 +227,66 @@ func (c *CoverService) coverCachePath(sourceID, safeEntry, ext string) (string, 
 	return target, nil
 }
 
+// GetOrLoadLocal returns a cached cover from disk or resolves it via loader (used
+// for offline SQLite thumbnail BLOBs) with singleflight deduplication, format
+// validation, and atomic disk persistence without HTTP SSRF/circuit-breaker overhead.
+func (c *CoverService) GetOrLoadLocal(
+	ctx context.Context,
+	sourceID, entryID, cacheKey string,
+	maxBytes int64,
+	loader func(context.Context) ([]byte, string, error),
+) (CoverData, error) {
+	if c == nil {
+		return CoverData{}, errors.New("cover service is nil")
+	}
+	cacheKey = strings.TrimSpace(cacheKey)
+	if cacheKey == "" || loader == nil {
+		return CoverData{}, ErrInvalidConfig
+	}
+	if data, ok := c.readCachedFromDisk(sourceID, entryID, cacheKey); ok {
+		return data, nil
+	}
+	limit := maxBytes
+	if limit <= 0 {
+		limit = max(c.maxImageBytes, maxSQLiteBlobCoverBytes)
+	}
+	flightKey := "local\x00" + sourceID + "\x00" + entryID + "\x00" + cacheKey
+	val, err, _ := c.flight.Do(flightKey, func() (any, error) {
+		if data, ok := c.readCachedFromDisk(sourceID, entryID, cacheKey); ok {
+			return data, nil
+		}
+		raw, _, err := loader(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(raw)) > limit {
+			return nil, fmt.Errorf("%w: cover blob size %d exceeds %d bytes limit", ErrInvalidImage, len(raw), limit)
+		}
+		ext, mimeType, ok := DetectImageFormat(raw)
+		if !ok {
+			return nil, fmt.Errorf("%w: unrecognized image magic bytes", ErrInvalidImage)
+		}
+		cachePath, err := c.versionedCoverCachePath(sourceID, entryID, cacheKey, ext)
+		if err != nil {
+			return nil, err
+		}
+		if err := writeCoverAtomic(cachePath, raw); err != nil {
+			return nil, err
+		}
+		return CoverData{
+			Bytes:     raw,
+			MediaType: mimeType,
+			Extension: ext,
+			CachePath: cachePath,
+			FromCache: false,
+		}, nil
+	})
+	if err != nil {
+		return CoverData{}, err
+	}
+	return val.(CoverData), nil
+}
+
 // GetOrFetch returns the cached cover from disk if present, otherwise fetches it remotely
 // subject to circuit breaker, 5m negative cache, rate limiter, concurrency=2 semaphore,
 // 10 MiB size cap, and JPEG/PNG/WebP/GIF magic-byte validation.

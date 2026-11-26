@@ -2,6 +2,7 @@ package extmeta
 
 import (
 	"archive/zip"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -23,10 +24,12 @@ import (
 )
 
 const (
-	defaultMaxDecompressedBytes int64 = 8 << 30 // 8 GiB safety ceiling
-	defaultMaxReleaseJSONBytes  int64 = 4 << 20 // 4 MiB
+	defaultMaxDecompressedBytes int64 = 8 << 30  // 8 GiB safety ceiling
+	defaultMaxUploadStreamBytes int64 = 10 << 30 // 10 GiB upload stream safety ceiling
+	defaultMaxReleaseJSONBytes  int64 = 4 << 20  // 4 MiB
 	streamBufferSize                  = 256 << 10
 	progressEmitThreshold       int64 = 64 << 10
+	sqliteFileMagic                   = "SQLite format 3\x00"
 )
 
 // RemoteUpdateInfo describes the outcome of checking a remote asset or release for changes.
@@ -698,4 +701,180 @@ func extractFirstSQLiteFromZipStream(
 	defer rc.Close()
 
 	return streamBoundedCopy(ctx, outTmp, outHasher, rc, maxOutputBytes, tracker, onProgress)
+}
+
+// StreamUploadResult describes byte counts, SHA-256 checksum, and detected compression
+// for a streaming SQLite upload written atomically to disk.
+type StreamUploadResult struct {
+	UploadedBytes     int64
+	DecompressedBytes int64
+	SHA256            string
+	Compression       string
+}
+
+// StreamDecompressSQLiteToFile streams an uploaded raw or compressed (.sqlite/.sqlite3/.db/.gz/.zst/.zip)
+// SQLite stream directly to a bounded temporary file, validates the SQLite3 file header ("SQLite format 3\x00"),
+// and atomically places the resulting database at destPath without buffering in memory.
+func StreamDecompressSQLiteToFile(
+	ctx context.Context,
+	filename string,
+	src io.Reader,
+	destPath string,
+	maxUploadBytes int64,
+	onProgress func(written int64),
+) (StreamUploadResult, error) {
+	if src == nil {
+		return StreamUploadResult{}, errors.New("upload reader must not be nil")
+	}
+	if strings.TrimSpace(destPath) == "" {
+		return StreamUploadResult{}, errors.New("destPath must not be empty")
+	}
+	if maxUploadBytes <= 0 {
+		maxUploadBytes = defaultMaxUploadStreamBytes
+	}
+
+	destDir := filepath.Dir(destPath)
+	if err := os.MkdirAll(destDir, 0o700); err != nil {
+		return StreamUploadResult{}, err
+	}
+
+	// Sniff leading bytes before selecting compression when extension is ambiguous.
+	limited := io.LimitReader(src, maxUploadBytes+1)
+	headBuf := make([]byte, 16)
+	hn, hErr := io.ReadFull(limited, headBuf)
+	if hErr != nil && !errors.Is(hErr, io.EOF) && !errors.Is(hErr, io.ErrUnexpectedEOF) {
+		return StreamUploadResult{}, hErr
+	}
+	head := headBuf[:hn]
+	if len(head) == 0 {
+		return StreamUploadResult{}, fmt.Errorf("%w: uploaded file is empty", ErrUnsupportedSchema)
+	}
+
+	format := detectUploadCompressionFormat(filename, head)
+	combined := io.MultiReader(bytes.NewReader(head), limited)
+	var dlCb DownloadProgressFunc
+	if onProgress != nil {
+		dlCb = func(_, _, written int64) { onProgress(written) }
+	}
+	tracker := &progressStreamReader{
+		r:          combined,
+		totalBytes: -1,
+		onProgress: dlCb,
+	}
+
+	outTmp, err := os.CreateTemp(destDir, ".extmeta-upload-*")
+	if err != nil {
+		return StreamUploadResult{}, err
+	}
+	outTmpPath := outTmp.Name()
+	cleanupOut := true
+	defer func() {
+		if cleanupOut {
+			_ = outTmp.Close()
+			_ = os.Remove(outTmpPath)
+		}
+	}()
+	if err := outTmp.Chmod(0o600); err != nil {
+		return StreamUploadResult{}, err
+	}
+
+	outHasher := sha256.New()
+	var writtenBytes int64
+	switch format {
+	case "none":
+		writtenBytes, err = streamBoundedCopy(ctx, outTmp, outHasher, tracker, maxUploadBytes, tracker, dlCb)
+	case "gzip":
+		gz, gErr := gzip.NewReader(tracker)
+		if gErr != nil {
+			return StreamUploadResult{}, fmt.Errorf("%w: open gzip upload stream: %v", ErrUnsupportedSchema, gErr)
+		}
+		writtenBytes, err = streamBoundedCopy(ctx, outTmp, outHasher, gz, maxUploadBytes, tracker, dlCb)
+		closeErr := gz.Close()
+		if err == nil {
+			err = closeErr
+		}
+	case "zstd":
+		dec, zErr := zstd.NewReader(
+			tracker,
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderLowmem(true),
+			zstd.WithDecoderMaxWindow(128<<20),
+		)
+		if zErr != nil {
+			return StreamUploadResult{}, fmt.Errorf("%w: open zstd upload stream: %v", ErrUnsupportedSchema, zErr)
+		}
+		writtenBytes, err = streamBoundedCopy(ctx, outTmp, outHasher, dec, maxUploadBytes, tracker, dlCb)
+		dec.Close()
+	case "zip":
+		writtenBytes, err = extractFirstSQLiteFromZipStream(ctx, destDir, outTmp, outHasher, tracker, maxUploadBytes, dlCb)
+	default:
+		return StreamUploadResult{}, fmt.Errorf("%w: unsupported upload format %q", ErrUnsupportedSchema, format)
+	}
+	if err != nil {
+		return StreamUploadResult{}, err
+	}
+	if tracker.downloaded > maxUploadBytes {
+		return StreamUploadResult{}, fmt.Errorf("upload stream exceeds %d bytes limit", maxUploadBytes)
+	}
+
+	// Verify SQLite3 file magic header before promoting temporary file.
+	if writtenBytes < int64(len(sqliteFileMagic)) {
+		return StreamUploadResult{}, fmt.Errorf("%w: uploaded file is not a valid SQLite database", ErrUnsupportedSchema)
+	}
+	if _, err := outTmp.Seek(0, io.SeekStart); err != nil {
+		return StreamUploadResult{}, err
+	}
+	magic := make([]byte, len(sqliteFileMagic))
+	if _, err := io.ReadFull(outTmp, magic); err != nil {
+		return StreamUploadResult{}, fmt.Errorf("%w: read SQLite header: %v", ErrUnsupportedSchema, err)
+	}
+	if string(magic) != sqliteFileMagic {
+		return StreamUploadResult{}, fmt.Errorf("%w: invalid SQLite header", ErrUnsupportedSchema)
+	}
+
+	if err := outTmp.Sync(); err != nil {
+		return StreamUploadResult{}, err
+	}
+	if err := outTmp.Close(); err != nil {
+		return StreamUploadResult{}, err
+	}
+	if err := os.Rename(outTmpPath, destPath); err != nil {
+		return StreamUploadResult{}, err
+	}
+	cleanupOut = false
+
+	if onProgress != nil {
+		onProgress(writtenBytes)
+	}
+	return StreamUploadResult{
+		UploadedBytes:     tracker.downloaded,
+		DecompressedBytes: writtenBytes,
+		SHA256:            hex.EncodeToString(outHasher.Sum(nil)),
+		Compression:       format,
+	}, nil
+}
+
+func detectUploadCompressionFormat(filename string, head []byte) string {
+	if len(head) >= len(sqliteFileMagic) && string(head[:len(sqliteFileMagic)]) == sqliteFileMagic {
+		return "none"
+	}
+	if len(head) >= 2 && head[0] == 0x1f && head[1] == 0x8b {
+		return "gzip"
+	}
+	if len(head) >= 4 && head[0] == 0x28 && head[1] == 0xb5 && head[2] == 0x2f && head[3] == 0xfd {
+		return "zstd"
+	}
+	if len(head) >= 4 && head[0] == 'P' && head[1] == 'K' && head[2] == 0x03 && head[3] == 0x04 {
+		return "zip"
+	}
+	switch strings.ToLower(path.Ext(strings.TrimSpace(filename))) {
+	case ".gz", ".gzip":
+		return "gzip"
+	case ".zst", ".zstd":
+		return "zstd"
+	case ".zip":
+		return "zip"
+	default:
+		return "none"
+	}
 }

@@ -6,7 +6,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"net/url"
+	"path"
 	"regexp"
 	"slices"
 	"strconv"
@@ -14,6 +17,7 @@ import (
 	"time"
 
 	"github.com/xJogger/fake-komga-115/internal/bangumi"
+	"github.com/xJogger/fake-komga-115/internal/cjk"
 	"github.com/xJogger/fake-komga-115/internal/database"
 	"github.com/xJogger/fake-komga-115/internal/diagnostics"
 )
@@ -458,6 +462,11 @@ func (m *Manager) finishSeries(ctx context.Context, run *ScrapeRun, target scrap
 		switch {
 		case matched:
 			_, err = m.store.ApplyScrapedMetadata(ctx, target.series, incoming)
+			if err == nil && incoming.ExtSourceID != "" && incoming.ExtEntryID != "" {
+				if bookErr := m.syncSeriesBooks(ctx, target.series, incoming.ExtSourceID, incoming.ExtEntryID, incoming.MatchOrigin); bookErr != nil && m.logger != nil {
+					m.logger.Warn("failed to align series books metadata", "seriesId", target.series.ID, "sourceId", incoming.ExtSourceID, "error", bookErr)
+				}
+			}
 		case !target.bound:
 			inferred := bangumi.InferPathNSFW(target.series.Name, target.series.RelativePath)
 			err = m.store.MarkSeriesScrapeStatusWithNSFW(ctx, target.series, database.ScrapeStatusUnmatched, 0, inferred)
@@ -524,10 +533,14 @@ func (m *Manager) matchOffline(ctx context.Context, target scrapeSeries, plan sc
 		if !plan.readySidecars[link.SourceID] {
 			continue
 		}
-		if !readArchive && m.opts.ArchiveMetaReader != nil {
+		if !readArchive {
 			readArchive = true
-			if book, err := m.store.FirstBookInSeries(ctx, series.ID); err == nil {
-				embedded, _ = m.opts.ArchiveMetaReader(ctx, book)
+			if m.opts.ArchiveMetaReader != nil {
+				if book, err := m.store.FirstBookInSeries(ctx, series.ID); err == nil {
+					embedded, _ = m.opts.ArchiveMetaReader(ctx, book)
+				}
+			} else {
+				embedded = m.cachedEmbeddedMetaFromDB(ctx, series.ID)
 			}
 		}
 		entry, confidence, err := m.matchSidecar(ctx, src.ID, titles, parsed.Authors, target.coverSHA1, embedded)
@@ -562,18 +575,26 @@ func (m *Manager) matchMapping(ctx context.Context, series database.Series, pars
 				}
 			}
 		}
-		for _, schema := range []string{TargetSourceMetaV1, TargetSourceGalleryV1} {
+		for _, schema := range []string{TargetSourceMetaV1, SchemaMangaAlphaMetaV2, SchemaKomgaSQLiteV1, TargetSourceGalleryV1} {
 			rec, ok := plan.mappings.Lookup(key, series.Name, author, schema)
 			if !ok {
 				continue
 			}
-			ids := make([]string, 0, len(plan.bySchema[schema]))
+			bySchemaIDs := append([]string(nil), plan.bySchema[schema]...)
+			if schema == SchemaMangaAlphaMetaV2 {
+				for _, v1ID := range plan.bySchema[TargetSourceMetaV1] {
+					if !slices.Contains(bySchemaIDs, v1ID) {
+						bySchemaIDs = append(bySchemaIDs, v1ID)
+					}
+				}
+			}
+			ids := make([]string, 0, len(bySchemaIDs))
 			for _, link := range chain {
-				if link.Enabled && slices.Contains(plan.bySchema[schema], link.SourceID) {
+				if link.Enabled && slices.Contains(bySchemaIDs, link.SourceID) {
 					ids = append(ids, link.SourceID)
 				}
 			}
-			for _, id := range plan.bySchema[schema] {
+			for _, id := range bySchemaIDs {
 				if !slices.Contains(ids, id) {
 					ids = append(ids, id)
 				}
@@ -613,7 +634,12 @@ func (m *Manager) matchSidecar(ctx context.Context, id string, titles, authors [
 				}
 			}
 		}
-		titles = append([]string{embedded.Series, embedded.Title}, titles...)
+		if strings.TrimSpace(embedded.Series) != "" {
+			titles = append([]string{embedded.Series}, titles...)
+		}
+		if strings.TrimSpace(embedded.Title) != "" {
+			titles = append(slices.Clone(titles), embedded.Title)
+		}
 		authors = append(slices.Clone(authors), embedded.Authors...)
 	}
 	if sha1 != "" {
@@ -865,7 +891,14 @@ func (m *Manager) BindSeriesExternal(ctx context.Context, seriesID, sourceID, en
 	if err != nil {
 		return database.SeriesMetadata{}, err
 	}
-	return m.store.ApplyScrapedMetadata(ctx, series, m.externalMetadata(ctx, src, entry, origin, 1))
+	saved, err := m.store.ApplyScrapedMetadata(ctx, series, m.externalMetadata(ctx, src, entry, origin, 1))
+	if err != nil {
+		return saved, err
+	}
+	if err := m.syncSeriesBooks(ctx, series, src.ID, entry.EntryID, origin); err != nil {
+		return saved, err
+	}
+	return saved, nil
 }
 
 func (m *Manager) sourceTagDictionary(ctx context.Context, sourceID string) *TagDictionary {
@@ -886,23 +919,650 @@ func (m *Manager) externalMetadata(ctx context.Context, src database.MetadataSou
 	if dict := m.sourceTagDictionary(ctx, src.TagDictSourceID); dict != nil {
 		tags = dict.TranslateList(tags, TagDisplayMode(src.TagDisplayMode))
 	}
-	authors := make([]database.Author, 0, len(entry.Authors))
-	for _, name := range entry.Authors {
-		authors = append(authors, database.Author{Name: name, Role: "writer"})
+
+	var authors []database.Author
+	if detailed, ok := entry.RawFields["detailedAuthors"].([]KomgaAuthor); ok && len(detailed) > 0 {
+		authors = make([]database.Author, 0, len(detailed))
+		for _, a := range detailed {
+			name := strings.TrimSpace(a.Name)
+			if name == "" {
+				continue
+			}
+			role := strings.TrimSpace(a.Role)
+			if role == "" {
+				role = "writer"
+			}
+			authors = append(authors, database.Author{Name: name, Role: role})
+		}
+	} else {
+		authors = make([]database.Author, 0, len(entry.Authors))
+		for _, name := range entry.Authors {
+			if trimmed := strings.TrimSpace(name); trimmed != "" {
+				authors = append(authors, database.Author{Name: trimmed, Role: "writer"})
+			}
+		}
 	}
-	altTitles := make([]database.AlternateTitle, 0, 1)
-	if entry.TitleAlt != "" && entry.TitleAlt != entry.Title {
-		altTitles = append(altTitles, database.AlternateTitle{Title: entry.TitleAlt})
+
+	altTitles := make([]database.AlternateTitle, 0, 2)
+	seenAlt := make(map[string]struct{}, 4)
+	addAlt := func(label, title string) {
+		title = strings.TrimSpace(title)
+		label = strings.TrimSpace(label)
+		if title == "" || title == strings.TrimSpace(entry.Title) {
+			return
+		}
+		key := strings.ToLower(label) + "\x00" + strings.ToLower(title)
+		if _, dup := seenAlt[key]; dup {
+			return
+		}
+		seenAlt[key] = struct{}{}
+		altTitles = append(altTitles, database.AlternateTitle{Label: label, Title: title})
 	}
-	genres := []string{}
-	if entry.Category != "" {
-		genres = append(genres, entry.Category)
+	if alts, ok := entry.RawFields["alternateTitles"].([]KomgaAlternateTitle); ok {
+		for _, at := range alts {
+			addAlt(at.Label, at.Title)
+		}
 	}
+	if entry.TitleAlt != "" {
+		addAlt("", entry.TitleAlt)
+	}
+
+	var genres []string
+	if rawGenres, ok := entry.RawFields["genres"].([]string); ok && len(rawGenres) > 0 {
+		genres = slices.Clone(rawGenres)
+	} else {
+		genres = []string{}
+		if entry.Category != "" {
+			genres = append(genres, entry.Category)
+		}
+	}
+
+	var links []database.Link
+	if len(entry.Links) > 0 {
+		links = make([]database.Link, 0, len(entry.Links))
+		for _, l := range entry.Links {
+			if strings.TrimSpace(l.URL) != "" {
+				links = append(links, database.Link{Label: strings.TrimSpace(l.Label), URL: strings.TrimSpace(l.URL)})
+			}
+		}
+		if len(links) == 0 {
+			links = nil
+		}
+	}
+
+	var sharingLabels []string
+	if len(entry.SharingLabels) > 0 {
+		sharingLabels = dedupeStrings(entry.SharingLabels)
+	}
+
 	return database.ScrapedMetadata{
-		ExtSourceID: src.ID, ExtEntryID: entry.EntryID, ExtCoverURL: entry.CoverURL,
-		MatchOrigin: origin, Confidence: confidence, Title: entry.Title, Summary: entry.Summary,
-		AlternateTitles: altTitles, Authors: authors, Tags: tags, Genres: genres, IsNSFW: entry.IsNSFW,
+		ExtSourceID:      src.ID,
+		ExtEntryID:       entry.EntryID,
+		ExtCoverURL:      entry.CoverURL,
+		MatchOrigin:      origin,
+		Confidence:       confidence,
+		Status:           entry.Status,
+		Title:            entry.Title,
+		TitleSort:        entry.TitleSort,
+		Summary:          entry.Summary,
+		Publisher:        entry.Publisher,
+		Language:         entry.Language,
+		ReadingDirection: entry.ReadingDirection,
+		AgeRating:        entry.AgeRating,
+		TotalBookCount:   entry.TotalBookCount,
+		ReleaseDate:      entry.ReleaseDate,
+		AlternateTitles:  altTitles,
+		Authors:          authors,
+		Tags:             tags,
+		Genres:           genres,
+		Links:            links,
+		SharingLabels:    sharingLabels,
+		IsNSFW:           entry.IsNSFW,
 	}
+}
+
+func (m *Manager) cachedEmbeddedMetaFromDB(ctx context.Context, seriesID string) *EmbeddedMeta {
+	book, err := m.store.FirstBookInSeriesAny(ctx, seriesID)
+	if err != nil {
+		return nil
+	}
+	bm, ok, err := m.store.BookMetadataByID(ctx, book.ID)
+	if err != nil || !ok {
+		return nil
+	}
+	authors := make([]string, 0, len(bm.Authors))
+	for _, a := range bm.Authors {
+		if name := strings.TrimSpace(a.Name); name != "" {
+			authors = append(authors, name)
+		}
+	}
+	var extURL, extID string
+	for _, link := range bm.Links {
+		u := strings.TrimSpace(link.URL)
+		if u == "" {
+			continue
+		}
+		if _, _, isGallery := directEntryID(u); isGallery {
+			extURL = u
+			break
+		}
+		if extURL == "" {
+			extURL = u
+		}
+	}
+	title := strings.TrimSpace(bm.Title)
+	summary := strings.TrimSpace(bm.Summary)
+	if title == "" && len(authors) == 0 && extURL == "" && extID == "" && len(bm.Tags) == 0 && summary == "" {
+		return nil
+	}
+	return &EmbeddedMeta{
+		Title:       title,
+		Series:      strings.TrimSpace(bm.SeriesGroup),
+		Summary:     summary,
+		Authors:     dedupeStrings(authors),
+		Tags:        slices.Clone(bm.Tags),
+		ExternalURL: extURL,
+		ExternalID:  extID,
+	}
+}
+
+type localBookCandidate struct {
+	ID         string
+	Name       string
+	FileID     string
+	NumberSort float64
+}
+
+type remoteBookEntry struct {
+	EntryID     string
+	FileNames   []string
+	Title       string
+	Summary     string
+	Number      string
+	NumberSort  *float64
+	ReleaseDate string
+	ISBN        string
+	Authors     []database.Author
+	Tags        []string
+	Links       []database.Link
+	CoverURL    string
+}
+
+type bookMatchPair struct {
+	localIdx  int
+	remoteIdx int
+}
+
+type parsedBookNumber struct {
+	val  float64
+	kind string
+	ok   bool
+}
+
+var (
+	reBookBracketTag    = regexp.MustCompile(`(?:\[[^\[\]]*\]|【[^【】]*】)`)
+	reBookAllParenTag   = regexp.MustCompile(`(?:\[[^\[\]]*\]|【[^【】]*】|\([^()]*\)|（[^（）]*）)`)
+	reBookExplicitVol   = regexp.MustCompile(`(?i)(?:第\s*0*(\d+(?:\.\d+)?)\s*[卷冊册巻]|\bvol(?:ume)?\.?\s*0*(\d+(?:\.\d+)?)|(?:^|[\s._(\[-])v0*(\d+(?:\.\d+)?)\b)`)
+	reBookExplicitCh    = regexp.MustCompile(`(?i)(?:第\s*0*(\d+(?:\.\d+)?)\s*[話话回章]|\b(?:ch(?:apter)?|ep(?:isode)?)\.?\s*0*(\d+(?:\.\d+)?))`)
+	reBookTrailingNum   = regexp.MustCompile(`(?:^|[\s._#-])0*(\d{1,4}(?:\.\d+)?)\s*$`)
+	bookArchiveExts     = map[string]struct{}{".cbz": {}, ".cbr": {}, ".cb7": {}, ".cbt": {}, ".zip": {}, ".rar": {}, ".7z": {}, ".tar": {}, ".pdf": {}, ".epub": {}, ".mobi": {}, ".azw3": {}}
+	bookSeparatorsClean = strings.NewReplacer("_", " ", "　", " ")
+)
+
+func (m *Manager) syncSeriesBooks(ctx context.Context, series database.Series, sourceID, entryID, origin string) error {
+	if sourceID == "" || sourceID == TargetSourceBangumi || entryID == "" {
+		return nil
+	}
+	src, srcErr := m.store.GetMetadataSource(ctx, sourceID)
+	m.mu.RLock()
+	sidecar := m.sidecars[sourceID]
+	m.mu.RUnlock()
+	if sidecar == nil || sidecar.upstreamDB == nil {
+		return nil
+	}
+
+	var dict *TagDictionary
+	var displayMode TagDisplayMode
+	if srcErr == nil {
+		displayMode = TagDisplayMode(src.TagDisplayMode)
+		if src.TagDictSourceID != "" {
+			dict = m.sourceTagDictionary(ctx, src.TagDictSourceID)
+		}
+	}
+
+	var remotes []remoteBookEntry
+	switch sidecar.Schema() {
+	case SchemaKomgaSQLiteV1:
+		ks, err := ReadKomgaSeries(ctx, sidecar.upstreamDB, entryID)
+		if err != nil {
+			if errors.Is(err, ErrEntryNotFound) {
+				return nil
+			}
+			return err
+		}
+		remotes = make([]remoteBookEntry, 0, len(ks.Books))
+		for _, bk := range ks.Books {
+			tags := dedupeStrings(bk.Tags)
+			if dict != nil && len(tags) > 0 {
+				tags = dict.TranslateList(tags, displayMode)
+			}
+			var authors []database.Author
+			if len(bk.Authors) > 0 {
+				authors = make([]database.Author, 0, len(bk.Authors))
+				for _, a := range bk.Authors {
+					if name := strings.TrimSpace(a.Name); name != "" {
+						role := strings.TrimSpace(a.Role)
+						if role == "" {
+							role = "writer"
+						}
+						authors = append(authors, database.Author{Name: name, Role: role})
+					}
+				}
+			}
+			var links []database.Link
+			if len(bk.Links) > 0 {
+				links = make([]database.Link, 0, len(bk.Links))
+				for _, l := range bk.Links {
+					if u := strings.TrimSpace(l.URL); u != "" {
+						links = append(links, database.Link{Label: strings.TrimSpace(l.Label), URL: u})
+					}
+				}
+			}
+			var coverURL string
+			if bk.SelectedThumbnailID != "" {
+				coverURL = EncodeSQLiteBlobCoverRef(sourceID, SQLiteBlobKindKomgaBook, bk.SelectedThumbnailID)
+			}
+			var files []string
+			if bk.Name != "" {
+				files = append(files, bk.Name)
+			}
+			if tail := komgaPathTail(bk.URL); tail != "" {
+				files = append(files, tail)
+			}
+			remotes = append(remotes, remoteBookEntry{
+				EntryID:     bk.KomgaBookID,
+				FileNames:   files,
+				Title:       bk.Title,
+				Summary:     bk.Summary,
+				Number:      bk.Number,
+				NumberSort:  bk.NumberSort,
+				ReleaseDate: bk.ReleaseDate,
+				ISBN:        bk.ISBN,
+				Authors:     authors,
+				Tags:        tags,
+				Links:       links,
+				CoverURL:    coverURL,
+			})
+		}
+	case SchemaMangaAlphaMetaV1, SchemaMangaAlphaMetaV2:
+		openBooks, err := ReadOpenOfflineBooks(ctx, sidecar.upstreamDB, entryID)
+		if err != nil {
+			return err
+		}
+		if len(openBooks) == 0 {
+			return nil
+		}
+		remotes = make([]remoteBookEntry, 0, len(openBooks))
+		for _, bk := range openBooks {
+			tags := dedupeStrings(bk.Tags)
+			if dict != nil && len(tags) > 0 {
+				tags = dict.TranslateList(tags, displayMode)
+			}
+			var authors []database.Author
+			if len(bk.Authors) > 0 {
+				authors = make([]database.Author, 0, len(bk.Authors))
+				for _, a := range bk.Authors {
+					if name := strings.TrimSpace(a.Name); name != "" {
+						role := strings.TrimSpace(a.Role)
+						if role == "" {
+							role = "writer"
+						}
+						authors = append(authors, database.Author{Name: name, Role: role})
+					}
+				}
+			}
+			var links []database.Link
+			if len(bk.Links) > 0 {
+				links = make([]database.Link, 0, len(bk.Links))
+				for _, l := range bk.Links {
+					if u := strings.TrimSpace(l.URL); u != "" {
+						links = append(links, database.Link{Label: strings.TrimSpace(l.Label), URL: u})
+					}
+				}
+			}
+			coverURL := strings.TrimSpace(bk.CoverURL)
+			if coverURL == "" && bk.HasCoverBlob {
+				coverURL = EncodeSQLiteBlobCoverRef(sourceID, SQLiteBlobKindOpenBook, bk.SeriesEntryID+":"+bk.BookKey)
+			}
+			var files []string
+			if bk.FileName != "" {
+				files = append(files, bk.FileName)
+			}
+			if bk.BookKey != "" {
+				files = append(files, bk.BookKey)
+			}
+			remotes = append(remotes, remoteBookEntry{
+				EntryID:     bk.BookKey,
+				FileNames:   files,
+				Title:       bk.Title,
+				Summary:     bk.Summary,
+				Number:      bk.Number,
+				NumberSort:  bk.NumberSort,
+				ReleaseDate: bk.ReleaseDate,
+				ISBN:        bk.ISBN,
+				Authors:     authors,
+				Tags:        tags,
+				Links:       links,
+				CoverURL:    coverURL,
+			})
+		}
+	default:
+		return nil
+	}
+
+	if len(remotes) == 0 {
+		return nil
+	}
+
+	rows, err := m.store.DB().QueryContext(ctx, `
+SELECT id, name, coalesce(file_id,''), number_sort
+FROM books
+WHERE series_id=?
+ORDER BY number_sort ASC, name COLLATE NOCASE ASC, id ASC`, series.ID)
+	if err != nil {
+		return err
+	}
+	var locals []localBookCandidate
+	for rows.Next() {
+		var item localBookCandidate
+		if scanErr := rows.Scan(&item.ID, &item.Name, &item.FileID, &item.NumberSort); scanErr != nil {
+			rows.Close()
+			return scanErr
+		}
+		locals = append(locals, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(locals) == 0 {
+		return nil
+	}
+
+	pairs := alignSeriesBooks(locals, remotes)
+	for _, pair := range pairs {
+		loc := locals[pair.localIdx]
+		rem := remotes[pair.remoteIdx]
+		meta := database.BookScrapedMetadata{
+			Title:       strings.TrimSpace(rem.Title),
+			Summary:     strings.TrimSpace(rem.Summary),
+			Number:      strings.TrimSpace(rem.Number),
+			NumberSort:  rem.NumberSort,
+			ReleaseDate: strings.TrimSpace(rem.ReleaseDate),
+			ISBN:        strings.TrimSpace(rem.ISBN),
+			ExtSourceID: sourceID,
+			ExtEntryID:  rem.EntryID,
+			ExtCoverURL: rem.CoverURL,
+			MatchOrigin: origin,
+		}
+		if len(rem.Authors) > 0 {
+			meta.Authors = slices.Clone(rem.Authors)
+		}
+		if len(rem.Tags) > 0 {
+			meta.Tags = slices.Clone(rem.Tags)
+		}
+		if len(rem.Links) > 0 {
+			meta.Links = slices.Clone(rem.Links)
+		}
+		if upErr := m.store.UpsertBookScrapedMetadata(ctx, loc.ID, meta); upErr != nil {
+			if errors.Is(upErr, database.ErrMetadataChanged) {
+				continue
+			}
+			return upErr
+		}
+	}
+	return nil
+}
+
+func alignSeriesBooks(locals []localBookCandidate, remotes []remoteBookEntry) []bookMatchPair {
+	usedL := make([]bool, len(locals))
+	usedR := make([]bool, len(remotes))
+	var pairs []bookMatchPair
+
+	matchUniqueKeyTier := func(localKeysFn func(localBookCandidate) []string, remoteKeysFn func(remoteBookEntry) []string) {
+		localMap := make(map[string][]int, len(locals))
+		for i, loc := range locals {
+			if usedL[i] {
+				continue
+			}
+			for _, k := range localKeysFn(loc) {
+				localMap[k] = append(localMap[k], i)
+			}
+		}
+		remoteMap := make(map[string][]int, len(remotes))
+		for j, rem := range remotes {
+			if usedR[j] {
+				continue
+			}
+			for _, k := range remoteKeysFn(rem) {
+				remoteMap[k] = append(remoteMap[k], j)
+			}
+		}
+		keys := make([]string, 0, len(localMap))
+		for k := range localMap {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		for _, k := range keys {
+			ls, rs := localMap[k], remoteMap[k]
+			if len(ls) == 1 && len(rs) == 1 && !usedL[ls[0]] && !usedR[rs[0]] {
+				usedL[ls[0]] = true
+				usedR[rs[0]] = true
+				pairs = append(pairs, bookMatchPair{localIdx: ls[0], remoteIdx: rs[0]})
+			}
+		}
+	}
+
+	// Tier 1a: Exact filename key (with archive extension removed, preserving brackets if any).
+	matchUniqueKeyTier(
+		func(b localBookCandidate) []string {
+			return bookFilenameKeys(false, b.Name, path.Base(strings.ReplaceAll(b.FileID, "\\", "/")))
+		},
+		func(r remoteBookEntry) []string { return bookFilenameKeys(false, r.FileNames...) },
+	)
+	// Tier 1b: Normalized filename key (removing bracket release tags + CJK folding).
+	matchUniqueKeyTier(
+		func(b localBookCandidate) []string {
+			return bookFilenameKeys(true, b.Name, path.Base(strings.ReplaceAll(b.FileID, "\\", "/")))
+		},
+		func(r remoteBookEntry) []string { return bookFilenameKeys(true, r.FileNames...) },
+	)
+
+	// Tier 2: Unambiguous volume/book number match.
+	localNums := make([]parsedBookNumber, len(locals))
+	for i, loc := range locals {
+		localNums[i] = parseBookNumber(loc.Name, "", nil)
+	}
+	remoteNums := make([]parsedBookNumber, len(remotes))
+	for j, rem := range remotes {
+		names := append(slices.Clone(rem.FileNames), rem.Title)
+		best := parsedBookNumber{}
+		for _, name := range names {
+			if p := parseBookNumber(name, "", nil); p.ok {
+				best = p
+				break
+			}
+		}
+		if !best.ok {
+			best = parseBookNumber("", rem.Number, rem.NumberSort)
+		}
+		remoteNums[j] = best
+	}
+	matchUniqueKeyTier(
+		func(b localBookCandidate) []string {
+			idx := slices.IndexFunc(locals, func(cand localBookCandidate) bool { return cand.ID == b.ID })
+			if idx < 0 || !localNums[idx].ok {
+				return nil
+			}
+			return []string{fmt.Sprintf("%s:%.3f", localNums[idx].kind, localNums[idx].val)}
+		},
+		func(r remoteBookEntry) []string {
+			idx := slices.IndexFunc(remotes, func(cand remoteBookEntry) bool { return cand.EntryID == r.EntryID })
+			if idx < 0 || !remoteNums[idx].ok {
+				return nil
+			}
+			return []string{fmt.Sprintf("%s:%.3f", remoteNums[idx].kind, remoteNums[idx].val)}
+		},
+	)
+
+	// Tier 3a: Single unmatched local book & single unmatched remote book (e.g., One-shot / single volume).
+	var remLocals, remRemotes []int
+	for i := range locals {
+		if !usedL[i] {
+			remLocals = append(remLocals, i)
+		}
+	}
+	for j := range remotes {
+		if !usedR[j] {
+			remRemotes = append(remRemotes, j)
+		}
+	}
+	if len(remLocals) == 1 && len(remRemotes) == 1 {
+		li, rj := remLocals[0], remRemotes[0]
+		if !bookNumbersConflict(localNums[li], remoteNums[rj]) {
+			usedL[li], usedR[rj] = true, true
+			pairs = append(pairs, bookMatchPair{localIdx: li, remoteIdx: rj})
+			return pairs
+		}
+	}
+
+	// Tier 3b: Normalized title similarity match on remaining books.
+	for _, li := range remLocals {
+		if usedL[li] {
+			continue
+		}
+		lKeys := bookNormalizedTitleKeys(locals[li].Name, path.Base(strings.ReplaceAll(locals[li].FileID, "\\", "/")))
+		if len(lKeys) == 0 {
+			continue
+		}
+		bestIdx := -1
+		bestScore := 0.0
+		secondScore := 0.0
+		for _, rj := range remRemotes {
+			if usedR[rj] || bookNumbersConflict(localNums[li], remoteNums[rj]) {
+				continue
+			}
+			candidates := append([]string{remotes[rj].Title}, remotes[rj].FileNames...)
+			rKeys := bookNormalizedTitleKeys(candidates...)
+			score := 0.0
+			for _, lk := range lKeys {
+				for _, rk := range rKeys {
+					if s := scoreNormalizedPair(lk, rk); s > score {
+						score = s
+					}
+				}
+			}
+			if score > bestScore {
+				secondScore = bestScore
+				bestScore = score
+				bestIdx = rj
+			} else if score > secondScore {
+				secondScore = score
+			}
+		}
+		if bestIdx >= 0 && bestScore >= 0.80 && bestScore-secondScore >= 0.05 {
+			usedL[li], usedR[bestIdx] = true, true
+			pairs = append(pairs, bookMatchPair{localIdx: li, remoteIdx: bestIdx})
+		}
+	}
+	return pairs
+}
+
+func stripBookArchiveExt(raw string) string {
+	base := strings.TrimSpace(raw)
+	if base == "" {
+		return ""
+	}
+	ext := strings.ToLower(path.Ext(base))
+	if _, ok := bookArchiveExts[ext]; ok {
+		base = strings.TrimSuffix(base, base[len(base)-len(ext):])
+	}
+	return strings.TrimSpace(base)
+}
+
+func bookFilenameKeys(stripBrackets bool, inputs ...string) []string {
+	var keys []string
+	for _, raw := range inputs {
+		stem := stripBookArchiveExt(raw)
+		if stem == "" {
+			continue
+		}
+		if stripBrackets {
+			stem = reBookBracketTag.ReplaceAllString(stem, " ")
+		}
+		stem = strings.TrimSpace(bookSeparatorsClean.Replace(stem))
+		if key := cjk.ExactTitleKey(stem); key != "" && !slices.Contains(keys, key) {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func bookNormalizedTitleKeys(inputs ...string) []string {
+	var keys []string
+	for _, raw := range inputs {
+		stem := stripBookArchiveExt(raw)
+		if stem == "" {
+			continue
+		}
+		stem = reBookAllParenTag.ReplaceAllString(stem, " ")
+		stem = strings.TrimSpace(bookSeparatorsClean.Replace(stem))
+		if key := cjk.ExactTitleKey(stem); key != "" && !slices.Contains(keys, key) {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func parseBookNumber(rawName, numberStr string, numberSort *float64) parsedBookNumber {
+	stem := stripBookArchiveExt(rawName)
+	if stem != "" {
+		if m := reBookExplicitVol.FindStringSubmatch(stem); len(m) >= 4 {
+			numRaw := firstNonEmpty(m[1], m[2], m[3])
+			if v, err := strconv.ParseFloat(numRaw, 64); err == nil {
+				return parsedBookNumber{val: v, kind: "vol", ok: true}
+			}
+		}
+		if m := reBookExplicitCh.FindStringSubmatch(stem); len(m) >= 3 {
+			numRaw := firstNonEmpty(m[1], m[2])
+			if v, err := strconv.ParseFloat(numRaw, 64); err == nil {
+				return parsedBookNumber{val: v, kind: "ch", ok: true}
+			}
+		}
+		cleaned := strings.TrimSpace(bookSeparatorsClean.Replace(reBookAllParenTag.ReplaceAllString(stem, " ")))
+		if m := reBookTrailingNum.FindStringSubmatch(cleaned); len(m) == 2 {
+			if v, err := strconv.ParseFloat(m[1], 64); err == nil && (v < 1900 || v > 2099) {
+				return parsedBookNumber{val: v, kind: "vol", ok: true}
+			}
+		}
+	}
+	if n := strings.TrimSpace(numberStr); n != "" {
+		if v, err := strconv.ParseFloat(n, 64); err == nil && v >= 0 {
+			return parsedBookNumber{val: v, kind: "vol", ok: true}
+		}
+	}
+	if numberSort != nil && *numberSort >= 0 {
+		return parsedBookNumber{val: *numberSort, kind: "vol", ok: true}
+	}
+	return parsedBookNumber{}
+}
+
+func bookNumbersConflict(a, b parsedBookNumber) bool {
+	if !a.ok || !b.ok {
+		return false
+	}
+	return a.kind != b.kind || math.Abs(a.val-b.val) >= 0.001
 }
 
 func (m *Manager) ClearSeriesExternal(ctx context.Context, seriesID string) (database.SeriesMetadata, error) {

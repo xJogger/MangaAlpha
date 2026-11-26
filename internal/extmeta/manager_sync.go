@@ -59,7 +59,9 @@ func (m *Manager) startSourceSync(ctx context.Context, id string, force, schedul
 		return SyncRun{}, ErrBusy
 	}
 	phase := "downloading"
-	if src.Kind == KindOfflineSQLite && src.LocalPath != "" && filepath.Clean(src.LocalPath) != m.sqlitePath(src.ID) {
+	if src.Kind == KindOfflineSQLite &&
+		((src.LocalPath != "" && filepath.Clean(src.LocalPath) != m.sqlitePath(src.ID)) ||
+			(src.LocalPath == "" && src.DownloadURL == "" && src.ReleaseAPIURL == "")) {
 		phase = "indexing"
 	}
 	run := SyncRun{ID: newRunID(), SourceID: id, Status: "running", Phase: phase, StartedAt: timestamp()}
@@ -72,6 +74,104 @@ func (m *Manager) startSourceSync(ctx context.Context, id string, force, schedul
 		m.finishSync(src, run.ID, skipped, err)
 	})
 	return run, nil
+}
+
+// ImportUploadedSQLite streams an uploaded SQLite (or compressed .gz/.zst/.zip) database file
+// into staging, validates its SQLite magic header and offline catalog schema, builds the sidecar
+// FTS5 index, and atomically promotes both artifacts for sourceID without buffering in memory.
+func (m *Manager) ImportUploadedSQLite(
+	ctx context.Context,
+	sourceID string,
+	filename string,
+	reader io.Reader,
+	onProgress func(written int64),
+) (database.MetadataSource, error) {
+	sourceID = strings.TrimSpace(sourceID)
+	filename = strings.TrimSpace(filename)
+	if !isValidSourceID(sourceID) || filename == "" || reader == nil {
+		return database.MetadataSource{}, ErrInvalidConfig
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return database.MetadataSource{}, ErrUnavailable
+	}
+	if m.activeSync[sourceID] {
+		m.mu.Unlock()
+		return database.MetadataSource{}, ErrBusy
+	}
+	m.activeSync[sourceID] = true
+	m.mu.Unlock()
+
+	defer func() {
+		m.mu.Lock()
+		delete(m.activeSync, sourceID)
+		m.mu.Unlock()
+	}()
+
+	src, err := m.store.GetMetadataSource(ctx, sourceID)
+	if err != nil {
+		return database.MetadataSource{}, err
+	}
+	if src.Kind != KindOfflineSQLite {
+		return database.MetadataSource{}, ErrInvalidConfig
+	}
+
+	staging, err := os.MkdirTemp(m.root, ".upload-")
+	if err != nil {
+		return database.MetadataSource{}, err
+	}
+	defer os.RemoveAll(staging)
+
+	upstream := filepath.Join(staging, "upstream.sqlite")
+	dlRes, err := StreamDecompressSQLiteToFile(ctx, filename, reader, upstream, defaultMaxUploadStreamBytes, onProgress)
+	if err != nil {
+		return database.MetadataSource{}, err
+	}
+
+	_, resolvedSchema, err := probeOfflineCatalogSQLite(ctx, upstream, "")
+	if err != nil {
+		return database.MetadataSource{}, err
+	}
+
+	var indexed int64
+	index := filepath.Join(staging, "index.db")
+	if err := BuildSidecarIndex(ctx, upstream, index, resolvedSchema, func(count int64) {
+		indexed = count
+	}); err != nil {
+		return database.MetadataSource{}, err
+	}
+
+	now, ready, empty := timestamp(), true, ""
+	sidecarPath := m.indexPath(src.ID)
+	state := database.MetadataSourceSyncState{
+		Ready:           &ready,
+		EntryCount:      &indexed,
+		SidecarPath:     &sidecarPath,
+		FileSize:        &dlRes.DecompressedBytes,
+		LocalSHA256:     &dlRes.SHA256,
+		LastUpdatedAt:   &now,
+		LastCheckedAt:   &now,
+		LastError:       &empty,
+		RemoteETag:      &empty,
+		RemoteLastMod:   &empty,
+		RemoteUpdatedAt: &empty,
+	}
+	if !src.Enabled && !src.Ready && src.LastUpdatedAt == "" {
+		state.Enabled = &ready
+	}
+
+	src.LocalPath = ""
+	src.SchemaType = resolvedSchema
+	files := map[string]string{
+		m.sqlitePath(src.ID): upstream,
+		sidecarPath:          index,
+	}
+	if err := m.publishSync(ctx, src, staging, state, files, nil, nil); err != nil {
+		return database.MetadataSource{}, err
+	}
+	return m.store.GetMetadataSource(ctx, src.ID)
 }
 
 func (m *Manager) Syncs() []SyncRun {
@@ -272,6 +372,14 @@ func (m *Manager) syncSource(ctx context.Context, src database.MetadataSource, f
 			}
 			size := info.Size()
 			state.FileSize = &size
+		} else if src.DownloadURL == "" && src.ReleaseAPIURL == "" {
+			info, err := os.Stat(m.sqlitePath(src.ID))
+			if err != nil || !info.Mode().IsRegular() {
+				return false, ErrInvalidConfig
+			}
+			upstream = m.sqlitePath(src.ID)
+			size := info.Size()
+			state.FileSize = &size
 		} else {
 			info, err := CheckRemoteUpdate(ctx, client, src.DownloadURL, src.ReleaseAPIURL, src.AssetName,
 				src.RemoteETag, src.RemoteLastMod, src.FileSize, src.RemoteUpdatedAt)
@@ -302,10 +410,18 @@ func (m *Manager) syncSource(ctx context.Context, src database.MetadataSource, f
 			state.LocalSHA256, state.FileSize = &out.SHA256, &size
 			files[m.sqlitePath(src.ID)] = upstream
 		}
+		_, resolvedSchema, err := probeOfflineCatalogSQLite(ctx, upstream, src.SchemaType)
+		if err != nil {
+			return false, err
+		}
+		if src.SchemaType == "" || strings.EqualFold(src.SchemaType, "auto") ||
+			(src.SchemaType == SchemaMangaAlphaMetaV1 && resolvedSchema == SchemaMangaAlphaMetaV2) {
+			src.SchemaType = resolvedSchema
+		}
 		var indexed int64
 		index := filepath.Join(staging, "index.db")
 		m.setSyncPhase(runID, "indexing")
-		err := BuildSidecarIndex(ctx, upstream, index, src.SchemaType, func(count int64) {
+		err = BuildSidecarIndex(ctx, upstream, index, src.SchemaType, func(count int64) {
 			indexed = count
 			m.mu.Lock()
 			m.updateSync(runID, func(run *SyncRun) { run.Indexed, run.IndexedEntries = count, count })
@@ -416,6 +532,14 @@ func (m *Manager) publishSync(ctx context.Context, src database.MetadataSource, 
 	saved, err := m.store.UpdateMetadataSourceSyncState(ctx, src.ID, state)
 	if err != nil {
 		return err
+	}
+	if src.Kind == KindOfflineSQLite && src.SchemaType != "" {
+		if _, schemaErr := m.store.DB().ExecContext(ctx,
+			`UPDATE metadata_sources SET schema_type=?, local_path=? WHERE id=?`,
+			src.SchemaType, src.LocalPath, src.ID,
+		); schemaErr != nil {
+			return schemaErr
+		}
 	}
 	m.invalidateFallbackCoverCacheLocked()
 	switch src.Kind {

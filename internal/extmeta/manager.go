@@ -318,10 +318,100 @@ func checkedLocalFile(path string) (os.FileInfo, error) {
 	return info, nil
 }
 
+const walWarningMessage = "检测到同目录存在未 Checkpoint 的 -wal 日志，可能缺少最新增量数据；请先停止 Komga 或执行 Checkpoint 后再同步"
+
+// SourceView enriches a MetadataSource record with resolved SQLite schema format
+// and un-checkpointed WAL status for API responses.
+type SourceView struct {
+	database.MetadataSource
+	SchemaFormat      string `json:"schemaFormat,omitempty"`
+	WALWarning        bool   `json:"walWarning"`
+	WALWarningBytes   int64  `json:"walWarningBytes"`
+	WALWarningMessage string `json:"walWarningMessage,omitempty"`
+}
+
+func (m *Manager) SourceView(ctx context.Context, src database.MetadataSource) SourceView {
+	view := SourceView{
+		MetadataSource: src,
+		SchemaFormat:   strings.TrimSpace(src.SchemaType),
+	}
+	if strings.EqualFold(view.SchemaFormat, "auto") {
+		view.SchemaFormat = ""
+	}
+	if src.Kind != KindOfflineSQLite {
+		return view
+	}
+
+	m.mu.RLock()
+	sidecar := m.sidecars[src.ID]
+	m.mu.RUnlock()
+	if sidecar != nil && (view.SchemaFormat == "" || (view.SchemaFormat != SchemaMangaAlphaMetaV2 && sidecar.Schema() != "")) {
+		if view.SchemaFormat == "" {
+			view.SchemaFormat = sidecar.Schema()
+		}
+	}
+
+	upstream := m.upstreamPath(src)
+	if upstream != "" {
+		if info, err := os.Stat(upstream); err == nil && info.Mode().IsRegular() {
+			walWarn, walBytes := DetectSQLiteWALWarning(upstream)
+			view.WALWarning = walWarn
+			view.WALWarningBytes = walBytes
+			if walWarn {
+				view.WALWarningMessage = walWarningMessage
+			}
+			if view.SchemaFormat == "" {
+				if probe, err := ProbeSQLiteFile(ctx, upstream); err == nil && probe.Format != "" {
+					view.SchemaFormat = probe.Format
+				}
+			}
+		}
+	}
+	return view
+}
+
+func (m *Manager) SourceViews(ctx context.Context, sources []database.MetadataSource) []SourceView {
+	out := make([]SourceView, len(sources))
+	for i, src := range sources {
+		out[i] = m.SourceView(ctx, src)
+	}
+	return out
+}
+
+func schemaCompatible(requested, detected string) bool {
+	req := strings.ToLower(strings.TrimSpace(requested))
+	det := strings.ToLower(strings.TrimSpace(detected))
+	if req == "" || req == "auto" {
+		return true
+	}
+	if req == det {
+		return true
+	}
+	return (req == SchemaMangaAlphaMetaV1 || req == SchemaMangaAlphaMetaV2) &&
+		(det == SchemaMangaAlphaMetaV1 || det == SchemaMangaAlphaMetaV2)
+}
+
+func probeOfflineCatalogSQLite(ctx context.Context, path, requestedSchema string) (SQLiteProbeResult, string, error) {
+	probe, err := ProbeSQLiteFile(ctx, path)
+	if err != nil {
+		return SQLiteProbeResult{}, "", err
+	}
+	switch probe.Format {
+	case SchemaKomgaSQLiteV1, SchemaMangaAlphaMetaV1, SchemaMangaAlphaMetaV2, SchemaGalleryV1:
+	default:
+		return SQLiteProbeResult{}, "", fmt.Errorf("%w: %s", ErrUnsupportedSchema, probe.Format)
+	}
+	if !schemaCompatible(requestedSchema, probe.Format) {
+		return SQLiteProbeResult{}, "", fmt.Errorf("%w: expected %s, got %s", ErrUnsupportedSchema, requestedSchema, probe.Format)
+	}
+	resolved := probe.Format
+	return probe, resolved, nil
+}
+
 func (m *Manager) AddCustomSource(ctx context.Context, src database.MetadataSource) (database.MetadataSource, error) {
 	// Only configuration fields may come from the request.
 	src = database.MetadataSource{
-		Kind: strings.TrimSpace(src.Kind), SchemaType: src.SchemaType, Name: src.Name, Description: src.Description,
+		Kind: strings.TrimSpace(src.Kind), SchemaType: strings.TrimSpace(src.SchemaType), Name: src.Name, Description: src.Description,
 		DownloadURL: src.DownloadURL, ManifestURL: src.ManifestURL, ReleaseAPIURL: src.ReleaseAPIURL,
 		AssetName: src.AssetName, Compression: src.Compression, LocalPath: strings.TrimSpace(src.LocalPath),
 		TagDictSourceID: src.TagDictSourceID, TagDisplayMode: src.TagDisplayMode, NSFWRule: src.NSFWRule,
@@ -329,6 +419,16 @@ func (m *Manager) AddCustomSource(ctx context.Context, src database.MetadataSour
 	}
 	if err := validateSource(src, true); err != nil {
 		return database.MetadataSource{}, err
+	}
+	if src.Kind == KindOfflineSQLite && src.LocalPath != "" {
+		_, resolvedSchema, err := probeOfflineCatalogSQLite(ctx, src.LocalPath, src.SchemaType)
+		if err != nil {
+			return database.MetadataSource{}, err
+		}
+		if src.SchemaType == "" || strings.EqualFold(src.SchemaType, "auto") ||
+			(src.SchemaType == SchemaMangaAlphaMetaV1 && resolvedSchema == SchemaMangaAlphaMetaV2) {
+			src.SchemaType = resolvedSchema
+		}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -398,8 +498,19 @@ func (m *Manager) UpdateSourceConfig(ctx context.Context, id string, cfg SourceC
 	setOption(&src.OnlineAPIURL, cfg.OnlineAPIURL)
 	setOption(&src.OnlineEnabled, cfg.OnlineEnabled)
 	src.LocalPath = strings.TrimSpace(src.LocalPath)
+	src.SchemaType = strings.TrimSpace(src.SchemaType)
 	if err := validateSource(src, cfg.LocalPath != nil); err != nil {
 		return src, err
+	}
+	if src.Kind == KindOfflineSQLite && src.LocalPath != "" && (cfg.LocalPath != nil || cfg.SchemaType != nil) {
+		_, resolvedSchema, err := probeOfflineCatalogSQLite(ctx, src.LocalPath, src.SchemaType)
+		if err != nil {
+			return src, err
+		}
+		if src.SchemaType == "" || strings.EqualFold(src.SchemaType, "auto") ||
+			(src.SchemaType == SchemaMangaAlphaMetaV1 && resolvedSchema == SchemaMangaAlphaMetaV2) {
+			src.SchemaType = resolvedSchema
+		}
 	}
 	if src.LocalPath != before.LocalPath || src.DownloadURL != before.DownloadURL || src.ManifestURL != before.ManifestURL ||
 		src.ReleaseAPIURL != before.ReleaseAPIURL || src.AssetName != before.AssetName || src.Compression != before.Compression ||

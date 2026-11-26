@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -25,10 +26,11 @@ var webUIClientSettingRanges = map[string][2]int{
 	"webui.home.addedSize":    {4, 36},
 }
 
-// webUIClientSettingEnums validates boolean-ish web UI toggles that are stored
-// as plain "0"/"1" strings in client_settings.
+// webUIClientSettingEnums validates enumerated web UI settings stored as plain
+// strings in client_settings (including "0"/"1" toggles and view modes).
 var webUIClientSettingEnums = map[string]map[string]struct{}{
 	"webui.shelf.infiniteScroll": {"0": {}, "1": {}},
+	"webui.series.booksView":     {"list": {}, "cover": {}},
 }
 
 type komgaSearchFilters struct {
@@ -156,7 +158,7 @@ func validateClientSetting(key string, value *string) error {
 	if value != nil {
 		if allowed, ok := webUIClientSettingEnums[strings.TrimSpace(key)]; ok {
 			if _, valid := allowed[strings.TrimSpace(*value)]; !valid {
-				return fmt.Errorf("%s must be \"0\" or \"1\"", key)
+				return fmt.Errorf("%s must be %s", key, formatAllowedSettingValues(allowed))
 			}
 		}
 		if limits, ok := webUIClientSettingRanges[strings.TrimSpace(key)]; ok {
@@ -170,6 +172,28 @@ func validateClientSetting(key string, value *string) error {
 		}
 	}
 	return nil
+}
+
+func formatAllowedSettingValues(allowed map[string]struct{}) string {
+	vals := make([]string, 0, len(allowed))
+	for v := range allowed {
+		vals = append(vals, v)
+	}
+	sort.Strings(vals)
+	quoted := make([]string, len(vals))
+	for i, v := range vals {
+		quoted[i] = fmt.Sprintf("%q", v)
+	}
+	switch len(quoted) {
+	case 0:
+		return ""
+	case 1:
+		return quoted[0]
+	case 2:
+		return quoted[0] + " or " + quoted[1]
+	default:
+		return strings.Join(quoted[:len(quoted)-1], ", ") + ", or " + quoted[len(quoted)-1]
+	}
 }
 
 func (s *Server) komgaSeriesList(w http.ResponseWriter, r *http.Request) {

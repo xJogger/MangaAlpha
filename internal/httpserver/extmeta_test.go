@@ -2,12 +2,16 @@ package httpserver
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -450,5 +454,236 @@ INSERT INTO entries(id,title,cover_url,is_nsfw) VALUES
  ('104','Restricted Entry','https://upstream.example.test/other.png',1);
 `); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMetadataSourcesListUploadWALAndBlobCoverHTTP(t *testing.T) {
+	srv, store, bgm, _ := setupV27TestServer(t, "")
+	ctx := t.Context()
+	if _, err := store.ClaimAdmin(ctx, "fixture-owner", "FixturePassword123!"); err != nil {
+		t.Fatal(err)
+	}
+	adminKey, _, err := store.CreateAPIKey(ctx, "fixture admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := store.CreateUser(ctx, database.CreateUserInput{
+		Username: "fixture-reader", Password: "FixturePassword123!", AllLibraries: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerKey, _, err := store.CreateAPIKeyForUser(ctx, reader.ID, "fixture reader")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	covers, err := extmeta.NewCoverService(extmeta.CoverConfig{DataDir: srv.runtime.DataDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := extmeta.NewManager(store, bgm, covers, srv.runtime.DataDir, nil, extmeta.ManagerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(manager.Close)
+	srv.WithMetadata(manager)
+	handler := srv.Handler()
+
+	var jpgBuf bytes.Buffer
+	if err := jpeg.Encode(&jpgBuf, image.NewRGBA(image.Rect(0, 0, 8, 8)), nil); err != nil {
+		t.Fatal(err)
+	}
+	jpgBytes := jpgBuf.Bytes()
+
+	// Create Komga SQLite fixture file & OpenV2 gzipped fixture.
+	komgaPath := filepath.Join(t.TempDir(), "komga.database.sqlite")
+	kdb, err := sql.Open("sqlite", komgaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kdb.Exec(`
+CREATE TABLE SERIES (ID TEXT PRIMARY KEY, NAME TEXT, URL TEXT, ONESHOT INTEGER, DELETED INTEGER);
+CREATE TABLE SERIES_METADATA (SERIES_ID TEXT PRIMARY KEY, STATUS TEXT, TITLE TEXT, TITLE_SORT TEXT, SUMMARY TEXT, READING_DIRECTION TEXT, PUBLISHER TEXT, AGE_RATING INTEGER, LANGUAGE TEXT, TOTAL_BOOK_COUNT INTEGER);
+CREATE TABLE BOOK (ID TEXT PRIMARY KEY, SERIES_ID TEXT, NAME TEXT, URL TEXT, NUMBER INTEGER);
+CREATE TABLE BOOK_METADATA (BOOK_ID TEXT PRIMARY KEY, TITLE TEXT, SUMMARY TEXT, NUMBER TEXT, NUMBER_SORT REAL, RELEASE_DATE TEXT, ISBN TEXT);
+CREATE TABLE thumbnail_series (ID TEXT PRIMARY KEY, SERIES_ID TEXT, SELECTED INTEGER, THUMBNAIL BLOB);
+INSERT INTO SERIES VALUES ('ks1','KomgaWork','/lib/KomgaWork',0,0);
+INSERT INTO SERIES_METADATA VALUES ('ks1','ENDED','Komga Title','Komga Title','Summary','RIGHT_TO_LEFT','Pub',13,'ja',1);
+INSERT INTO BOOK VALUES ('kb1','ks1','Vol 1','/lib/KomgaWork/v1.cbz',1);
+INSERT INTO BOOK_METADATA VALUES ('kb1','Vol 1','','1',1.0,'','');
+INSERT INTO thumbnail_series VALUES ('ts1','ks1',1,?);
+`, jpgBytes); err != nil {
+		t.Fatal(err)
+	}
+	_ = kdb.Close()
+	komgaRaw, err := os.ReadFile(komgaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	openPath := filepath.Join(t.TempDir(), "open.sqlite")
+	odb, err := sql.Open("sqlite", openPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := odb.Exec(`
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+INSERT INTO meta VALUES ('schema', 'mangaalpha_meta_v2');
+CREATE TABLE entries (id TEXT PRIMARY KEY, title TEXT, title_alt TEXT, authors TEXT, summary TEXT, tags TEXT, category TEXT, cover_url TEXT, rating REAL, is_nsfw INTEGER, updated_at INTEGER, extra_json TEXT, cover_blob BLOB);
+INSERT INTO entries VALUES ('oe1','Open Entry','','[]','','[]','Manga','',9,0,1,'{}',?);
+`, jpgBytes); err != nil {
+		t.Fatal(err)
+	}
+	_ = odb.Close()
+	openRaw, err := os.ReadFile(openPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var openGZ bytes.Buffer
+	gw := gzip.NewWriter(&openGZ)
+	_, _ = gw.Write(openRaw)
+	_ = gw.Close()
+
+	makeUploadReq := func(key string, filename string, payload []byte, fieldsFirst bool, fields [][2]string) *httptest.ResponseRecorder {
+		t.Helper()
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		if fieldsFirst {
+			for _, kv := range fields {
+				_ = mw.WriteField(kv[0], kv[1])
+			}
+		}
+		fw, err := mw.CreateFormFile("file", filename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fw.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if !fieldsFirst {
+			for _, kv := range fields {
+				_ = mw.WriteField(kv[0], kv[1])
+			}
+		}
+		_ = mw.Close()
+		req := httptest.NewRequest(http.MethodPost, "/admin/api/metadata/sources/upload", &body)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		req.Header.Set("X-API-Key", key)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		return w
+	}
+
+	// 1. Non-admin blocked 403.
+	if w := makeUploadReq(readerKey, "komga.sqlite", komgaRaw, true, [][2]string{{"name", "Denied"}}); w.Code != http.StatusForbidden {
+		t.Fatalf("reader upload status = %d, want 403", w.Code)
+	}
+
+	// 2. Invalid SQLite magic rejected 400 and leaves no phantom source.
+	if w := makeUploadReq(adminKey, "bad.sqlite", []byte("not-a-sqlite-file"), true, [][2]string{{"name", "BadUpload"}}); w.Code != http.StatusBadRequest {
+		t.Fatalf("bad upload status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+
+	// 3. Upload raw komga.sqlite with file part BEFORE name field -> 201 Created.
+	upResp := makeUploadReq(adminKey, "komga.sqlite", komgaRaw, false, [][2]string{{"name", "Uploaded Komga"}})
+	if upResp.Code != http.StatusCreated {
+		t.Fatalf("komga upload status = %d, want 201: %s", upResp.Code, upResp.Body.String())
+	}
+	createdView := decodeMetadataFixture[extmeta.SourceView](t, upResp)
+	if createdView.ID == "" || createdView.SchemaFormat != extmeta.FormatKomgaSQLite || !createdView.Ready || createdView.EntryCount != 1 {
+		t.Fatalf("unexpected upload response: %+v", createdView)
+	}
+
+	// 4. Entry cover served lazily from Komga BLOB.
+	coverReq := httptest.NewRequest(http.MethodGet, "/admin/api/metadata/sources/"+createdView.ID+"/entries/ks1/cover", nil)
+	coverReq.Header.Set("X-API-Key", adminKey)
+	coverW := httptest.NewRecorder()
+	handler.ServeHTTP(coverW, coverReq)
+	if coverW.Code != http.StatusOK || coverW.Header().Get("Content-Type") != "image/jpeg" || !bytes.Equal(coverW.Body.Bytes(), jpgBytes) {
+		t.Fatalf("komga blob entry cover = %d ct=%q len=%d", coverW.Code, coverW.Header().Get("Content-Type"), coverW.Body.Len())
+	}
+
+	// 5. Overwrite existing source with .sqlite.gz (mangaalpha_meta_v2) -> 200 OK.
+	updResp := makeUploadReq(adminKey, "open.sqlite.gz", openGZ.Bytes(), true, [][2]string{{"sourceId", createdView.ID}})
+	if updResp.Code != http.StatusOK {
+		t.Fatalf("gz overwrite status = %d, want 200: %s", updResp.Code, updResp.Body.String())
+	}
+	updView := decodeMetadataFixture[extmeta.SourceView](t, updResp)
+	if updView.SchemaFormat != extmeta.FormatOpenV2 {
+		t.Fatalf("expected updated schemaFormat=%q, got %+v", extmeta.FormatOpenV2, updView)
+	}
+	openCoverReq := httptest.NewRequest(http.MethodGet, "/admin/api/metadata/sources/"+createdView.ID+"/entries/oe1/cover", nil)
+	openCoverReq.Header.Set("X-API-Key", adminKey)
+	openCoverW := httptest.NewRecorder()
+	handler.ServeHTTP(openCoverW, openCoverReq)
+	if openCoverW.Code != http.StatusOK || openCoverW.Header().Get("Content-Type") != "image/jpeg" || !bytes.Equal(openCoverW.Body.Bytes(), jpgBytes) {
+		t.Fatalf("open-v2 blob entry cover = %d ct=%q len=%d", openCoverW.Code, openCoverW.Header().Get("Content-Type"), openCoverW.Body.Len())
+	}
+
+	// 6. LocalPath Komga source with -wal surfaces walWarning cleanly on /sources and /overview.
+	if err := os.WriteFile(komgaPath+"-wal", []byte("uncheckpointed-wal-data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	localSrc, err := manager.AddCustomSource(ctx, database.MetadataSource{
+		Kind: extmeta.KindOfflineSQLite, Name: "Mounted Komga", LocalPath: komgaPath, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/admin/api/metadata/sources", nil)
+	listReq.Header.Set("X-API-Key", adminKey)
+	listW := httptest.NewRecorder()
+	handler.ServeHTTP(listW, listReq)
+	if listW.Code != http.StatusOK {
+		t.Fatalf("GET /metadata/sources = %d", listW.Code)
+	}
+	listData := decodeMetadataFixture[struct {
+		Sources []extmeta.SourceView `json:"sources"`
+	}](t, listW)
+	var sawUploaded, sawMounted bool
+	for _, s := range listData.Sources {
+		if s.Name == "BadUpload" {
+			t.Fatalf("failed bad upload leaked phantom source: %+v", s)
+		}
+		if s.ID == createdView.ID {
+			sawUploaded = true
+			if s.SchemaFormat != extmeta.FormatOpenV2 || s.WALWarning {
+				t.Fatalf("unexpected uploaded source in list: %+v", s)
+			}
+		}
+		if s.ID == localSrc.ID {
+			sawMounted = true
+			if s.SchemaFormat != extmeta.FormatKomgaSQLite || !s.WALWarning || s.WALWarningBytes <= 0 || s.WALWarningMessage == "" {
+				t.Fatalf("expected walWarning on mounted source: %+v", s)
+			}
+		}
+	}
+	if !sawUploaded || !sawMounted {
+		t.Fatalf("missing expected sources in list: uploaded=%v mounted=%v", sawUploaded, sawMounted)
+	}
+
+	overviewReq := httptest.NewRequest(http.MethodGet, "/admin/api/metadata/overview", nil)
+	overviewReq.Header.Set("X-API-Key", adminKey)
+	overviewW := httptest.NewRecorder()
+	handler.ServeHTTP(overviewW, overviewReq)
+	if overviewW.Code != http.StatusOK {
+		t.Fatalf("GET /metadata/overview = %d", overviewW.Code)
+	}
+	overviewData := decodeMetadataFixture[struct {
+		Sources []extmeta.SourceView `json:"sources"`
+	}](t, overviewW)
+	var overviewWALChecked bool
+	for _, s := range overviewData.Sources {
+		if s.ID == localSrc.ID {
+			overviewWALChecked = true
+			if !s.WALWarning || s.SchemaFormat != extmeta.FormatKomgaSQLite {
+				t.Fatalf("overview missing walWarning/schemaFormat: %+v", s)
+			}
+		}
+	}
+	if !overviewWALChecked {
+		t.Fatalf("mounted source missing from overview: %+v", overviewData.Sources)
 	}
 }
