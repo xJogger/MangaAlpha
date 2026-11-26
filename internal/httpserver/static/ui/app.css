@@ -1352,6 +1352,12 @@ button, input, select, textarea {
   max-width: 100%;
 }
 
+.detail-badges > .badge {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .detail-cta {
   display: flex;
   flex-wrap: wrap;
