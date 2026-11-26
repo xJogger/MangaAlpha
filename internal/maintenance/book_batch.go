@@ -207,15 +207,15 @@ func (m *Manager) batchBookCover(ctx context.Context, book database.Book, meta d
 
 func (m *Manager) batchBookComicInfo(ctx context.Context, book database.Book, options JobOptions) (bool, error) {
 	status, parsed, err := m.archive.ExtractBookComicInfoWithOptions(ctx, book, options.Force)
-	if err != nil && !options.ExtractPage1 {
-		return false, err
+	if err != nil {
+		return parsed, err
 	}
 	if !options.ExtractPage1 || status == archive.ComicInfoSkippedSolid ||
 		status == archive.ComicInfoSkippedEncrypted || status == archive.ComicInfoSkippedUnsupported {
-		return parsed, err
+		return parsed, nil
 	}
 	generated, pageErr := m.batchPageOne(ctx, book)
-	return parsed || generated, errors.Join(err, pageErr)
+	return parsed || generated, pageErr
 }
 
 func (m *Manager) batchPageOne(ctx context.Context, book database.Book) (bool, error) {

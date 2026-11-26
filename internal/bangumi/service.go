@@ -518,7 +518,8 @@ func (s *Service) SearchCandidates(
 
 	seen := map[int64]bool{}
 	var merged []SubjectCandidate
-	if liveResults, err := s.live.Search(ctx, searchKeyword, parsed, series.OneShot, 15); err == nil {
+	oneShot := series.EffectiveOneShot()
+	if liveResults, err := s.live.Search(ctx, searchKeyword, parsed, oneShot, 15); err == nil {
 		for _, item := range liveResults {
 			if !seen[item.ID] {
 				seen[item.ID] = true
@@ -527,7 +528,7 @@ func (s *Service) SearchCandidates(
 		}
 	}
 	if useLookupTerms && len(terms) > 1 && len(merged) < 5 {
-		if liveAlt, err := s.live.Search(ctx, terms[1], parsed, series.OneShot, 10); err == nil {
+		if liveAlt, err := s.live.Search(ctx, terms[1], parsed, oneShot, 10); err == nil {
 			for _, item := range liveAlt {
 				if !seen[item.ID] {
 					seen[item.ID] = true
@@ -537,7 +538,7 @@ func (s *Service) SearchCandidates(
 		}
 	}
 	if s.archive.Ready() {
-		if localResults, err := s.archive.Search(ctx, parsed, series.OneShot, 15); err == nil {
+		if localResults, err := s.archive.Search(ctx, parsed, oneShot, 15); err == nil {
 			for _, item := range localResults {
 				if !seen[item.ID] && (!item.NSFW || showLiveNSFW(ctx)) {
 					seen[item.ID] = true
@@ -617,7 +618,7 @@ func (s *Service) OfflineMatch(ctx context.Context, series database.Series) (dat
 		return database.ScrapedMetadata{}, false, nil
 	}
 	parsed := ParseSeriesWithPath(series.Name, series.RelativePath)
-	candidates, err := s.archive.Search(ctx, parsed, series.OneShot, 10)
+	candidates, err := s.archive.Search(ctx, parsed, series.EffectiveOneShot(), 10)
 	if err != nil || len(candidates) == 0 || candidates[0].Confidence < AutoMatchMinConfidence {
 		return database.ScrapedMetadata{}, false, err
 	}
@@ -696,8 +697,9 @@ func (s *Service) AutoScrapeOneDetailed(
 	}
 	parsed := ParseSeriesWithPath(series.Name, series.RelativePath)
 	terms := parsed.lookupTitles()
+	oneShot := series.EffectiveOneShot()
 	if s.archive.Ready() {
-		candidates, err = s.archive.Search(ctx, parsed, series.OneShot, 10)
+		candidates, err = s.archive.Search(ctx, parsed, oneShot, 10)
 		if err != nil {
 			return false, database.SeriesMetadata{}, nil, err
 		}
@@ -707,7 +709,7 @@ func (s *Service) AutoScrapeOneDetailed(
 	} else if len(terms) > 0 {
 		maxTries := min(2, len(terms))
 		for i := 0; i < maxTries; i++ {
-			res, sErr := s.live.Search(ctx, terms[i], parsed, series.OneShot, 10)
+			res, sErr := s.live.Search(ctx, terms[i], parsed, oneShot, 10)
 			if sErr != nil {
 				if i == 0 {
 					return false, database.SeriesMetadata{}, nil, sErr
@@ -1073,8 +1075,8 @@ func shouldSkipByMode(mode string, scrapeStatus string) bool {
 
 func (s *Service) loadTargetSeries(ctx context.Context, libraryID string) ([]scrapeTarget, error) {
 	query := `
-SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,coalesce(sm.scrape_status,'none'),
-       coalesce(sm.match_origin,''),
+SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.one_shot_override,s.books_count,
+       coalesce(sm.scrape_status,'none'),coalesce(sm.match_origin,''),
        (coalesce(sm.bgm_subject_id,0)>0 OR coalesce(sm.ext_entry_id,'')<>'')
 FROM series s
 JOIN libraries l ON l.id=s.library_id
@@ -1095,14 +1097,13 @@ LEFT JOIN series_metadata sm ON sm.series_id=s.id`
 	var out []scrapeTarget
 	for rows.Next() {
 		var t scrapeTarget
-		var oneShotInt int
 		if err := rows.Scan(
 			&t.series.ID, &t.series.LibraryID, &t.series.CID, &t.series.Name,
-			&t.series.RelativePath, &oneShotInt, &t.scrapeStatus, &t.matchOrigin, &t.bound,
+			&t.series.RelativePath, &t.series.OneShot, &t.series.OneShotOverride, &t.series.BooksCount,
+			&t.scrapeStatus, &t.matchOrigin, &t.bound,
 		); err != nil {
 			return nil, err
 		}
-		t.series.OneShot = oneShotInt != 0
 		out = append(out, t)
 	}
 	return out, rows.Err()

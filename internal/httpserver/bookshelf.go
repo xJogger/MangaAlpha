@@ -28,7 +28,7 @@ func (s *Server) bookshelfVersions(w http.ResponseWriter, r *http.Request) {
 		s.writeDBErrorMessage(w, r, err, "Could not load series metadata.")
 		return
 	}
-	if current.OneShot || (meta.BgmSubjectID == nil || *meta.BgmSubjectID <= 0) || (scope != "" && current.LibraryID != scope) {
+	if current.EffectiveOneShot() || (meta.BgmSubjectID == nil || *meta.BgmSubjectID <= 0) || (scope != "" && current.LibraryID != scope) {
 		writeJSON(w, 200, map[string]any{"versions": []any{}})
 		return
 	}
@@ -41,7 +41,7 @@ func (s *Server) bookshelfVersions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"versions": []any{}})
 		return
 	}
-	where := " WHERE gm.bgm_subject_id=? AND s.one_shot=0 AND l.enabled=1 AND NOT EXISTS (SELECT 1 FROM union_layers ul WHERE ul.member_library_id=l.id)"
+	where := " WHERE gm.bgm_subject_id=? AND NOT (s.one_shot = 1 OR (s.one_shot_override = 1 AND s.books_count = 1)) AND l.enabled=1 AND NOT EXISTS (SELECT 1 FROM union_layers ul WHERE ul.member_library_id=l.id)"
 	args := []any{*meta.BgmSubjectID}
 	where += " AND s.library_id IN " + database.Placeholders(len(visibleLibs))
 	for _, lib := range visibleLibs {

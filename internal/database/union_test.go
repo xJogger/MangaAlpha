@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -609,4 +610,170 @@ func TestUnionMaterializesMixedOneShotShapesByPriority(t *testing.T) {
 		t.Fatal(err)
 	}
 	check(id.Series(lib.ID, "Collision.cbz"), "Different.cbz", false)
+}
+
+func TestUnionRefreshInheritsBookMetadataIncrementally(t *testing.T) {
+	ctx := t.Context()
+	store, err := Open(filepath.Join(t.TempDir(), "union_book_meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	for _, lib := range []Library{
+		{ID: "lib_top", Name: "Top", ProviderType: ProviderLocal, RootCID: "local:/top", RootPath: "/top", Enabled: true},
+		{ID: "lib_bot", Name: "Bot", ProviderType: Provider115, RootCID: "cid_bot", Enabled: true},
+	} {
+		if err := store.UpsertLibrary(ctx, lib); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := nowText()
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO series(id,library_id,cid,name,relative_path,one_shot,created_at,updated_at,seen_scan_id) VALUES
+('s_top','lib_top','Cat/Work','Work','Top/Cat/Work',0,?,?,'s1'),
+('s_bot','lib_bot','100','Work','Bot/Cat/Work',0,?,?,'s2')`, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO books(id,series_id,library_id,file_id,parent_cid,name,size,pick_code,number_sort,created_at,updated_at,seen_scan_id) VALUES
+('b_t1','s_top','lib_top','Cat/Work/01.cbz','Cat/Work','01.cbz',1000,'',1,?,?,'s1'),
+('b_b1','s_bot','lib_bot','f1','100','01.cbz',1000,'pk1',1,?,?,'s2'),
+('b_b2','s_bot','lib_bot','f2','100','02.cbz',2000,'pk2',2,?,?,'s2'),
+('b_t3','s_top','lib_top','Cat/Work/03.cbz','Cat/Work','03.cbz',3000,'',3,?,?,'s1'),
+('b_b3','s_bot','lib_bot','f3','100','03.cbz',3500,'pk3',3,?,?,'s2'),
+('b_t4','s_top','lib_top','Cat/Work/04.cbz','Cat/Work','04.cbz',4000,'',4,?,?,'s1')`,
+		now, now, now, now, now, now, now, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	lock := true
+	topTitle := "Top Vol 1"
+	topSort := 1.5
+	if err := store.PatchBookMetadata(ctx, "b_t1", BookMetadataPatch{
+		Title:     &topTitle,
+		TitleLock: &lock,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBookScrapedMetadata(ctx, "b_t1", BookScrapedMetadata{
+		Summary:          "Top Summary",
+		Number:           "1",
+		NumberSort:       &topSort,
+		Authors:          []Author{{Name: "Top Author", Role: "writer"}},
+		Tags:             []string{"TopTag"},
+		Links:            []Link{{Label: "Top", URL: "https://top.example.test/1"}},
+		SeriesGroup:      "GroupTop",
+		StoryArc:         "ArcTop",
+		StoryArcNumber:   "1",
+		ComicInfoVersion: "v_top_1",
+		ComicInfoStatus:  "parsed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBookScrapedMetadata(ctx, "b_b1", BookScrapedMetadata{
+		Title:            "Bot Vol 1",
+		Summary:          "Bot Summary",
+		ISBN:             "978-BOT-1",
+		BgmSubjectID:     888,
+		MatchOrigin:      "auto",
+		ComicInfoVersion: "v_bot_1",
+		ComicInfoStatus:  "parsed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBookScrapedMetadata(ctx, "b_b2", BookScrapedMetadata{
+		Title:            "Bot Vol 2",
+		ComicInfoVersion: "v_bot_2",
+		ComicInfoStatus:  "parsed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBookScrapedMetadata(ctx, "b_b3", BookScrapedMetadata{
+		Title:            "Bot Vol 3",
+		ComicInfoVersion: "v_bot_3",
+		ComicInfoStatus:  "parsed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	unionLib, _, err := store.CreateUnionLibrary(ctx, "MetaUnion", true, []string{"lib_top", "lib_bot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	uBooks, _, err := store.BooksPage(ctx, BookQuery{LibraryIDs: []string{unionLib.ID}, Unpaged: true})
+	if err != nil || len(uBooks) != 4 {
+		t.Fatalf("union books = %+v, err=%v", uBooks, err)
+	}
+	byName := make(map[string]Book, len(uBooks))
+	for _, b := range uBooks {
+		byName[b.Name] = b
+	}
+
+	m1, ok1, err := store.BookMetadataByID(ctx, byName["01.cbz"].ID)
+	if err != nil || !ok1 || m1.Title != "Top Vol 1" || !m1.TitleLock || m1.Summary != "Top Summary" ||
+		m1.NumberSort == nil || *m1.NumberSort != 1.5 || m1.ISBN != "978-BOT-1" || m1.BgmSubjectID != 888 ||
+		!slices.Equal(m1.Tags, []string{"TopTag"}) || m1.ComicInfoVersion != "v_top_1" || m1.ComicInfoStatus != "parsed" {
+		t.Fatalf("inherited 01.cbz metadata = %+v, ok=%v err=%v", m1, ok1, err)
+	}
+
+	m2, ok2, err := store.BookMetadataByID(ctx, byName["02.cbz"].ID)
+	if err != nil || !ok2 || m2.Title != "Bot Vol 2" || m2.ComicInfoVersion != "v_bot_2" || m2.ComicInfoStatus != "parsed" {
+		t.Fatalf("inherited 02.cbz metadata = %+v, ok=%v err=%v", m2, ok2, err)
+	}
+
+	// b_t3 is the active source without metadata; b_b3 supplies title while ComicInfo status remains unset for b_t3.
+	m3, ok3, err := store.BookMetadataByID(ctx, byName["03.cbz"].ID)
+	if err != nil || !ok3 || m3.Title != "Bot Vol 3" || m3.ComicInfoVersion != "" || m3.ComicInfoStatus != "" {
+		t.Fatalf("inherited 03.cbz metadata = %+v, ok=%v err=%v", m3, ok3, err)
+	}
+
+	// Warm no-op refresh must not bump shelf_revision.
+	revBefore, err := store.shelfRevision(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RefreshUnionLibrary(ctx, unionLib.ID); err != nil {
+		t.Fatal(err)
+	}
+	revAfter, err := store.shelfRevision(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revAfter != revBefore {
+		t.Fatalf("warm refresh bumped shelf_revision: %+v -> %+v", revBefore, revAfter)
+	}
+
+	// Union manual overrides (locked Title + explicit empty Summary) stay protected during incremental refresh.
+	customTitle := "Union Custom 4"
+	emptySummary := ""
+	if err := store.PatchBookMetadata(ctx, byName["04.cbz"].ID, BookMetadataPatch{
+		Title:     &customTitle,
+		TitleLock: &lock,
+		Summary:   &emptySummary,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sort4 := 4.5
+	if err := store.UpsertBookScrapedMetadata(ctx, "b_t4", BookScrapedMetadata{
+		Title:            "Phys Vol 4",
+		Summary:          "Phys Summary 4",
+		ISBN:             "978-4",
+		NumberSort:       &sort4,
+		ComicInfoVersion: "v_top_4",
+		ComicInfoStatus:  "parsed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RefreshUnionLibrary(ctx, unionLib.ID); err != nil {
+		t.Fatal(err)
+	}
+	m4, ok4, err := store.BookMetadataByID(ctx, byName["04.cbz"].ID)
+	if err != nil || !ok4 || m4.Title != customTitle || !m4.TitleLock ||
+		m4.Summary != "" || !m4.HasSummary() ||
+		m4.ISBN != "978-4" || m4.NumberSort == nil || *m4.NumberSort != 4.5 ||
+		m4.ComicInfoVersion != "v_top_4" || m4.ComicInfoStatus != "parsed" {
+		t.Fatalf("incremental 04.cbz merge = %+v, ok=%v err=%v", m4, ok4, err)
+	}
 }

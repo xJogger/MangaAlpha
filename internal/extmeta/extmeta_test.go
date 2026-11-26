@@ -1404,7 +1404,7 @@ func TestManagerCoverChecksSidecarEvenWhenSeriesNSFWIsLockedOff(t *testing.T) {
 	if meta.IsNSFW || !meta.NSFWLock {
 		t.Fatalf("series fixture did not lock off the NSFW flag: %+v", meta)
 	}
-	allowed := database.WithUserScope(ctx, database.UserScope{UserID: "allowed", AllowNSFW: true})
+	allowed := database.WithUserScope(ctx, database.UserScope{UserID: "allowed", AllowNSFW: true, ShowNSFW: true})
 	restricted := database.WithUserScope(ctx, database.UserScope{UserID: "restricted"})
 	raw, mediaType, err := m.FetchCover(allowed, meta.ExtSourceID, meta.ExtEntryID, meta.ExtCoverURL)
 	if err != nil || mediaType != "image/png" || !bytes.Equal(raw, png) {

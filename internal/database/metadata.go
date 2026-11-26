@@ -813,10 +813,27 @@ func (s *Store) SaveSeriesMetadata(ctx context.Context, m SeriesMetadata) error 
 }
 
 func (s *Store) ClearSeriesExternalBinding(ctx context.Context, series Series) (SeriesMetadata, error) {
-	current, err := s.SeriesMetadataByID(ctx, series)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return SeriesMetadata{}, err
 	}
+	defer tx.Rollback()
+
+	current, err := scanSeriesMetadataRow(tx.QueryRowContext(ctx,
+		`SELECT `+seriesMetadataColumns+` FROM series_metadata WHERE series_id=?`, series.ID))
+	if errors.Is(err, sql.ErrNoRows) {
+		current = defaultSeriesMetadata(series)
+	} else if err != nil {
+		return SeriesMetadata{}, err
+	}
+	if strings.TrimSpace(current.Title) == "" {
+		current.Title = series.Name
+	}
+	if strings.TrimSpace(current.TitleSort) == "" {
+		current.TitleSort = current.Title
+	}
+
+	prevExtSourceID := strings.TrimSpace(current.ExtSourceID)
 	current.ExtSourceID = ""
 	current.ExtEntryID = ""
 	current.ExtCoverURL = ""
@@ -826,7 +843,7 @@ func (s *Store) ClearSeriesExternalBinding(ctx context.Context, series Series) (
 		current.ScrapeConfidence = 0
 		current.MatchOrigin = ""
 		if !current.NSFWLock {
-			current.IsNSFW, err = s.unionHasNSFWSource(ctx, series.ID)
+			current.IsNSFW, err = queryUnionHasNSFWSource(ctx, tx, series.ID)
 			if err != nil {
 				return SeriesMetadata{}, err
 			}
@@ -838,7 +855,26 @@ func (s *Store) ClearSeriesExternalBinding(ctx context.Context, series Series) (
 			current.TitleSort = series.Name
 		}
 	}
-	if err := s.saveSeriesMetadata(ctx, current, nowText()); err != nil {
+	now := nowText()
+	if err := saveSeriesMetadataTx(ctx, tx, current, now); err != nil {
+		return SeriesMetadata{}, err
+	}
+	if prevExtSourceID != "" {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE book_metadata
+SET ext_source_id='',
+    ext_entry_id='',
+    ext_cover_url='',
+    ext_cover_path='',
+    cover_source=CASE WHEN cover_source='ext' THEN 'auto' ELSE cover_source END,
+    match_origin=CASE WHEN bgm_subject_id<=0 THEN '' ELSE match_origin END,
+    updated_at=?
+WHERE ext_source_id=? AND book_id IN (SELECT id FROM books WHERE series_id=?)`,
+			now, prevExtSourceID, series.ID); err != nil {
+			return SeriesMetadata{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return SeriesMetadata{}, err
 	}
 	return s.SeriesMetadataByID(ctx, series)

@@ -1,6 +1,7 @@
 package extmeta
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"strings"
@@ -72,4 +73,39 @@ func TestCoverFailureDiagnosticsAreVerboseAndSanitized(t *testing.T) {
 		t.Fatalf("negative cache diagnostic = %+v", events)
 	}
 	assertSafeMetadataDiagnostics(t, rec.ExportText(20))
+}
+
+func TestCoverCircuitBreakerIsolatesBookCustomByHost(t *testing.T) {
+	png := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'}
+	var badHits, goodHits int
+	client := &http.Client{Transport: managerTransport(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Hostname() {
+		case "bad.example.test":
+			badHits++
+			return managerResponse(r, http.StatusTooManyRequests, strings.NewReader("rate limited")), nil
+		case "good.example.test":
+			goodHits++
+			return managerResponse(r, http.StatusOK, bytes.NewReader(png)), nil
+		default:
+			return managerResponse(r, http.StatusNotFound, strings.NewReader("missing")), nil
+		}
+	})}
+	covers, err := NewCoverService(CoverConfig{
+		DataDir: t.TempDir(), Client: client, RequestsPerSec: 100, Burst: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := t.Context()
+	if _, err := covers.GetOrFetch(ctx, "book-custom", "b1", "https://bad.example.test/1.png"); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("expected ErrCircuitOpen on bad host, got %v", err)
+	}
+	if _, err := covers.GetOrFetch(ctx, "book-custom", "b2", "https://bad.example.test/2.png"); !errors.Is(err, ErrCircuitOpen) || badHits != 1 {
+		t.Fatalf("expected cached circuit open for same host without extra hit (hits=%d), got %v", badHits, err)
+	}
+	data, err := covers.GetOrFetch(ctx, "book-custom", "b3", "https://good.example.test/1.png")
+	if err != nil || !bytes.Equal(data.Bytes, png) || goodHits != 1 {
+		t.Fatalf("healthy domain should not be affected by bad domain circuit breaker: data=%+v goodHits=%d err=%v", data, goodHits, err)
+	}
 }

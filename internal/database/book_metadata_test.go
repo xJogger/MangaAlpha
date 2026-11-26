@@ -300,3 +300,222 @@ func TestSeriesScrapePreservesBangumiAndComicInfoOnlyFillsBlanks(t *testing.T) {
 		t.Fatalf("ComicInfo backfill = %+v, %v", backfilled, err)
 	}
 }
+
+func TestClearSeriesExternalBindingClearsChildBooksSafely(t *testing.T) {
+	ctx := t.Context()
+	store, err := Open(filepath.Join(t.TempDir(), "clear_ext_books.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.UpsertLibrary(ctx, Library{ID: "catalog", RootCID: "root", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	insertCatalogSeries(t, store, "catalog", "work", "Work", make([]catalogBookTime, 3))
+	series, err := store.SeriesByID(ctx, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyScrapedMetadata(ctx, series, ScrapedMetadata{
+		SubjectID: 42, ExtSourceID: "ext-src-1", ExtEntryID: "series-1",
+		ExtCoverURL: "https://ext.example.test/s.jpg", MatchOrigin: "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	lock := true
+	lockedTitle := "Locked Manual Vol 1"
+	if err := store.PatchBookMetadata(ctx, "work-book-a", BookMetadataPatch{
+		Title: &lockedTitle, TitleLock: &lock,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetBookCustomCover(ctx, "work-book-a", "custom1.jpg", "https://custom.example.test/1.jpg"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetBookCoverSource(ctx, "work-book-a", "ext"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBookScrapedMetadata(ctx, "work-book-a", BookScrapedMetadata{
+		ExtSourceID: "ext-src-1", ExtEntryID: "e1",
+		ExtCoverURL: "https://ext.example.test/b1.jpg", ExtCoverPath: "ext1.jpg",
+		MatchOrigin: "manual", ComicInfoVersion: "v1", ComicInfoStatus: "parsed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.SetBookCustomCover(ctx, "work-book-b", "custom2.jpg", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetBookCoverSource(ctx, "work-book-b", "custom"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBookScrapedMetadata(ctx, "work-book-b", BookScrapedMetadata{
+		BgmSubjectID: 101, BgmCoverURL: "https://bgm.example.test/101.jpg",
+		ExtSourceID: "ext-src-1", ExtEntryID: "e2",
+		ExtCoverURL: "https://ext.example.test/b2.jpg", ExtCoverPath: "ext2.jpg",
+		MatchOrigin: "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.SetBookCoverSource(ctx, "work-book-c", "ext"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBookScrapedMetadata(ctx, "work-book-c", BookScrapedMetadata{
+		ExtSourceID: "other-src", ExtEntryID: "e3",
+		ExtCoverURL: "https://other.example.test/b3.jpg", MatchOrigin: "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cleared, err := store.ClearSeriesExternalBinding(ctx, series)
+	if err != nil {
+		t.Fatalf("ClearSeriesExternalBinding: %v", err)
+	}
+	if cleared.ExtSourceID != "" || cleared.ExtEntryID != "" || cleared.BgmSubjectID == nil || *cleared.BgmSubjectID != 42 {
+		t.Fatalf("unexpected cleared series metadata: %+v", cleared)
+	}
+
+	mA, _, err := store.BookMetadataByID(ctx, "work-book-a")
+	if err != nil || mA.ExtSourceID != "" || mA.ExtEntryID != "" || mA.ExtCoverURL != "" || mA.ExtCoverPath != "" ||
+		mA.CoverSource != CoverSourceAuto || mA.MatchOrigin != "" ||
+		mA.Title != lockedTitle || !mA.TitleLock ||
+		mA.CustomCoverPath != "custom1.jpg" || mA.CustomCoverURL != "https://custom.example.test/1.jpg" ||
+		mA.ComicInfoVersion != "v1" || mA.ComicInfoStatus != "parsed" {
+		t.Fatalf("work-book-a after ClearSeriesExternalBinding = %+v, err=%v", mA, err)
+	}
+	// Verify auto-scrape is no longer blocked by stale match_origin on work-book-a.
+	if err := store.UpsertBookScrapedMetadata(WithAutomaticMetadata(ctx), "work-book-a", BookScrapedMetadata{
+		Summary: "Re-scraped summary", MatchOrigin: "auto",
+	}); err != nil {
+		t.Fatalf("auto-scrape after clear was still blocked: %v", err)
+	}
+
+	mB, _, err := store.BookMetadataByID(ctx, "work-book-b")
+	if err != nil || mB.ExtSourceID != "" || mB.ExtEntryID != "" || mB.ExtCoverURL != "" || mB.ExtCoverPath != "" ||
+		mB.BgmSubjectID != 101 || mB.MatchOrigin != "manual" ||
+		mB.CoverSource != "custom" || mB.CustomCoverPath != "custom2.jpg" {
+		t.Fatalf("work-book-b after ClearSeriesExternalBinding = %+v, err=%v", mB, err)
+	}
+
+	mC, _, err := store.BookMetadataByID(ctx, "work-book-c")
+	if err != nil || mC.ExtSourceID != "other-src" || mC.ExtEntryID != "e3" || mC.MatchOrigin != "manual" || mC.CoverSource != "ext" {
+		t.Fatalf("unrelated ext_source_id work-book-c modified = %+v, err=%v", mC, err)
+	}
+}
+
+func TestCommitLibraryScanCarriesPasswordBindingsAndSeriesThumbnails(t *testing.T) {
+	ctx := t.Context()
+	store, err := Open(filepath.Join(t.TempDir(), "scan_carry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.UpsertLibrary(ctx, Library{ID: "lib", Name: "Lib", RootCID: "root", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	now := nowText()
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO series(id,library_id,cid,name,relative_path,one_shot,created_at,updated_at,seen_scan_id) VALUES
+('s_old1','lib','old1','Old 1','Root/Old 1',0,?,?,'run0'),
+('s_old2','lib','old2','Old 2','Root/Old 2',0,?,?,'run0'),
+('s_new2','lib','new2','New 2','Root/New 2',0,?,?,'run0');
+INSERT INTO books(id,series_id,library_id,file_id,parent_cid,name,size,pick_code,number_sort,created_at,updated_at,seen_scan_id) VALUES
+('b1','s_old1','lib','f1','old1','01.cbz',100,'',1,?,?,'run0'),
+('b2','s_old2','lib','f2','old2','02.cbz',100,'',1,?,?,'run0')`,
+		now, now, now, now, now, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveArchivePasswordBinding(ctx, Book{ID: "b1", SeriesID: "s_old1", LibraryID: "lib", ParentCID: "old1"}, "secret-pw"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO series_thumbnails(series_id,source_book_id,source_version,path,media_type,width,height,size,generation_duration_ns,created_at,updated_at) VALUES
+('s_old1','b1','v1','thumb_old1.jpg','image/jpeg',100,150,2048,11,?,?),
+('s_old2','b2','v2','thumb_old2.jpg','image/jpeg',100,150,2048,12,?,?),
+('s_new2','b2','v2','existing_new2.jpg','image/jpeg',100,150,2048,13,?,?)`,
+		now, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO scan_runs(id,library_id,status,trigger_type,created_at) VALUES('run1','lib','running','manual',?);
+INSERT INTO scan_series_staging(run_id,id,library_id,cid,name,relative_path,one_shot,file_modified_at,created_at,updated_at) VALUES
+('run1','s_new1','lib','new1','New 1','Root/New 1',0,?,?,?),
+('run1','s_new2','lib','new2','New 2','Root/New 2',0,?,?,?);
+INSERT INTO scan_books_staging(run_id,id,series_id,library_id,file_id,parent_cid,name,size,pick_code,sha1,file_created_at,file_modified_at,number_sort,created_at,updated_at) VALUES
+('run1','b1','s_new1','lib','f1','new1','01.cbz',100,'','',?,?,1,?,?),
+('run1','b2','s_new2','lib','f2','new2','02.cbz',100,'','',?,?,1,?,?)`,
+		now, now, now, now, now, now, now, now, now, now, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.CommitLibraryScan(ctx, "lib", "run1"); err != nil {
+		t.Fatalf("CommitLibraryScan: %v", err)
+	}
+
+	var apbSeries, apbParent string
+	if err := store.DB().QueryRowContext(ctx, `SELECT series_id,parent_cid FROM archive_password_bindings WHERE book_id='b1'`).Scan(&apbSeries, &apbParent); err != nil {
+		t.Fatal(err)
+	}
+	if apbSeries != "s_new1" || apbParent != "new1" {
+		t.Fatalf("archive_password_bindings = (%q, %q), want ('s_new1', 'new1')", apbSeries, apbParent)
+	}
+
+	var thumb1, thumb2 string
+	if err := store.DB().QueryRowContext(ctx, `SELECT path FROM series_thumbnails WHERE series_id='s_new1'`).Scan(&thumb1); err != nil || thumb1 != "thumb_old1.jpg" {
+		t.Fatalf("carried s_new1 thumbnail = %q, err=%v", thumb1, err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT path FROM series_thumbnails WHERE series_id='s_new2'`).Scan(&thumb2); err != nil || thumb2 != "existing_new2.jpg" {
+		t.Fatalf("existing s_new2 thumbnail = %q, err=%v", thumb2, err)
+	}
+}
+
+func TestTrackerSnapshotAndReadingActivityEffectiveOneShotAndNumberSort(t *testing.T) {
+	ctx := t.Context()
+	store, err := Open(filepath.Join(t.TempDir(), "tracker_eff.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.UpsertLibrary(ctx, Library{ID: "lib", Name: "Lib", RootCID: "root", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	insertCatalogSeries(t, store, "lib", "s_single", "Single Override", make([]catalogBookTime, 1))
+	if err := store.SetSeriesOneShotOverride(ctx, "s_single", true); err != nil {
+		t.Fatal(err)
+	}
+	snapSingle, ok, err := store.BangumiTrackerSeriesSnapshot(ctx, "s_single")
+	if err != nil || !ok || !snapSingle.OneShot {
+		t.Fatalf("single override tracker snapshot = %+v, ok=%v err=%v", snapSingle, ok, err)
+	}
+
+	insertCatalogSeries(t, store, "lib", "s_multi", "Multi Sort", make([]catalogBookTime, 2))
+	s1 := 2.0
+	s2 := 1.0
+	if err := store.PatchBookMetadata(ctx, "s_multi-book-a", BookMetadataPatch{NumberSort: &s1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PatchBookMetadata(ctx, "s_multi-book-b", BookMetadataPatch{NumberSort: &s2}); err != nil {
+		t.Fatal(err)
+	}
+	done := true
+	inProg := false
+	page := 3
+	if err := store.UpdateBookReadProgress(ctx, Book{ID: "s_multi-book-b", SeriesID: "s_multi"}, &done, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateBookReadProgress(ctx, Book{ID: "s_multi-book-a", SeriesID: "s_multi"}, &inProg, &page); err != nil {
+		t.Fatal(err)
+	}
+	snapMulti, ok, err := store.BangumiTrackerSeriesSnapshot(ctx, "s_multi")
+	if err != nil || !ok || snapMulti.OneShot || snapMulti.MaxCompletedOrdinal != 1 {
+		t.Fatalf("multi tracker snapshot with bm.number_sort = %+v, ok=%v err=%v", snapMulti, ok, err)
+	}
+	activity, err := store.ReadingActivity(ctx, ReadingActivityQuery{InProgressOnly: true, Size: 10})
+	if err != nil || len(activity.Groups) != 1 || len(activity.Groups[0].Books) != 1 ||
+		activity.Groups[0].Books[0].Book.ID != "s_multi-book-a" || activity.Groups[0].Books[0].Book.NumberSort != 2.0 {
+		t.Fatalf("ReadingActivity effective number_sort = %+v, err=%v", activity, err)
+	}
+}

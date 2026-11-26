@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -1349,7 +1350,16 @@ WHERE id=?`)
 		progressMutated = true
 	}
 
-	// 8. Migrate collections & readlists referencing member physical libraries to the union library IDs.
+	// 8. Incrementally inherit book_metadata from winning physical sources while preserving union locks/overrides.
+	inheritedBookMeta, err := inheritUnionBookMetadataTx(ctx, tx, unionLibraryID, now, winningSrcChangedIDs, enableBulk)
+	if err != nil {
+		return UnionRefreshStats{}, err
+	}
+	if inheritedBookMeta > 0 {
+		catalogMutated = true
+	}
+
+	// 9. Migrate collections & readlists referencing member physical libraries to the union library IDs.
 	migCol, migRL, err := migrateCollectionsAndReadListsTx(ctx, tx, unionLibraryID)
 	if err != nil {
 		return UnionRefreshStats{}, err
@@ -1357,7 +1367,7 @@ WHERE id=?`)
 	stats.MigratedCollections = migCol
 	stats.MigratedReadLists = migRL
 
-	// 9. Record last refresh status on the union library.
+	// 10. Record last refresh status on the union library.
 	if _, err := tx.ExecContext(ctx, `
 UPDATE libraries
 SET last_scan_status='success',last_scan_completed_at=?,last_scan_error='',updated_at=?
@@ -1400,6 +1410,9 @@ WHERE id=1`, catBump, progBump); err != nil {
 
 	if err := tx.Commit(); err != nil {
 		return UnionRefreshStats{}, err
+	}
+	if inheritedBookMeta > 0 {
+		s.wakeSearchFTSWorker()
 	}
 	return stats, nil
 }
@@ -1687,6 +1700,347 @@ VALUES(?,?,?,'[]',?,?,?)`)
 		}
 	}
 	return len(toCopy), nil
+}
+
+type unionSourceBookMeta struct {
+	isActive bool
+	meta     BookMetadata
+}
+
+func inheritUnionBookMetadataTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	unionLibraryID, now string,
+	winningSrcChangedIDs []string,
+	enableBulk func() error,
+) (int, error) {
+	rows, err := tx.QueryContext(ctx, `
+SELECT
+ ub.id,
+ CASE WHEN ubs.priority = (
+   SELECT MIN(u2.priority) FROM union_book_sources u2 WHERE u2.union_book_id=ub.id
+ ) THEN 1 ELSE 0 END AS is_active,
+ sbm.book_id,sbm.title,sbm.summary,sbm.number,sbm.number_sort,sbm.release_date,sbm.isbn,
+ sbm.authors_json,sbm.tags_json,sbm.links_json,
+ sbm.title_lock,sbm.summary_lock,sbm.number_lock,sbm.number_sort_lock,sbm.release_date_lock,
+ sbm.isbn_lock,sbm.authors_lock,sbm.tags_lock,sbm.links_lock,
+ sbm.bgm_subject_id,sbm.bgm_cover_url,sbm.bgm_cover_path,sbm.bgm_is_nsfw,
+ sbm.ext_source_id,sbm.ext_entry_id,sbm.ext_cover_url,sbm.ext_cover_path,
+ sbm.custom_cover_path,sbm.custom_cover_url,sbm.cover_source,
+ sbm.series_group,sbm.story_arc,sbm.story_arc_number,
+ sbm.comicinfo_version,sbm.comicinfo_status,
+ sbm.match_origin,sbm.updated_at,sbm.explicit_empty
+FROM book_metadata sbm
+CROSS JOIN union_book_sources ubs ON ubs.source_book_id=sbm.book_id
+CROSS JOIN books ub ON ub.id=ubs.union_book_id AND ub.library_id=?
+ORDER BY ub.id ASC, ubs.priority ASC`, unionLibraryID)
+	if err != nil {
+		return 0, err
+	}
+	candidates := make(map[string][]unionSourceBookMeta)
+	var unionBookIDs []string
+	for rows.Next() {
+		var (
+			unionBookID, authors, tags, links, updated string
+			isActiveInt                                int
+			m                                          BookMetadata
+		)
+		if err := rows.Scan(
+			&unionBookID, &isActiveInt,
+			&m.BookID, &m.Title, &m.Summary, &m.Number, &m.NumberSort, &m.ReleaseDate, &m.ISBN,
+			&authors, &tags, &links,
+			&m.TitleLock, &m.SummaryLock, &m.NumberLock, &m.NumberSortLock, &m.ReleaseDateLock,
+			&m.ISBNLock, &m.AuthorsLock, &m.TagsLock, &m.LinksLock,
+			&m.BgmSubjectID, &m.BgmCoverURL, &m.BgmCoverPath, &m.BgmIsNSFW,
+			&m.ExtSourceID, &m.ExtEntryID, &m.ExtCoverURL, &m.ExtCoverPath,
+			&m.CustomCoverPath, &m.CustomCoverURL, &m.CoverSource,
+			&m.SeriesGroup, &m.StoryArc, &m.StoryArcNumber,
+			&m.ComicInfoVersion, &m.ComicInfoStatus,
+			&m.MatchOrigin, &updated, &m.explicitEmpty,
+		); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		_ = json.Unmarshal([]byte(authors), &m.Authors)
+		_ = json.Unmarshal([]byte(tags), &m.Tags)
+		_ = json.Unmarshal([]byte(links), &m.Links)
+		m.UpdatedAt = parseTime(updated)
+		if _, seen := candidates[unionBookID]; !seen {
+			unionBookIDs = append(unionBookIDs, unionBookID)
+		}
+		candidates[unionBookID] = append(candidates[unionBookID], unionSourceBookMeta{
+			isActive: isActiveInt != 0,
+			meta:     m,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	winningChanged := make(map[string]bool, len(winningSrcChangedIDs))
+	var missingWinningIDs []string
+	for _, id := range winningSrcChangedIDs {
+		winningChanged[id] = true
+		if _, hasCand := candidates[id]; !hasCand {
+			missingWinningIDs = append(missingWinningIDs, id)
+		}
+	}
+
+	existing := make(map[string]BookMetadata, len(unionBookIDs))
+	for _, chunk := range chunkStrings(unionBookIDs, sqlInChunkSize) {
+		args := make([]any, len(chunk))
+		for i, idVal := range chunk {
+			args[i] = idVal
+		}
+		eRows, err := tx.QueryContext(ctx,
+			`SELECT `+bookMetadataColumns+` FROM book_metadata WHERE book_id IN `+Placeholders(len(chunk)), args...)
+		if err != nil {
+			return 0, err
+		}
+		for eRows.Next() {
+			m, err := scanBookMetadata(eRows)
+			if err != nil {
+				eRows.Close()
+				return 0, err
+			}
+			existing[m.BookID] = m
+		}
+		if err := eRows.Err(); err != nil {
+			eRows.Close()
+			return 0, err
+		}
+		eRows.Close()
+	}
+
+	var toUpsert []BookMetadata
+	for _, unionBookID := range unionBookIDs {
+		dst, exists := existing[unionBookID]
+		if !exists {
+			dst = BookMetadata{BookID: unionBookID, CoverSource: CoverSourceAuto}
+		}
+		if mergeUnionBookMetadata(&dst, exists, candidates[unionBookID], winningChanged[unionBookID]) {
+			toUpsert = append(toUpsert, dst)
+		}
+	}
+
+	updatedCount := 0
+	if len(toUpsert) > 0 {
+		if err := enableBulk(); err != nil {
+			return 0, err
+		}
+		stmt, err := tx.PrepareContext(ctx, `
+INSERT INTO book_metadata(`+bookMetadataColumns+`) VALUES(
+ ?,?,?,?,?,?,?,?,?,?,
+ ?,?,?,?,?,?,?,?,?,
+ ?,?,?,?,?,?,?,?,
+ ?,?,?,?,?,?,?,?,?,
+ ?,?
+)
+ON CONFLICT(book_id) DO UPDATE SET
+ title=excluded.title,summary=excluded.summary,number=excluded.number,number_sort=excluded.number_sort,
+ release_date=excluded.release_date,isbn=excluded.isbn,authors_json=excluded.authors_json,
+ tags_json=excluded.tags_json,links_json=excluded.links_json,
+ title_lock=excluded.title_lock,summary_lock=excluded.summary_lock,number_lock=excluded.number_lock,
+ number_sort_lock=excluded.number_sort_lock,release_date_lock=excluded.release_date_lock,
+ isbn_lock=excluded.isbn_lock,authors_lock=excluded.authors_lock,tags_lock=excluded.tags_lock,links_lock=excluded.links_lock,
+ bgm_subject_id=excluded.bgm_subject_id,bgm_cover_url=excluded.bgm_cover_url,bgm_cover_path=excluded.bgm_cover_path,bgm_is_nsfw=excluded.bgm_is_nsfw,
+ ext_source_id=excluded.ext_source_id,ext_entry_id=excluded.ext_entry_id,ext_cover_url=excluded.ext_cover_url,ext_cover_path=excluded.ext_cover_path,
+ custom_cover_path=excluded.custom_cover_path,custom_cover_url=excluded.custom_cover_url,cover_source=excluded.cover_source,
+ series_group=excluded.series_group,story_arc=excluded.story_arc,story_arc_number=excluded.story_arc_number,
+ comicinfo_version=excluded.comicinfo_version,comicinfo_status=excluded.comicinfo_status,
+ match_origin=excluded.match_origin,updated_at=excluded.updated_at,explicit_empty=excluded.explicit_empty`)
+		if err != nil {
+			return 0, err
+		}
+		defer stmt.Close()
+		for _, m := range toUpsert {
+			authors, _ := json.Marshal(cleanAuthors(m.Authors))
+			tags, _ := json.Marshal(cleanStringSlice(m.Tags))
+			links, _ := json.Marshal(cleanWebLinks(m.Links))
+			if m.CoverSource == "" {
+				m.CoverSource = CoverSourceAuto
+			}
+			if _, err := stmt.ExecContext(ctx,
+				m.BookID, m.Title, m.Summary, m.Number, m.NumberSort, m.ReleaseDate, m.ISBN,
+				string(authors), string(tags), string(links),
+				m.TitleLock, m.SummaryLock, m.NumberLock, m.NumberSortLock, m.ReleaseDateLock,
+				m.ISBNLock, m.AuthorsLock, m.TagsLock, m.LinksLock,
+				m.BgmSubjectID, m.BgmCoverURL, m.BgmCoverPath, m.BgmIsNSFW,
+				m.ExtSourceID, m.ExtEntryID, m.ExtCoverURL, m.ExtCoverPath,
+				m.CustomCoverPath, m.CustomCoverURL, m.CoverSource,
+				m.SeriesGroup, m.StoryArc, m.StoryArcNumber,
+				m.ComicInfoVersion, m.ComicInfoStatus,
+				m.MatchOrigin, now, m.explicitEmpty,
+			); err != nil {
+				return 0, err
+			}
+			updatedCount++
+		}
+	}
+
+	if len(missingWinningIDs) > 0 {
+		for _, chunk := range chunkStrings(missingWinningIDs, sqlInChunkSize) {
+			args := make([]any, 0, 1+len(chunk))
+			args = append(args, now)
+			for _, idVal := range chunk {
+				args = append(args, idVal)
+			}
+			res, err := tx.ExecContext(ctx, `
+UPDATE book_metadata
+SET comicinfo_version='',comicinfo_status='',updated_at=?
+WHERE (comicinfo_version<>'' OR comicinfo_status<>'') AND book_id IN `+Placeholders(len(chunk)), args...)
+			if err != nil {
+				return 0, err
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				updatedCount += int(n)
+			}
+		}
+	}
+	return updatedCount, nil
+}
+
+func mergeUnionBookList[T any](
+	dst *[]T,
+	src []T,
+	dstLock *bool,
+	srcLock, exists bool,
+	dstOverrides *int,
+	srcOverrides, overrideBit int,
+) bool {
+	if *dstLock || len(*dst) != 0 || *dstOverrides&overrideBit != 0 {
+		return false
+	}
+	changed := false
+	if len(src) > 0 {
+		*dst = slices.Clone(src)
+		*dstOverrides |= overrideBit
+		changed = true
+	} else if srcOverrides&overrideBit != 0 {
+		*dstOverrides |= overrideBit
+		changed = true
+	}
+	if !exists && srcLock {
+		*dstLock = true
+		changed = true
+	}
+	return changed
+}
+
+func mergeUnionBookMetadata(dst *BookMetadata, exists bool, srcs []unionSourceBookMeta, winningChanged bool) bool {
+	changed := false
+	activeSeen := false
+	for _, entry := range srcs {
+		src := entry.meta
+		for _, f := range []struct {
+			dstVal      *string
+			srcVal      string
+			dstLock     *bool
+			srcLock     bool
+			overrideBit int
+		}{
+			{&dst.Title, src.Title, &dst.TitleLock, src.TitleLock, bookTitleOverride},
+			{&dst.Summary, src.Summary, &dst.SummaryLock, src.SummaryLock, bookSummaryOverride},
+			{&dst.Number, src.Number, &dst.NumberLock, src.NumberLock, bookNumberOverride},
+			{&dst.ReleaseDate, src.ReleaseDate, &dst.ReleaseDateLock, src.ReleaseDateLock, bookReleaseDateOverride},
+			{&dst.ISBN, src.ISBN, &dst.ISBNLock, src.ISBNLock, bookISBNOverride},
+		} {
+			if !*f.dstLock && dst.explicitEmpty&f.overrideBit == 0 && *f.dstVal == "" {
+				if f.srcVal != "" {
+					*f.dstVal = f.srcVal
+					changed = true
+				} else if src.explicitEmpty&f.overrideBit != 0 {
+					dst.explicitEmpty |= f.overrideBit
+					changed = true
+				}
+				if !exists && f.srcLock {
+					*f.dstLock = true
+					changed = true
+				}
+			}
+		}
+		if !dst.NumberSortLock && dst.NumberSort == nil {
+			if src.NumberSort != nil {
+				v := *src.NumberSort
+				dst.NumberSort = &v
+				changed = true
+			}
+			if !exists && src.NumberSortLock {
+				dst.NumberSortLock = true
+				changed = true
+			}
+		}
+		if mergeUnionBookList(&dst.Authors, src.Authors, &dst.AuthorsLock, src.AuthorsLock, exists, &dst.explicitEmpty, src.explicitEmpty, bookAuthorsOverride) {
+			changed = true
+		}
+		if mergeUnionBookList(&dst.Tags, src.Tags, &dst.TagsLock, src.TagsLock, exists, &dst.explicitEmpty, src.explicitEmpty, bookTagsOverride) {
+			changed = true
+		}
+		if mergeUnionBookList(&dst.Links, src.Links, &dst.LinksLock, src.LinksLock, exists, &dst.explicitEmpty, src.explicitEmpty, bookLinksOverride) {
+			changed = true
+		}
+		if dst.SeriesGroup == "" && src.SeriesGroup != "" {
+			dst.SeriesGroup = src.SeriesGroup
+			changed = true
+		}
+		if dst.StoryArc == "" && src.StoryArc != "" {
+			dst.StoryArc = src.StoryArc
+			changed = true
+		}
+		if dst.StoryArcNumber == "" && src.StoryArcNumber != "" {
+			dst.StoryArcNumber = src.StoryArcNumber
+			changed = true
+		}
+		if dst.BgmSubjectID == 0 && src.BgmSubjectID > 0 && dst.MatchOrigin != "manual" && dst.MatchOrigin != "agent" {
+			dst.BgmSubjectID = src.BgmSubjectID
+			dst.BgmCoverURL = src.BgmCoverURL
+			dst.BgmCoverPath = src.BgmCoverPath
+			dst.BgmIsNSFW = src.BgmIsNSFW
+			changed = true
+		}
+		if dst.ExtSourceID == "" && dst.ExtEntryID == "" && (src.ExtSourceID != "" || src.ExtEntryID != "") &&
+			dst.MatchOrigin != "manual" && dst.MatchOrigin != "agent" {
+			dst.ExtSourceID = src.ExtSourceID
+			dst.ExtEntryID = src.ExtEntryID
+			dst.ExtCoverURL = src.ExtCoverURL
+			dst.ExtCoverPath = src.ExtCoverPath
+			changed = true
+		}
+		if dst.MatchOrigin == "" && src.MatchOrigin != "" && (dst.BgmSubjectID > 0 || dst.ExtEntryID != "" || !exists) {
+			dst.MatchOrigin = src.MatchOrigin
+			changed = true
+		}
+		if dst.CustomCoverPath == "" && dst.CustomCoverURL == "" && (src.CustomCoverPath != "" || src.CustomCoverURL != "") {
+			dst.CustomCoverPath = src.CustomCoverPath
+			dst.CustomCoverURL = src.CustomCoverURL
+			if dst.CoverSource == CoverSourceAuto && src.CoverSource == "custom" {
+				dst.CoverSource = "custom"
+			}
+			changed = true
+		}
+		if !exists && src.CoverSource != "" && dst.CoverSource == CoverSourceAuto && src.CoverSource != CoverSourceAuto {
+			dst.CoverSource = src.CoverSource
+			changed = true
+		}
+		if entry.isActive {
+			activeSeen = true
+			if (dst.ComicInfoVersion == "" && dst.ComicInfoStatus == "") || winningChanged {
+				if dst.ComicInfoVersion != src.ComicInfoVersion || dst.ComicInfoStatus != src.ComicInfoStatus {
+					dst.ComicInfoVersion = src.ComicInfoVersion
+					dst.ComicInfoStatus = src.ComicInfoStatus
+					changed = true
+				}
+			}
+		}
+	}
+	if winningChanged && !activeSeen && (dst.ComicInfoVersion != "" || dst.ComicInfoStatus != "") {
+		dst.ComicInfoVersion = ""
+		dst.ComicInfoStatus = ""
+		changed = true
+	}
+	return changed
 }
 
 func migrateCollectionsAndReadListsTx(ctx context.Context, tx *sql.Tx, unionLibraryID string) (int, int, error) {

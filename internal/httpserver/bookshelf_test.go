@@ -132,4 +132,41 @@ func TestBookshelfVersionsAndMergedSelectionPreferMostBooks(t *testing.T) {
 	if jResp.StatusCode != http.StatusFound || jResp.Header.Get("Location") != "/series/s_remote_5?versions=1" {
 		t.Fatalf("/bgm/4242 status=%d loc=%q, want 302 /series/s_remote_5?versions=1", jResp.StatusCode, jResp.Header.Get("Location"))
 	}
+
+	// 4. EffectiveOneShot (one_shot_override=1 & books_count=1) skips multi-version merging.
+	seedSeries(localLib.ID, "s_override_1", "Override Single", 1)
+	if err := store.SetSeriesOneShotOverride(ctx, "s_override_1", true); err != nil {
+		t.Fatal(err)
+	}
+	vOverrideResp := doAuthGet("/admin/api/bookshelf/versions/s_override_1")
+	defer vOverrideResp.Body.Close()
+	if vOverrideResp.StatusCode != http.StatusOK {
+		t.Fatalf("override versions status = %d", vOverrideResp.StatusCode)
+	}
+	var vOverrideBody struct {
+		Versions []struct {
+			ID string `json:"id"`
+		} `json:"versions"`
+	}
+	if err := json.NewDecoder(vOverrideResp.Body).Decode(&vOverrideBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(vOverrideBody.Versions) != 0 {
+		t.Fatalf("effective one-shot should return 0 versions, got %+v", vOverrideBody.Versions)
+	}
+	vListResp := doAuthGet("/admin/api/bookshelf/versions/s_local_2")
+	defer vListResp.Body.Close()
+	var vListBody struct {
+		Versions []struct {
+			ID string `json:"id"`
+		} `json:"versions"`
+	}
+	if err := json.NewDecoder(vListResp.Body).Decode(&vListBody); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range vListBody.Versions {
+		if item.ID == "s_override_1" {
+			t.Fatalf("effective one-shot s_override_1 leaked into multi-version list: %+v", vListBody.Versions)
+		}
+	}
 }

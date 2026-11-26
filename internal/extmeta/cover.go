@@ -503,7 +503,7 @@ func (c *CoverService) readCachedFromDisk(sourceID, entryID, coverURL string) (C
 }
 
 func (c *CoverService) circuitKey(sourceID, coverURL string) string {
-	if s := strings.TrimSpace(sourceID); s != "" {
+	if s := strings.TrimSpace(sourceID); s != "" && s != "book-custom" {
 		return "src:" + s
 	}
 	if u, err := url.Parse(coverURL); err == nil && u.Hostname() != "" {

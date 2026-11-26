@@ -748,13 +748,14 @@ selected AS (
 )
 SELECT totals.group_count,totals.book_count,g.day_key,g.group_key,b.id,
  coalesce(b.series_id,''),coalesce(b.library_id,''),coalesce(b.name,''),coalesce(b.size,0),coalesce(b.sha1,''),
- b.file_created_at,b.file_modified_at,coalesce(b.number_sort,0),coalesce(b.created_at,''),coalesce(b.updated_at,''),
+ b.file_created_at,b.file_modified_at,coalesce(bm.number_sort,b.number_sort,0),coalesce(b.created_at,''),coalesce(b.updated_at,''),
  coalesce(z.page_count,0),coalesce(s.name,''),coalesce(s.one_shot,0),coalesce(s.one_shot_override,0),coalesce(s.books_count,0),coalesce(sm.title,''),sm.authors_json,sm.bgm_subject_id,
  coalesce(p.completed,0),p.page,p.read_date,p.completed_at,coalesce(p.updated_at,'')
 FROM (SELECT count(*) AS group_count,coalesce(sum(book_count),0) AS book_count FROM groups) totals
 LEFT JOIN selected g ON true
 LEFT JOIN activity a ON a.group_key=g.group_key AND a.day_key=g.day_key
 LEFT JOIN books b ON b.id=a.book_id
+LEFT JOIN book_metadata bm ON bm.book_id=b.id
 LEFT JOIN series s ON s.id=b.series_id
 LEFT JOIN series_metadata sm ON sm.series_id=s.id
 LEFT JOIN zip_indexes z ON z.book_id=b.id

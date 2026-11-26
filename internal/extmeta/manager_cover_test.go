@@ -154,3 +154,48 @@ INSERT INTO gallery(gid,title,thumb,category,rating,expunged) VALUES
 	expectCover("bound", global[1].ID, "fixture")
 	m.InvalidateFallbackCoverCache()
 }
+
+func TestFetchCoverEnforcesShowNSFWForHTTPURLs(t *testing.T) {
+	ctx := t.Context()
+	png := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'}
+	var requests int
+	client := &http.Client{Transport: managerTransport(func(r *http.Request) (*http.Response, error) {
+		requests++
+		return managerResponse(r, http.StatusOK, bytes.NewReader(png)), nil
+	})}
+	store, m, root := newTestManager(t, ManagerOptions{})
+	covers, err := NewCoverService(CoverConfig{DataDir: root, Client: client, RequestsPerSec: 100, Burst: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.covers = covers
+	seedMetadataLibrary(t, store, "main", true)
+	seedMetadataSeries(t, store, "series", "main", "Blue River")
+	upstream := filepath.Join(root, "upstream.sqlite")
+	createManagerGallery(t, upstream, "Blue River")
+	src := addManagerSource(t, m, database.MetadataSource{Name: "Catalog", Kind: KindOfflineSQLite, LocalPath: upstream})
+	syncManagerFixture(t, m, src, false, "success")
+
+	const coverURL = "https://covers.example.test/nsfw.png"
+	if err := store.SaveSeriesMetadata(ctx, database.SeriesMetadata{
+		SeriesID: "series", ExtSourceID: src.ID, ExtEntryID: "102", ExtCoverURL: coverURL, NSFWLock: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	optOut := database.WithUserScope(ctx, database.UserScope{UserID: "opt-out", AllowNSFW: true, ShowNSFW: false})
+	if _, _, err := m.FetchCover(optOut, src.ID, "102", coverURL); !errors.Is(err, ErrUnavailable) || requests != 0 {
+		t.Fatalf("allow_nsfw=1 show_nsfw=0 user saw NSFW HTTP cover: requests=%d err=%v", requests, err)
+	}
+
+	optedIn := database.WithUserScope(ctx, database.UserScope{UserID: "opted-in", AllowNSFW: true, ShowNSFW: true})
+	raw, mediaType, err := m.FetchCover(optedIn, src.ID, "102", coverURL)
+	if err != nil || mediaType != "image/png" || !bytes.Equal(raw, png) || requests != 1 {
+		t.Fatalf("allow_nsfw=1 show_nsfw=1 failed: mediaType=%q requests=%d err=%v", mediaType, requests, err)
+	}
+
+	// Cache is already warm on disk; opt-out user must STILL be denied.
+	if _, _, err := m.FetchCover(optOut, src.ID, "102", coverURL); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("warm cache leaked NSFW HTTP cover to show_nsfw=0 user: err=%v", err)
+	}
+}

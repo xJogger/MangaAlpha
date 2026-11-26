@@ -110,13 +110,17 @@ UPDATE shelf_revision SET bulk_mode=0,catalog=catalog+1,progress=progress+? WHER
 func preserveReassignedBookState(ctx context.Context, tx *sql.Tx, runID string) (bool, error) {
 	// Keep the old and new memberships available before upserting the books.
 	if _, err := tx.ExecContext(ctx, `
-CREATE TEMP TABLE scan_reassigned_books(book_id TEXT PRIMARY KEY, old_series_id TEXT NOT NULL, new_series_id TEXT NOT NULL)
-WITHOUT ROWID`); err != nil {
+CREATE TEMP TABLE scan_reassigned_books(
+ book_id TEXT PRIMARY KEY,
+ old_series_id TEXT NOT NULL,
+ new_series_id TEXT NOT NULL,
+ new_parent_cid TEXT NOT NULL
+) WITHOUT ROWID`); err != nil {
 		return false, err
 	}
 	result, err := tx.ExecContext(ctx, `
 INSERT INTO scan_reassigned_books
-SELECT b.id,b.series_id,t.series_id
+SELECT b.id,b.series_id,t.series_id,t.parent_cid
 FROM scan_books_staging t JOIN books b ON b.library_id=t.library_id AND b.file_id=t.file_id
 WHERE t.run_id=? AND b.series_id<>t.series_id`, runID)
 	if err != nil {
@@ -133,6 +137,13 @@ UPDATE `+table+` AS p SET series_id=m.new_series_id FROM scan_reassigned_books m
 WHERE p.book_id=m.book_id AND p.series_id=m.old_series_id`); err != nil {
 				return false, err
 			}
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE archive_password_bindings AS p
+SET series_id=m.new_series_id,parent_cid=m.new_parent_cid
+FROM scan_reassigned_books m
+WHERE p.book_id=m.book_id`); err != nil {
+			return false, err
 		}
 		if err := carrySeriesScanState(ctx, tx, runID); err != nil {
 			return false, err
@@ -205,6 +216,14 @@ INSERT INTO collection_series(collection_id,series_id,position)
 SELECT cs.collection_id,next.new_id,cs.position
 FROM scan_series_successors next JOIN collection_series cs ON cs.series_id=next.old_id
 WHERE true ON CONFLICT(collection_id,series_id) DO NOTHING`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO series_thumbnails(
+ series_id,source_book_id,source_version,path,media_type,width,height,size,generation_duration_ns,created_at,updated_at
+)
+SELECT next.new_id,st.source_book_id,st.source_version,st.path,st.media_type,st.width,st.height,st.size,st.generation_duration_ns,st.created_at,st.updated_at
+FROM scan_series_successors next JOIN series_thumbnails st ON st.series_id=next.old_id`); err != nil {
 		return err
 	}
 	_, err := tx.ExecContext(ctx, `DROP TABLE temp.scan_series_successors`)

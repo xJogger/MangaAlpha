@@ -52,7 +52,7 @@ func (m *Manager) fetchCover(ctx context.Context, sourceID, entryID, parentEntry
 	if !src.Enabled || !src.Ready || src.Kind != KindOfflineSQLite || m.covers == nil || coverURL == "" {
 		return nil, "", ErrUnavailable
 	}
-	if scope, ok := database.UserScopeFromContext(ctx); ok && !scope.AllowNSFW {
+	if !m.store.ShowNSFW(ctx) {
 		entry, err := m.entry(ctx, sourceID, firstNonEmpty(parentEntryID, entryID))
 		if err != nil || entry.IsNSFW {
 			return nil, "", ErrUnavailable

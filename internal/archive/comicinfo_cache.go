@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -234,6 +235,9 @@ func (s *Service) extractPhysicalComicInfo(ctx context.Context, job comicInfoJob
 		return "", false, err
 	}
 	if !force && current.ComicInfoVersion == version && comicInfoTerminal(current.ComicInfoStatus) {
+		if job.logical.ID != "" && job.logical.ID != book.ID {
+			return s.syncLogicalBookFromPhysical(ctx, job.logical.ID, version, current)
+		}
 		return current.ComicInfoStatus, false, nil
 	}
 	var raw []byte
@@ -261,10 +265,17 @@ func (s *Service) extractPhysicalComicInfo(ctx context.Context, job comicInfoJob
 		return "", false, err
 	}
 	if status != "" {
-		if current.ComicInfoVersion == version && current.ComicInfoStatus == status {
-			return status, false, nil
+		if current.ComicInfoVersion != version || current.ComicInfoStatus != status {
+			if err := s.store.SetBookComicInfoSentinel(ctx, book.ID, version, status); err != nil {
+				return status, false, err
+			}
 		}
-		return status, false, s.store.SetBookComicInfoSentinel(ctx, book.ID, version, status)
+		if job.logical.ID != "" && job.logical.ID != book.ID {
+			if err := s.syncLogicalBookSentinel(ctx, job.logical.ID, version, status); err != nil {
+				return status, false, err
+			}
+		}
+		return status, false, nil
 	}
 	if err := s.persistComicInfo(ctx, job, version, raw); err != nil {
 		return "", false, err
@@ -436,6 +447,66 @@ func (r *RARService) readComicInfo(ctx context.Context, book database.Book, hint
 	return nil, ErrArchivePasswordInvalid
 }
 
+func (s *Service) syncLogicalBookFromPhysical(ctx context.Context, logicalID, version string, physical database.BookMetadata) (string, bool, error) {
+	logicalMeta, _, err := s.store.BookMetadataByID(ctx, logicalID)
+	if err != nil {
+		return "", false, err
+	}
+	if logicalMeta.ComicInfoVersion == version && comicInfoTerminal(logicalMeta.ComicInfoStatus) &&
+		logicalMeta.ComicInfoStatus == physical.ComicInfoStatus {
+		return physical.ComicInfoStatus, false, nil
+	}
+	if physical.ComicInfoStatus != ComicInfoParsed {
+		return physical.ComicInfoStatus, false, s.store.SetBookComicInfoSentinel(ctx, logicalID, version, physical.ComicInfoStatus)
+	}
+	meta := database.BookScrapedMetadata{
+		Title:            physical.Title,
+		Summary:          physical.Summary,
+		Number:           physical.Number,
+		NumberSort:       physical.NumberSort,
+		ReleaseDate:      physical.ReleaseDate,
+		ISBN:             physical.ISBN,
+		SeriesGroup:      physical.SeriesGroup,
+		StoryArc:         physical.StoryArc,
+		StoryArcNumber:   physical.StoryArcNumber,
+		ComicInfoVersion: version,
+		ComicInfoStatus:  physical.ComicInfoStatus,
+	}
+	if len(physical.Authors) > 0 {
+		meta.Authors = slices.Clone(physical.Authors)
+	}
+	if len(physical.Tags) > 0 {
+		meta.Tags = slices.Clone(physical.Tags)
+	}
+	if len(physical.Links) > 0 {
+		meta.Links = slices.Clone(physical.Links)
+	}
+	updated, err := s.syncLogicalBookMetadata(ctx, logicalID, version, meta)
+	return physical.ComicInfoStatus, updated, err
+}
+
+func (s *Service) syncLogicalBookMetadata(ctx context.Context, logicalID, version string, meta database.BookScrapedMetadata) (bool, error) {
+	err := s.store.UpsertBookScrapedMetadata(database.WithAutomaticMetadata(ctx), logicalID, meta)
+	if errors.Is(err, database.ErrMetadataChanged) {
+		return false, s.syncLogicalBookSentinel(ctx, logicalID, version, meta.ComicInfoStatus)
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Service) syncLogicalBookSentinel(ctx context.Context, logicalID, version, status string) error {
+	logicalMeta, _, err := s.store.BookMetadataByID(ctx, logicalID)
+	if err != nil {
+		return err
+	}
+	if logicalMeta.ComicInfoVersion == version && logicalMeta.ComicInfoStatus == status {
+		return nil
+	}
+	return s.store.SetBookComicInfoSentinel(ctx, logicalID, version, status)
+}
+
 func (s *Service) persistComicInfo(ctx context.Context, job comicInfoJob, version string, raw []byte) error {
 	s.comicInfo.mu.Lock()
 	parser := s.comicInfo.parser
@@ -450,11 +521,19 @@ func (s *Service) persistComicInfo(ctx context.Context, job comicInfoJob, versio
 	if err := s.store.BackfillSeriesMetadataFromComicInfo(ctx, job.book.SeriesID, series); err != nil {
 		return err
 	}
-	if job.logical.SeriesID != job.book.SeriesID {
+	if job.logical.SeriesID != "" && job.logical.SeriesID != job.book.SeriesID {
 		if err := s.store.BackfillSeriesMetadataFromComicInfo(ctx, job.logical.SeriesID, series); err != nil {
 			return err
 		}
 	}
 	meta.ComicInfoVersion, meta.ComicInfoStatus = version, ComicInfoParsed
-	return s.store.UpsertBookScrapedMetadata(ctx, job.book.ID, meta)
+	if err := s.store.UpsertBookScrapedMetadata(ctx, job.book.ID, meta); err != nil {
+		return err
+	}
+	if job.logical.ID != "" && job.logical.ID != job.book.ID {
+		if _, err := s.syncLogicalBookMetadata(ctx, job.logical.ID, version, meta); err != nil {
+			return err
+		}
+	}
+	return nil
 }

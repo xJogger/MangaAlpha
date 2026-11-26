@@ -8,6 +8,8 @@ import (
 	"image/png"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -227,4 +229,83 @@ func TestBookBatchUnknownTankobonKeepsConfirmedBinding(t *testing.T) {
 	if saved, _, err := store.BookMetadataByID(ctx, book.ID); err != nil || saved.BgmSubjectID != 41 {
 		t.Fatalf("confirmed binding was replaced: %+v err=%v", saved, err)
 	}
+}
+
+func TestBatchComicInfoSkipsPage1OnIOError(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	store, err := database.Open(filepath.Join(dir, "batch_io_err.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	var reqCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqCount.Add(1)
+		http.Error(w, "missing", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	acct, err := store.UpsertWebDAVAccount(ctx, database.WebDAVAccountSecret{
+		WebDAVAccount: database.WebDAVAccount{
+			Name:          "TestWD",
+			BaseURL:       srv.URL,
+			RatePerSecond: 100,
+		},
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO libraries(id,name,provider_type,webdav_account_id,root_cid,root_path,enabled,one_shot,created_at,updated_at)
+VALUES('lib_wd','WD','webdav',?,'','/',1,0,?,?);
+INSERT INTO series(id,library_id,cid,name,relative_path,one_shot,books_count,created_at,updated_at,seen_scan_id)
+VALUES('ser_wd','lib_wd','S','S','S',0,1,?,?,'sc1');
+INSERT INTO books(id,series_id,library_id,file_id,parent_cid,name,size,pick_code,sha1,number_sort,created_at,updated_at,seen_scan_id)
+VALUES('book_wd','ser_wd','lib_wd','S/bad.cbz','S','bad.cbz',1024,'','',1,?,?,'sc1')`,
+		acct.ID, now, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	cm, err := cache.New(store, filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	archives := archive.NewService(store, nil, cm, logger)
+	archives.SetComicInfoParser(func(reader io.Reader) (database.BookScrapedMetadata, database.SeriesComicInfoBackfill, error) {
+		return database.BookScrapedMetadata{}, database.SeriesComicInfoBackfill{}, nil
+	})
+	t.Cleanup(archives.Close)
+	thumbs, err := thumbnail.New(store, filepath.Join(dir, "thumbs"), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := New(store, archives, thumbs, logger)
+	t.Cleanup(manager.Close)
+
+	baseRun, err := manager.StartJob(ctx, OperationBatchComicInfo, TargetSeries, "ser_wd", JobOptions{ExtractPage1: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRun = waitRun(t, manager, baseRun.ID)
+	if baseRun.Status != "failed" || baseRun.FailedCount != 1 {
+		t.Fatalf("unexpected baseline run result: %+v", baseRun)
+	}
+	baseline := reqCount.Swap(0)
+
+	run, err := manager.StartJob(ctx, OperationBatchComicInfo, TargetSeries, "ser_wd", JobOptions{ExtractPage1: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run = waitRun(t, manager, run.ID)
+	if run.Status != "failed" || run.FailedCount != 1 || run.GeneratedCount != 0 {
+		t.Fatalf("unexpected run result: %+v", run)
+	}
+	if got := reqCount.Load(); baseline == 0 || got != baseline {
+		t.Fatalf("ExtractPage1 retried failed archive: baseline=%d withExtractPage1=%d", baseline, got)
+	}
+	assertBatchTableCount(t, store, "book_thumbnails", 0)
 }

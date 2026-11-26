@@ -246,3 +246,223 @@ func waitComicInfo(t *testing.T, store *database.Store, id, status string) datab
 	t.Fatalf("book %s did not reach ComicInfo status %s", id, status)
 	return database.BookMetadata{}
 }
+
+func TestUnionComicInfoWriteThroughAndShortcutSync(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	store, err := database.Open(filepath.Join(dir, "union_comicinfo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	libDir := filepath.Join(dir, "phys")
+	if err := os.MkdirAll(libDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertLibrary(ctx, database.Library{
+		ID: "lib_phys", Name: "Physical", ProviderType: database.ProviderLocal,
+		RootCID: "local:" + libDir, RootPath: libDir, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	buildCBZ := func(name, xml string) (string, int64) {
+		t.Helper()
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		p, err := zw.Create("01.png")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.Write([]byte("fixture page")); err != nil {
+			t.Fatal(err)
+		}
+		if xml != "" {
+			ci, err := zw.Create("ComicInfo.xml")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ci.Write([]byte(xml)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		rel := filepath.Join("SeriesA", name)
+		full := filepath.Join(libDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, buf.Bytes(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return rel, int64(buf.Len())
+	}
+
+	const comicXML = `<ComicInfo><Title>Union Embedded Vol</Title><Summary>Embedded volume summary</Summary>
+<Number>2</Number><Year>2025</Year><Month>4</Month><Day>9</Day><ISBN>9784088820002</ISBN>
+<Writer>Author One</Writer><Tags>TagOne</Tags><Web>https://example.test/vol</Web>
+<Series>Union Embedded Series</Series><Publisher>Union Pub</Publisher><SeriesGroup>GroupA</SeriesGroup></ComicInfo>`
+
+	f1, s1 := buildCBZ("01.cbz", comicXML)
+	f2, s2 := buildCBZ("02.cbz", comicXML)
+	f3, s3 := buildCBZ("03.cbz", comicXML)
+	f4, s4 := buildCBZ("04.cbz", "")
+	f5, s5 := buildCBZ("05.cbz", comicXML)
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO series(id,library_id,cid,name,relative_path,one_shot,created_at,updated_at,seen_scan_id)
+VALUES('s_phys','lib_phys','SeriesA','SeriesA','PhysRoot/SeriesA',0,?,?,'sc1')`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	for i, row := range []struct {
+		id, rel string
+		name    string
+		size    int64
+	}{
+		{"b_p1", f1, "01.cbz", s1},
+		{"b_p2", f2, "02.cbz", s2},
+		{"b_p3", f3, "03.cbz", s3},
+		{"b_p4", f4, "04.cbz", s4},
+		{"b_p5", f5, "05.cbz", s5},
+	} {
+		if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO books(id,series_id,library_id,file_id,parent_cid,name,size,pick_code,number_sort,created_at,updated_at,seen_scan_id)
+VALUES(?,'s_phys','lib_phys',?,'SeriesA',?,?,'',?,?,?,'sc1')`,
+			row.id, row.rel, row.name, row.size, float64(i+1), now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cm, err := cache.New(store, filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(store, nil, cm, slog.Default())
+	service.SetComicInfoParser(func(reader io.Reader) (database.BookScrapedMetadata, database.SeriesComicInfoBackfill, error) {
+		meta, err := extmeta.ParseComicInfoXML(reader)
+		if err != nil {
+			return database.BookScrapedMetadata{}, database.SeriesComicInfoBackfill{}, err
+		}
+		var authors []database.Author
+		for _, author := range meta.DetailedAuthors {
+			authors = append(authors, database.Author{Name: author.Name, Role: author.Role})
+		}
+		var links []database.Link
+		for _, link := range meta.Links {
+			links = append(links, database.Link{Label: link.Label, URL: link.URL})
+		}
+		return database.BookScrapedMetadata{
+			Title: meta.Title, Summary: meta.Summary, Number: meta.Number, NumberSort: meta.NumberSort,
+			ReleaseDate: meta.ReleaseDate, ISBN: meta.ISBN, Authors: authors, Tags: meta.Tags, Links: links,
+			SeriesGroup: meta.SeriesGroup,
+		}, database.SeriesComicInfoBackfill{Title: meta.Series, Publisher: meta.Publisher, Summary: meta.Summary}, nil
+	})
+	t.Cleanup(service.Close)
+
+	// Pre-extract b_p5 directly BEFORE union creation so physical b_p5 already has cached ComicInfo.
+	if st, err := service.ExtractBookComicInfo(ctx, func() database.Book {
+		b, _ := store.BookByID(ctx, "b_p5")
+		return b
+	}()); err != nil || st != ComicInfoParsed {
+		t.Fatalf("pre-extract b_p5 = %q, %v", st, err)
+	}
+
+	unionLib, _, err := store.CreateUnionLibrary(ctx, "UnionLib", true, []string{"lib_phys"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	uSeriesList, _, err := store.SeriesPage(ctx, database.SeriesQuery{LibraryIDs: []string{unionLib.ID}, Size: 10})
+	if err != nil || len(uSeriesList) != 1 {
+		t.Fatalf("union series = %+v, err=%v", uSeriesList, err)
+	}
+	uSeries := uSeriesList[0]
+	uBooks, _, err := store.BooksPage(ctx, database.BookQuery{SeriesID: uSeries.ID, Unpaged: true})
+	if err != nil || len(uBooks) != 5 {
+		t.Fatalf("union books = %+v, err=%v", uBooks, err)
+	}
+	byName := make(map[string]database.Book, len(uBooks))
+	for _, ub := range uBooks {
+		byName[ub.Name] = ub
+	}
+
+	// Lock Title on 02.cbz and set manual MatchOrigin on 03.cbz.
+	locked := true
+	lockedTitle := "Locked Union Vol"
+	if err := store.PatchBookMetadata(ctx, byName["02.cbz"].ID, database.BookMetadataPatch{
+		Title: &lockedTitle, TitleLock: &locked,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBookScrapedMetadata(ctx, byName["03.cbz"].ID, database.BookScrapedMetadata{
+		Title: "Manual Union Vol", MatchOrigin: "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Reading 01.cbz via union book triggers async ComicInfo write-through to union book & series.
+	if _, err := service.ReadPage(ctx, byName["01.cbz"], 1); err != nil {
+		t.Fatal(err)
+	}
+	uMeta1 := waitComicInfo(t, store, byName["01.cbz"].ID, ComicInfoParsed)
+	p1, _ := store.BookByIDAny(ctx, "b_p1")
+	if uMeta1.Title != "Union Embedded Vol" || uMeta1.Summary != "Embedded volume summary" ||
+		uMeta1.ComicInfoVersion != BookVersion(p1) || uMeta1.SeriesGroup != "GroupA" {
+		t.Fatalf("union 01.cbz write-through = %+v", uMeta1)
+	}
+	uSeriesMeta, err := store.SeriesMetadataByID(ctx, uSeries)
+	if err != nil || uSeriesMeta.Publisher != "Union Pub" || uSeriesMeta.Title != "Union Embedded Series" {
+		t.Fatalf("union series backfill = %+v, %v", uSeriesMeta, err)
+	}
+
+	// 2. 02.cbz keeps locked Title while filling unlocked Summary; 03.cbz keeps manual metadata while recording parsed status.
+	if st, err := service.ExtractBookComicInfo(ctx, byName["02.cbz"]); err != nil || st != ComicInfoParsed {
+		t.Fatalf("extract 02.cbz = %q, %v", st, err)
+	}
+	uMeta2, _, err := store.BookMetadataByID(ctx, byName["02.cbz"].ID)
+	if err != nil || uMeta2.Title != lockedTitle || uMeta2.Summary != "Embedded volume summary" || uMeta2.ComicInfoStatus != ComicInfoParsed {
+		t.Fatalf("union 02.cbz lock protection = %+v, %v", uMeta2, err)
+	}
+	if st, err := service.ExtractBookComicInfo(ctx, byName["03.cbz"]); err != nil || st != ComicInfoParsed {
+		t.Fatalf("extract 03.cbz = %q, %v", st, err)
+	}
+	uMeta3, _, err := store.BookMetadataByID(ctx, byName["03.cbz"].ID)
+	if err != nil || uMeta3.Title != "Manual Union Vol" || uMeta3.Summary != "" || uMeta3.ComicInfoStatus != ComicInfoParsed {
+		t.Fatalf("union 03.cbz manual protection = %+v, %v", uMeta3, err)
+	}
+
+	// 3. Sentinel write-through for 04.cbz without ComicInfo.xml.
+	if _, err := service.ListPages(ctx, byName["04.cbz"]); err != nil {
+		t.Fatal(err)
+	}
+	uMeta4 := waitComicInfo(t, store, byName["04.cbz"].ID, ComicInfoAbsent)
+	p4, _ := store.BookByIDAny(ctx, "b_p4")
+	if uMeta4.ComicInfoVersion != BookVersion(p4) {
+		t.Fatalf("union 04.cbz sentinel version = %q, want %q", uMeta4.ComicInfoVersion, BookVersion(p4))
+	}
+
+	// 4. Shortcut sync: reset logical 05.cbz metadata AND delete physical 05.cbz file on disk!
+	if _, err := store.DB().ExecContext(ctx, `DELETE FROM book_metadata WHERE book_id=?`, byName["05.cbz"].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(libDir, f5)); err != nil {
+		t.Fatal(err)
+	}
+	status5, changed5, err := service.ExtractBookComicInfoWithOptions(ctx, byName["05.cbz"], false)
+	if err != nil || status5 != ComicInfoParsed || !changed5 {
+		t.Fatalf("shortcut sync reopened archive or failed: status=%q changed=%v err=%v", status5, changed5, err)
+	}
+	uMeta5, ok5, err := store.BookMetadataByID(ctx, byName["05.cbz"].ID)
+	p5, _ := store.BookByIDAny(ctx, "b_p5")
+	if err != nil || !ok5 || uMeta5.Title != "Union Embedded Vol" || uMeta5.ComicInfoStatus != ComicInfoParsed || uMeta5.ComicInfoVersion != BookVersion(p5) {
+		t.Fatalf("shortcut synced metadata = %+v, ok=%v err=%v", uMeta5, ok5, err)
+	}
+	// Second shortcut call sees logical book already synced -> changed=false without touching disk.
+	status5b, changed5b, err := service.ExtractBookComicInfoWithOptions(ctx, byName["05.cbz"], false)
+	if err != nil || status5b != ComicInfoParsed || changed5b {
+		t.Fatalf("repeated shortcut sync should be no-op: status=%q changed=%v err=%v", status5b, changed5b, err)
+	}
+}

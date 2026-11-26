@@ -793,3 +793,78 @@ INSERT INTO bgm_subjects VALUES(200,1001,1,0,'Legacy Series','旧版系列','','
 		t.Fatalf("unexpected sorted offline tankobons: %+v", offlineItems)
 	}
 }
+
+func TestEffectiveOneShotPropagatesToCandidateMatching(t *testing.T) {
+	ctx := t.Context()
+	tmp := t.TempDir()
+	store, err := database.Open(filepath.Join(tmp, "eff_oneshot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	svc, err := NewService(store, filepath.Join(tmp, "bgm"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	svc.live.limiter = rate.NewLimiter(rate.Inf, 1)
+	svc.SetAPITransportForTest(matchingTransport(func(r *http.Request) (*http.Response, error) {
+		w := httptest.NewRecorder()
+		if r.URL.Path == "/v0/search/subjects" {
+			// Candidate 501 (series:false, rank:1 -> +0.02 tie-breaker) vs 502 (series:true, rank:0 -> +0.06 SeriesBonus only when NOT one-shot).
+			_, _ = io.WriteString(w, `{"data":[
+				{"id":501,"type":1,"platform":"漫画","name":"Short Tale","name_cn":"短篇物语","series":false,"rating":{"rank":1,"score":8.5},"nsfw":false},
+				{"id":502,"type":1,"platform":"漫画","name":"短篇物语","name_cn":"短篇物语","series":true,"nsfw":false}
+			]}`)
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
+		return w.Result(), nil
+	}))
+
+	if err := store.UpsertLibrary(ctx, database.Library{
+		ID: "lib1", Name: "Lib", ProviderType: database.ProviderLocal, RootCID: "local:/lib", RootPath: "/lib", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO series(id,library_id,cid,name,relative_path,one_shot,one_shot_override,books_count,created_at,updated_at,seen_scan_id)
+VALUES('s_eff','lib1','c1','短篇物语','Lib/短篇物语',0,1,0,?,?,'sc1');
+INSERT INTO books(id,series_id,library_id,file_id,parent_cid,name,size,pick_code,number_sort,created_at,updated_at,seen_scan_id)
+VALUES('b_eff','s_eff','lib1','f1','c1','01.cbz',100,'',1,?,?,'sc1')`, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	series, err := store.SeriesByID(ctx, "s_eff")
+	if err != nil || series.OneShot || !series.EffectiveOneShot() {
+		t.Fatalf("unexpected series = %+v, err=%v", series, err)
+	}
+	cands, _, err := svc.SearchCandidates(ctx, series, "")
+	if err != nil || len(cands) != 2 {
+		t.Fatalf("SearchCandidates = %+v, err=%v", cands, err)
+	}
+	if cands[0].ID != 501 || cands[1].Breakdown == nil || cands[1].Breakdown.SeriesBonus != 0 {
+		t.Fatalf("SearchCandidates did not use EffectiveOneShot: %+v", cands)
+	}
+
+	run, err := svc.StartBatch(ctx, "lib1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		run, _ = svc.Run(ctx, run.ID)
+		if run.Status == "success" || run.Status == "partial" || run.Status == "failed" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if run.Status != "success" || run.MatchedCount != 1 {
+		t.Fatalf("batch scrape run = %+v", run)
+	}
+	meta, err := store.SeriesMetadataByID(ctx, series)
+	if err != nil || meta.BgmSubjectID == nil || *meta.BgmSubjectID != 501 {
+		t.Fatalf("batch scrape did not honor one_shot_override (expected 501, got %+v, err=%v)", meta.BgmSubjectID, err)
+	}
+}
