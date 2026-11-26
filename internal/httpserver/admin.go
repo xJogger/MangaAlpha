@@ -132,6 +132,11 @@ func (s *Server) adminRoutes(r chi.Router) {
 		ar.Get("/maintenance-jobs", s.listMaintenanceJobs)
 		ar.Post("/maintenance-jobs", s.startMaintenanceJob)
 		ar.Post("/maintenance-jobs/{runID}/cancel", s.cancelMaintenanceJob)
+		ar.Patch("/series/{seriesID}/oneshot", s.patchSeriesOneShot)
+		ar.Post("/books/{bookID}/cover", s.putBookCustomCover)
+		ar.Delete("/books/{bookID}/cover", s.deleteBookCustomCover)
+		ar.Patch("/books/{bookID}/cover-source", s.patchBookCoverSource)
+		ar.Post("/books/{bookID}/comicinfo/refresh", s.refreshBookComicInfo)
 		ar.Get("/cache", s.cacheStats)
 		ar.Delete("/cache/{cacheType}", s.clearCache)
 
@@ -1192,55 +1197,64 @@ func (s *Server) listMaintenanceJobs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) startMaintenanceJob(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		Operation string `json:"operation"`
-		SeriesID  string `json:"seriesId"`
-		BookID    string `json:"bookId"`
-		Force     bool   `json:"force"`
+		Operation  string `json:"operation"`
+		TargetType string `json:"targetType"`
+		TargetID   string `json:"targetId"`
+		SeriesID   string `json:"seriesId"`
+		BookID     string `json:"bookId"`
+		LibraryID  string `json:"libraryId"`
+		maintenance.JobOptions
 	}
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	request.Operation = strings.TrimSpace(request.Operation)
-	request.SeriesID = strings.TrimSpace(request.SeriesID)
-	request.BookID = strings.TrimSpace(request.BookID)
-	var (
-		run maintenance.Run
-		err error
-	)
-	switch request.Operation {
+	operation := strings.TrimSpace(request.Operation)
+	targetType := strings.TrimSpace(request.TargetType)
+	switch operation {
 	case maintenance.OperationBookIndex:
-		if request.BookID == "" {
-			writeError(w, http.StatusBadRequest, "INVALID_TARGET", "bookId is required")
+		if targetType == "" {
+			targetType = maintenance.TargetBook
+		}
+	case maintenance.OperationSeriesIndex, maintenance.OperationSeriesThumbnail:
+		if targetType == "" {
+			targetType = maintenance.TargetSeries
+		}
+	case maintenance.OperationBatchBookCovers, maintenance.OperationBatchComicInfo:
+		if targetType != maintenance.TargetSeries && targetType != maintenance.TargetLibrary {
+			writeError(w, http.StatusBadRequest, "INVALID_TARGET", "targetType must be series or library.")
 			return
 		}
-		run, err = s.tasks.StartBookIndex(r.Context(), request.BookID, request.Force)
-	case maintenance.OperationSeriesIndex:
-		if request.SeriesID == "" {
-			writeError(w, http.StatusBadRequest, "INVALID_TARGET", "seriesId is required")
-			return
-		}
-		run, err = s.tasks.StartSeriesIndex(r.Context(), request.SeriesID, request.Force)
-	case maintenance.OperationSeriesThumbnail:
-		if request.SeriesID == "" {
-			writeError(w, http.StatusBadRequest, "INVALID_TARGET", "seriesId is required")
-			return
-		}
-		run, err = s.tasks.StartSeriesThumbnail(r.Context(), request.SeriesID, request.Force)
 	default:
 		writeError(w, http.StatusBadRequest, "INVALID_OPERATION", "Unknown maintenance operation.")
 		return
 	}
-	if err != nil {
-		status := http.StatusConflict
-		code := "MAINTENANCE_JOB_START_FAILED"
-		if errors.Is(err, sql.ErrNoRows) {
-			status, code = http.StatusNotFound, "NOT_FOUND"
-		} else if errors.Is(err, maintenance.ErrJobAlreadyQueued) {
-			status, code = http.StatusConflict, "JOB_ALREADY_RUNNING"
-		} else if errors.Is(err, maintenance.ErrInvalidOperation) {
-			status, code = http.StatusBadRequest, "INVALID_OPERATION"
+	targetID := strings.TrimSpace(request.TargetID)
+	if targetID == "" {
+		switch targetType {
+		case maintenance.TargetBook:
+			targetID = strings.TrimSpace(request.BookID)
+		case maintenance.TargetSeries:
+			targetID = strings.TrimSpace(request.SeriesID)
+		case maintenance.TargetLibrary:
+			targetID = strings.TrimSpace(request.LibraryID)
 		}
-		writeError(w, status, code, err.Error())
+	}
+	if targetID == "" {
+		writeError(w, http.StatusBadRequest, "INVALID_TARGET", "A maintenance target ID is required.")
+		return
+	}
+	run, err := s.tasks.StartJob(r.Context(), operation, targetType, targetID, request.JobOptions)
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Maintenance target not found.")
+		case errors.Is(err, maintenance.ErrJobAlreadyQueued):
+			writeError(w, http.StatusConflict, "JOB_ALREADY_RUNNING", maintenance.ErrJobAlreadyQueued.Error())
+		case errors.Is(err, maintenance.ErrInvalidOperation):
+			writeError(w, http.StatusBadRequest, "INVALID_OPERATION", maintenance.ErrInvalidOperation.Error())
+		default:
+			s.writeDBError(w, r, err)
+		}
 		return
 	}
 	writeJSON(w, http.StatusAccepted, run)
@@ -1344,7 +1358,16 @@ func (s *Server) seriesRichDetail(w http.ResponseWriter, r *http.Request) {
 		s.writeDBError(w, r, err)
 		return
 	}
-	bookDTOList, err := s.bookDTOs(r, books)
+	bookIDs := make([]string, len(books))
+	for i, book := range books {
+		bookIDs[i] = book.ID
+	}
+	bookMetas, err := s.store.BookMetadataMap(r.Context(), bookIDs)
+	if err != nil {
+		s.writeDBError(w, r, err)
+		return
+	}
+	bookProgresses, err := s.store.BookReadProgresses(r.Context(), bookIDs)
 	if err != nil {
 		s.writeDBError(w, r, err)
 		return
@@ -1361,16 +1384,19 @@ func (s *Server) seriesRichDetail(w http.ResponseWriter, r *http.Request) {
 
 	var totalSize int64
 	currentVersions := make(map[string]string, len(books))
+	bookDTOList := make([]any, 0, len(books))
 	bookExtras := make(map[string]any, len(books))
 	for _, b := range books {
 		totalSize += b.Size
 		ver := archive.BookVersion(b)
 		currentVersions[b.ID] = ver
-		extra := map[string]any{
-			"inferredProgress": pageProgressInline(pageProgresses[b.ID]),
-			"indexStatus":      indexStatusInline(indexStats[b.ID], ver),
-			"downloadStat":     downloadStatInline(downloadStats[b.ID]),
-		}
+		bm := bookMetas[b.ID]
+		bookProgress, hasProgress := bookProgresses[b.ID]
+		bookDTOList = append(bookDTOList, bookDTOWithProgressAndMeta(b, series, meta, bookProgress, hasProgress, bm))
+		extra := bookMetadataSummary(bm)
+		extra["inferredProgress"] = pageProgressInline(pageProgresses[b.ID])
+		extra["indexStatus"] = indexStatusInline(indexStats[b.ID], ver)
+		extra["downloadStat"] = downloadStatInline(downloadStats[b.ID])
 		if len(unionBookSources) > 0 {
 			if srcs := unionBookSources[b.ID]; len(srcs) > 0 {
 				extra["unionSources"] = srcs
@@ -1412,6 +1438,10 @@ func (s *Server) seriesRichDetail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"series":             seriesDTOFull(series, progress, meta),
 		"rawMeta":            meta,
+		"oneShotOverride":    series.OneShotOverride,
+		"fileBackedOneShot":  series.OneShot,
+		"effectiveOneShot":   series.EffectiveOneShot(),
+		"canToggleOneShot":   !series.OneShot && series.BooksCount == 1,
 		"tracker":            trackerSummary,
 		"originalName":       series.Name,
 		"relativePath":       series.RelativePath,
@@ -1507,8 +1537,25 @@ func (s *Server) bookRichDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	rawBookMeta := bookMetadataSummary(bookMeta)
+	rawBookMeta["customCoverUrl"] = ""
+	rawBookMeta["extSourceId"] = ""
+	rawBookMeta["extEntryId"] = ""
+	rawBookMeta["matchOrigin"] = ""
+	if scope, ok := database.UserScopeFromContext(r.Context()); ok && scope.IsAdmin {
+		rawBookMeta["customCoverUrl"] = bookMeta.CustomCoverURL
+		rawBookMeta["extSourceId"] = bookMeta.ExtSourceID
+		rawBookMeta["extEntryId"] = bookMeta.ExtEntryID
+		rawBookMeta["matchOrigin"] = bookMeta.MatchOrigin
+	}
+	rawBookMeta["seriesGroup"] = bookMeta.SeriesGroup
+	rawBookMeta["storyArc"] = bookMeta.StoryArc
+	rawBookMeta["storyArcNumber"] = bookMeta.StoryArcNumber
+	rawBookMeta["updatedAt"] = webTime(bookMeta.UpdatedAt)
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"book":              bookDTOWithProgressAndMeta(book, series, seriesMeta, progress, hasProgress, bookMeta),
+		"rawBookMeta":       rawBookMeta,
 		"seriesId":          series.ID,
 		"seriesTitle":       seriesMeta.Title,
 		"originalSeries":    series.Name,
