@@ -456,6 +456,24 @@ INSERT INTO books(
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("out-of-range webui page size status=%d", response.StatusCode)
 	}
+	response = requestJSONWithClient(t, sessionClient, http.MethodPatch, server.URL+"/api/v1/client-settings/user", map[string]any{
+		"webui.shelf.infiniteScroll": map[string]any{"value": "1"},
+	})
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("webui infinite scroll PATCH status=%d", response.StatusCode)
+	}
+	getJSONWithClient(t, sessionClient, server.URL+"/api/v1/client-settings/user/list", &displaySettings)
+	if displaySettings["webui.shelf.infiniteScroll"]["value"] != "1" {
+		t.Fatalf("webui infinite scroll preference not stored: %#v", displaySettings)
+	}
+	response = requestJSONWithClient(t, sessionClient, http.MethodPatch, server.URL+"/api/v1/client-settings/user", map[string]any{
+		"webui.shelf.infiniteScroll": map[string]any{"value": "yes"},
+	})
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid webui infinite scroll status=%d", response.StatusCode)
+	}
 
 	var structuredSeriesPage map[string]any
 	response = requestJSONWithClient(t, sessionClient, http.MethodPost, server.URL+"/api/v1/series/list?page=0&size=10&sort=metadata.titleSort,asc", map[string]any{

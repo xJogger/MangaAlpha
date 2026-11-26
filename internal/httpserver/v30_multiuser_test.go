@@ -222,6 +222,47 @@ func TestV30MultiUserRBACIsolationAndCodename(t *testing.T) {
 	_ = json.NewDecoder(createB.Body).Decode(&userB)
 	createB.Body.Close()
 
+	// 2b. Shelf display preferences (including the infinite-scroll toggle) stay
+	// per-account: Alice's choice must never show up for Bob.
+	prefA := doReq("PATCH", "/api/v1/client-settings/user", map[string]any{
+		"webui.shelf.infiniteScroll": map[string]any{"value": "1"},
+	}, "alice", "AlicePass123!", "")
+	prefA.Body.Close()
+	if prefA.StatusCode != http.StatusNoContent {
+		t.Fatalf("alice infinite scroll PATCH status=%d", prefA.StatusCode)
+	}
+
+	var aliceSettings map[string]map[string]any
+	settingsA := doReq("GET", "/api/v1/client-settings/user/list", nil, "alice", "AlicePass123!", "")
+	if settingsA.StatusCode != http.StatusOK {
+		t.Fatalf("alice client settings status=%d", settingsA.StatusCode)
+	}
+	_ = json.NewDecoder(settingsA.Body).Decode(&aliceSettings)
+	settingsA.Body.Close()
+	if aliceSettings["webui.shelf.infiniteScroll"]["value"] != "1" {
+		t.Fatalf("alice infinite scroll preference missing: %#v", aliceSettings)
+	}
+
+	var bobSettings map[string]map[string]any
+	settingsB := doReq("GET", "/api/v1/client-settings/user/list", nil, "bob", "BobPass123!", "")
+	if settingsB.StatusCode != http.StatusOK {
+		t.Fatalf("bob client settings status=%d", settingsB.StatusCode)
+	}
+	_ = json.NewDecoder(settingsB.Body).Decode(&bobSettings)
+	settingsB.Body.Close()
+	if _, leaked := bobSettings["webui.shelf.infiniteScroll"]; leaked {
+		t.Fatalf("bob must not inherit alice's shelf preference: %#v", bobSettings)
+	}
+
+	// Only the canonical "0"/"1" encodings are accepted for the boolean toggle.
+	badPrefA := doReq("PATCH", "/api/v1/client-settings/user", map[string]any{
+		"webui.shelf.infiniteScroll": map[string]any{"value": "yes"},
+	}, "alice", "AlicePass123!", "")
+	badPrefA.Body.Close()
+	if badPrefA.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid infinite scroll value status=%d", badPrefA.StatusCode)
+	}
+
 	// 3. RBAC: Alice MUST get 403 on all admin-only routes, metadata PATCH, and Agent API!
 	forbiddenChecks := []struct {
 		method string

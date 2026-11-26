@@ -20,6 +20,12 @@ func TestValidateClientSettingWebUIDisplayRanges(t *testing.T) {
 		{"home updated in range", "webui.home.updatedSize", value("18"), false},
 		{"home added above range", "webui.home.addedSize", value("37"), true},
 		{"home continue below range", "webui.home.continueSize", value("3"), true},
+		{"infinite scroll enabled", "webui.shelf.infiniteScroll", value("1"), false},
+		{"infinite scroll disabled", "webui.shelf.infiniteScroll", value("0"), false},
+		{"infinite scroll boolean text", "webui.shelf.infiniteScroll", value("true"), true},
+		{"infinite scroll out of range", "webui.shelf.infiniteScroll", value("2"), true},
+		{"infinite scroll empty value", "webui.shelf.infiniteScroll", value(""), true},
+		{"infinite scroll deletion", "webui.shelf.infiniteScroll", nil, false},
 		{"unrelated webui key untouched", "webui.reader.mode", value("rtl"), false},
 	}
 	for _, tc := range cases {

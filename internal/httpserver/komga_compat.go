@@ -25,6 +25,12 @@ var webUIClientSettingRanges = map[string][2]int{
 	"webui.home.addedSize":    {4, 36},
 }
 
+// webUIClientSettingEnums validates boolean-ish web UI toggles that are stored
+// as plain "0"/"1" strings in client_settings.
+var webUIClientSettingEnums = map[string]map[string]struct{}{
+	"webui.shelf.infiniteScroll": {"0": {}, "1": {}},
+}
+
 type komgaSearchFilters struct {
 	Search        string
 	LibraryIDs    []string
@@ -148,6 +154,11 @@ func validateClientSetting(key string, value *string) error {
 		return errors.New("client setting value is too long")
 	}
 	if value != nil {
+		if allowed, ok := webUIClientSettingEnums[strings.TrimSpace(key)]; ok {
+			if _, valid := allowed[strings.TrimSpace(*value)]; !valid {
+				return fmt.Errorf("%s must be \"0\" or \"1\"", key)
+			}
+		}
 		if limits, ok := webUIClientSettingRanges[strings.TrimSpace(key)]; ok {
 			n, err := strconv.Atoi(strings.TrimSpace(*value))
 			if err != nil {

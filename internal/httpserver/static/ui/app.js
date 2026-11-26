@@ -15,17 +15,29 @@
 
   // Per-user web UI display preferences, stored in Komga client settings under
   // the existing webui.* namespace so they travel across devices.
+  // `type: 'int'` entries are bounded counts; `type: 'bool'` entries are toggles
+  // stored as "0"/"1" so they round-trip through the plain-text setting value.
   const DISPLAY_PREFS = {
-    shelfPageSize: { key: 'webui.shelf.pageSize', def: 36, min: 12, max: 120 },
-    homeContinueSize: { key: 'webui.home.continueSize', def: 8, min: 4, max: 24 },
-    homeUpdatedSize: { key: 'webui.home.updatedSize', def: 18, min: 4, max: 36 },
-    homeAddedSize: { key: 'webui.home.addedSize', def: 12, min: 4, max: 36 },
+    shelfPageSize: { key: 'webui.shelf.pageSize', type: 'int', def: 36, min: 12, max: 120 },
+    shelfInfiniteScroll: { key: 'webui.shelf.infiniteScroll', type: 'bool', def: false },
+    homeContinueSize: { key: 'webui.home.continueSize', type: 'int', def: 8, min: 4, max: 24 },
+    homeUpdatedSize: { key: 'webui.home.updatedSize', type: 'int', def: 18, min: 4, max: 36 },
+    homeAddedSize: { key: 'webui.home.addedSize', type: 'int', def: 12, min: 4, max: 36 },
   };
 
-  function clampDisplayPref(spec, raw) {
+  function normalizeDisplayPref(spec, raw) {
+    if (spec.type === 'bool') {
+      if (raw === true || raw === 1) return true;
+      const text = String(raw == null ? '' : raw).trim().toLowerCase();
+      return text === '1' || text === 'true' || text === 'on' || text === 'yes';
+    }
     const n = Number.parseInt(raw, 10);
     if (!Number.isFinite(n)) return spec.def;
     return Math.min(spec.max, Math.max(spec.min, n));
+  }
+
+  function serializeDisplayPref(spec, value) {
+    return spec.type === 'bool' ? (value ? '1' : '0') : String(value);
   }
 
   function defaultDisplayPrefs() {
@@ -46,7 +58,7 @@
     for (const [name, spec] of Object.entries(DISPLAY_PREFS)) {
       try {
         const raw = localStorage.getItem(displayPrefStorageKey(userId, name));
-        if (raw != null && raw !== '') out[name] = clampDisplayPref(spec, raw);
+        if (raw != null && raw !== '') out[name] = normalizeDisplayPref(spec, raw);
       } catch (_) {}
     }
     return out;
@@ -84,6 +96,8 @@
     extMetaRepoDraft: null,
     extMetaBatchDraft: null,
     extMetaExportDraft: null,
+    shelfObserver: null,
+    shelfAbort: null,
   };
 
   function isAdminUser() {
@@ -95,8 +109,30 @@
     state.displayPrefsUserId = '';
   }
 
+  // Tear down both the infinite-scroll observer and any in-flight shelf request.
+  // Called on every route change so a stale page response can never render over
+  // the new view (and can never trigger a global 401 redirect after navigation).
+  function teardownShelfObserver() {
+    if (state.shelfObserver) {
+      try { state.shelfObserver.disconnect(); } catch (_) {}
+      state.shelfObserver = null;
+    }
+    if (state.shelfAbort) {
+      try { state.shelfAbort.abort(); } catch (_) {}
+      state.shelfAbort = null;
+    }
+  }
+
+  // AbortController errors are expected control flow (route/filter changed), not
+  // user-facing failures, so callers must swallow them instead of rendering a
+  // "load failed" banner over the view that replaced them.
+  function isAbortError(err) {
+    return Boolean(err && (err.name === 'AbortError' || err.code === 20));
+  }
+
   function displayPref(name) {
     const spec = DISPLAY_PREFS[name];
+    if (spec.type === 'bool') return Boolean(state.displayPrefs[name]);
     return Math.min(spec.max, Math.max(spec.min, state.displayPrefs[name] || spec.def));
   }
 
@@ -118,9 +154,9 @@
         const item = res && res[spec.key];
         const storageKey = displayPrefStorageKey(uid, name);
         if (item && item.value != null && item.value !== '') {
-          const value = clampDisplayPref(spec, item.value);
+          const value = normalizeDisplayPref(spec, item.value);
           next[name] = value;
-          try { localStorage.setItem(storageKey, String(value)); } catch (_) {}
+          try { localStorage.setItem(storageKey, serializeDisplayPref(spec, value)); } catch (_) {}
         } else {
           try { localStorage.removeItem(storageKey); } catch (_) {}
         }
@@ -135,48 +171,69 @@
   async function saveDisplayPref(name, raw) {
     const uid = (state.auth && state.auth.userId) || '';
     const spec = DISPLAY_PREFS[name];
-    const value = clampDisplayPref(spec, raw);
+    const value = normalizeDisplayPref(spec, raw);
     await api('/api/v1/client-settings/user', {
       method: 'PATCH',
-      body: { [spec.key]: { value: String(value) } },
+      body: { [spec.key]: { value: serializeDisplayPref(spec, value) } },
     });
     if (((state.auth && state.auth.userId) || '') === uid) {
       state.displayPrefs[name] = value;
       if (uid) {
-        try { localStorage.setItem(displayPrefStorageKey(uid, name), String(value)); } catch (_) {}
+        try { localStorage.setItem(displayPrefStorageKey(uid, name), serializeDisplayPref(spec, value)); } catch (_) {}
       }
     }
     return value;
   }
 
-  function displayPrefSelectHTML(name, label, values) {
+  function displayPrefSelectHTML(name, label, values, unit = '项') {
     const current = displayPref(name);
     const options = values.slice();
     if (!options.includes(current)) options.push(current);
     options.sort((a, b) => a - b);
     const id = `disp-pref-${name}`;
-    return `<div class="field" style="margin:0">
+    return `<div class="pref-field">
       <label for="${esc(id)}">${esc(label)}</label>
       <select id="${esc(id)}" data-display-pref="${esc(name)}">
-        ${options.map((value) => `<option value="${value}" ${value === current ? 'selected' : ''}>${value} 项</option>`).join('')}
+        ${options.map((value) => `<option value="${value}" ${value === current ? 'selected' : ''}>${value} ${unit}</option>`).join('')}
       </select>
     </div>`;
   }
 
+  function displayPrefSwitchHTML(name, label, hint) {
+    const id = `disp-pref-${name}`;
+    return `<label class="pref-toggle" for="${esc(id)}">
+      <span class="pref-toggle-text">
+        <strong>${esc(label)}</strong>
+        <span>${esc(hint)}</span>
+      </span>
+      <span class="switch">
+        <input type="checkbox" id="${esc(id)}" data-display-pref="${esc(name)}" ${displayPref(name) ? 'checked' : ''}>
+        <span class="switch-track" aria-hidden="true"></span>
+      </span>
+    </label>`;
+  }
+
   function bindDisplayPrefControls(root) {
-    root.querySelectorAll('select[data-display-pref]').forEach((select) => {
-      select.onchange = async () => {
-        const name = select.getAttribute('data-display-pref');
+    root.querySelectorAll('[data-display-pref]').forEach((control) => {
+      control.onchange = async () => {
+        const name = control.getAttribute('data-display-pref');
+        const spec = DISPLAY_PREFS[name];
         const previous = displayPref(name);
-        select.disabled = true;
+        const raw = control.type === 'checkbox' ? (control.checked ? '1' : '0') : control.value;
+        control.disabled = true;
         try {
-          const saved = await saveDisplayPref(name, select.value);
-          toast(`已保存显示偏好：${saved} 项`);
+          const saved = await saveDisplayPref(name, raw);
+          if (spec.type === 'bool') {
+            toast(saved ? '已开启无限滚动浏览' : '已切换为分页浏览');
+          } else {
+            toast(`已保存显示偏好：${saved} 项`);
+          }
         } catch (err) {
-          select.value = String(previous);
+          if (control.type === 'checkbox') control.checked = Boolean(previous);
+          else control.value = String(previous);
           toast(err.message, 'error');
         } finally {
-          select.disabled = false;
+          control.disabled = false;
         }
       };
     });
@@ -185,15 +242,16 @@
   function displayPrefCardHTML() {
     return `<div class="card">
       <h3>网页显示偏好（仅当前账号）</h3>
-      <p style="font-size:12.5px;color:var(--text-secondary);margin-top:0">
-        这些数量会保存到当前账号（Komga client settings 的 <code>webui.*</code> 命名空间），换设备登录同样生效；浏览器只保留一份本地缓存用于首屏加速。
+      <p class="card-hint" style="margin-top:0">
+        这些偏好会保存到当前账号（Komga client settings 的 <code>webui.*</code> 命名空间），换设备登录同样生效；浏览器只保留一份本地缓存用于首屏加速。
       </p>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px">
-        ${displayPrefSelectHTML('shelfPageSize', '书架每页', [24, 36, 48, 60, 96])}
+      <div class="pref-grid">
+        ${displayPrefSelectHTML('shelfPageSize', '书架每页数量', [24, 36, 48, 60, 96])}
         ${displayPrefSelectHTML('homeContinueSize', '首页「继续阅读」', [4, 8, 12, 18, 24])}
         ${displayPrefSelectHTML('homeUpdatedSize', '首页「最近更新」', [8, 12, 18, 24, 36])}
         ${displayPrefSelectHTML('homeAddedSize', '首页「最新入库」', [8, 12, 18, 24, 36])}
       </div>
+      ${displayPrefSwitchHTML('shelfInfiniteScroll', '书架无限滚动', '不显示分页按钮，滚动到列表底部时自动加载下一页；仅影响网页端的书架与浏览书库。')}
     </div>`;
   }
 
@@ -558,6 +616,13 @@
   });
 
   async function api(url, opts = {}) {
+    const throwIfAborted = () => {
+      if (opts.signal && opts.signal.aborted) {
+        const err = new Error('Aborted');
+        err.name = 'AbortError';
+        throw err;
+      }
+    };
     const method = (opts.method || 'GET').toUpperCase();
     const headers = Object.assign({ 'X-FK115-UI': '1' }, opts.headers || {});
     if (
@@ -578,18 +643,25 @@
       headers['Content-Type'] = 'application/json';
       fetchOpts.body = JSON.stringify(opts.body);
     }
+    if (opts.signal) fetchOpts.signal = opts.signal;
     const resp = await fetch(url, fetchOpts);
+    // A stale shelf request may abort while the response is already in flight;
+    // never let its body reach a route change or the caller's render path.
+    throwIfAborted();
     if (resp.status === 409) {
       let errData = {};
       try { errData = await resp.clone().json(); } catch (_) {}
+      throwIfAborted();
       if (errData && errData.error === 'USER_CONTEXT_MISMATCH') {
         route();
         throw new Error('登录账号已切换，页面已刷新，请重试');
       }
     }
-    if (resp.status === 401 && !opts.allow401) {
+    if (resp.status === 401 && !opts.allow401 && !(opts.signal && opts.signal.aborted)) {
       let errData = {};
       try { errData = await resp.json(); } catch (_) {}
+      // The signal can abort during body parsing; re-check before redirecting.
+      throwIfAborted();
       if (errData.error === 'SETUP_REQUIRED') {
         navigate('/setup', true);
       } else if (location.pathname !== '/login') {
@@ -865,21 +937,79 @@
     const pct = total > 0 ? Math.min(100, Math.round((read / total) * 100)) : 0;
     const score = typeof s.bgmScore === 'number' && s.bgmScore > 0 ? s.bgmScore.toFixed(1) : '';
     const sourceText = !libraryID ? librarySourceText(s.libraryId) : '';
+    const subText = origDiff || (s.oneshot ? '单本' : `共 ${total} 册`);
+    const subTooltip = origDiff && total > 0 ? `${origDiff} · 共 ${total} 册` : subText;
+    const href = mergedWorks() && s.bgmSubjectId && !s.oneshot
+      ? seriesVersionURL(s.id, libraryID)
+      : `/series/${encodeURIComponent(s.id)}`;
     return `
-      <a href="${mergedWorks() && s.bgmSubjectId && !s.oneshot ? seriesVersionURL(s.id, libraryID) : `/series/${encodeURIComponent(s.id)}`}" data-nav class="poster-card">
+      <a href="${href}" data-nav class="poster-card">
         <div class="poster-thumb">
           <img loading="lazy" src="/api/v1/series/${encodeURIComponent(s.id)}/thumbnail?v=${state.coverVer}" alt="${esc(title)}">
-          ${score ? `<span class="poster-badge-top-left">★ ${esc(score)}</span>` : ''}
-          ${unread > 0 ? `<span class="poster-badge-top-right">${unread}</span>` : ''}
-          ${read > 0 ? `<div class="poster-progress-bar"><span style="width:${pct}%"></span></div>` : ''}
+          ${score ? `<span class="poster-badge-top-left" title="Bangumi 评分 ${esc(score)}">★ ${esc(score)}</span>` : ''}
+          ${unread > 0 ? `<span class="poster-badge-top-right" title="${unread} 册未读">${unread}</span>` : ''}
+          ${read > 0 ? `<div class="poster-progress-bar" title="已读 ${read} / ${total} 册"><span style="width:${pct}%"></span></div>` : ''}
         </div>
         <div class="poster-body">
           <div class="poster-title" title="${esc(title)}">${esc(title)}</div>
-          <div class="poster-sub" title="${esc(origDiff || `${total} 册`)}">${esc(origDiff || (s.oneshot ? '单本' : `共 ${total} 册`))}</div>
+          <div class="poster-sub" title="${esc(subTooltip)}">${esc(subText)}</div>
           ${sourceText ? `<div class="poster-source" title="${esc(sourceText)}">${esc(sourceText)}</div>` : ''}
         </div>
       </a>
     `;
+  }
+
+  // A quiet placeholder grid used while the shelf list is still loading, so the
+  // first paint keeps the same rhythm as the real poster grid.
+  function posterSkeletonHTML(count = 12) {
+    const titleWidths = [84, 72, 90, 68];
+    const metaWidths = [48, 56, 42, 54];
+    const blocks = [];
+    for (let i = 0; i < Math.max(1, count); i += 1) {
+      const tw = titleWidths[i % titleWidths.length];
+      const mw = metaWidths[i % metaWidths.length];
+      blocks.push(`<div class="poster-card poster-card-skeleton" aria-hidden="true">
+        <div class="poster-thumb"></div>
+        <div class="poster-body">
+          <div class="skeleton-line skeleton-line-title" style="width:${tw}%"></div>
+          <div class="skeleton-line skeleton-line-meta" style="width:${mw}%"></div>
+        </div>
+      </div>`);
+    }
+    return blocks.join('');
+  }
+
+  function posterSkeletonGridHTML(count = 12) {
+    return `<div class="poster-grid" aria-hidden="true">${posterSkeletonHTML(count)}</div>`;
+  }
+
+  // Human-readable summaries for the currently applied shelf filters.
+  const FILTER_CHIP_DEFS = [
+    { key: 'q', label: '关键词' },
+    { key: 'read_status', label: '阅读', values: { UNREAD: '未读', IN_PROGRESS: '阅读中', READ: '已读完' } },
+    { key: 'scrape_status', label: '匹配', values: { matched: '已匹配', manual: '手动指定', unmatched: '未匹配', none: '尚未刮削', pending: '尚未刮削' } },
+    { key: 'oneshot', label: '形态', values: { true: '单本 One-Shot', false: '多卷系列' } },
+    { key: 'status', label: '连载', values: { ONGOING: '连载中', ENDED: '已完结', HIATUS: '休刊', ABANDONED: '中止' } },
+    { key: 'genre', label: '类型' },
+    { key: 'tag', label: '标签' },
+    { key: 'publisher', label: '出版社' },
+    { key: 'author', label: '作者' },
+  ];
+
+  function filterChipsHTML(sp) {
+    const chips = [];
+    for (const def of FILTER_CHIP_DEFS) {
+      const raw = (sp.get(def.key) || '').trim();
+      if (!raw) continue;
+      // Own-property lookup only: values such as `constructor`/`toString` must
+      // render as the raw filter value, never as inherited function source.
+      const text = def.values && Object.prototype.hasOwnProperty.call(def.values, raw)
+        ? def.values[raw]
+        : raw;
+      chips.push(`<button type="button" class="chip chip-removable" data-filter-clear="${esc(def.key)}" title="移除该筛选条件">${esc(def.label)}<strong>${esc(text)}</strong><span class="chip-x" aria-hidden="true">×</span></button>`);
+    }
+    if (chips.length > 1) chips.push('<button type="button" class="chip chip-clear" id="f-clear-all">清除全部</button>');
+    return chips.join('');
   }
 
   // --- Setup & Login Views ---
@@ -1018,12 +1148,23 @@
   function renderHome() {
     document.title = '书架 · MangaAlpha';
     const seq = routeSeq;
-    renderShell('home', `<section id="home-libs">正在读取书库…</section>
+    renderShell('home', `<div class="browse-head">
+        <div class="browse-heading">
+          <h1 class="browse-title">书架</h1>
+          <p class="browse-sub">继续上次的阅读进度，或从最近更新与最新入库里发现新作品。</p>
+        </div>
+      </div>
+      <section id="home-libs"><p class="list-status" role="status">正在读取书库…</p></section>
       <section id="home-continue" aria-live="polite"></section>
-      <section id="home-updated" aria-live="polite">正在加载最近更新…</section>
+      <section id="home-updated" aria-live="polite">
+        <div class="section-block">
+          <div class="section-head"><h2>最近更新</h2></div>
+          ${posterSkeletonGridHTML(8)}
+        </div>
+      </section>
       <section id="home-added" aria-live="polite"></section>`);
-    function load(slot, path, render) {
-      api(path).then((data) => {
+    function load(slot, fetchData, render) {
+      fetchData().then((data) => {
         if (seq !== routeSeq) return;
         const target = document.getElementById(slot);
         if (target) target.innerHTML = render(data);
@@ -1031,12 +1172,21 @@
         if (seq !== routeSeq) return;
         const target = document.getElementById(slot);
         if (!target) return;
-        target.innerHTML = `<div class="empty-box">${esc(err.message)} <button class="btn btn-sm">重试</button></div>`;
-        target.querySelector('button').onclick = () => load(slot, path, render);
+        target.innerHTML = `<div class="empty-box">${esc(err.message)} <button type="button" class="btn btn-sm">重试</button></div>`;
+        target.querySelector('button').onclick = () => load(slot, fetchData, render);
       });
     }
     const seriesURL = mergedWorks() ? '/admin/api/bookshelf/series?merge_bangumi=1&' : '/api/v1/series?';
-    load('home-libs', '/api/v1/libraries', (libs) => {
+    let initialLibsPromise = api('/api/v1/libraries');
+    const libsReady = initialLibsPromise.then((libs) => {
+      if (seq === routeSeq) state.libraries = libs || [];
+      return libs || [];
+    }).catch(() => state.libraries || []);
+    load('home-libs', () => {
+      const p = initialLibsPromise || api('/api/v1/libraries');
+      initialLibsPromise = null;
+      return p;
+    }, (libs) => {
       state.libraries = libs || [];
       let html = '';
       if (state.libraries.length === 0) {
@@ -1077,7 +1227,7 @@
 
       return html;
     });
-    load('home-continue', '/api/v1/books?read_status=IN_PROGRESS&sort=readProgress.readDate,desc&size=' + displayPref('homeContinueSize'), (res) => {
+    load('home-continue', () => api('/api/v1/books?read_status=IN_PROGRESS&sort=readProgress.readDate,desc&size=' + displayPref('homeContinueSize')), (res) => {
       const contBooks = res?.content || [];
       let html = '';
       if (contBooks.length > 0) {
@@ -1110,7 +1260,7 @@
 
       return html;
     });
-    load('home-updated', seriesURL + 'sort=lastModifiedDate,desc&size=' + displayPref('homeUpdatedSize'), (res) => {
+    load('home-updated', () => Promise.all([api(seriesURL + 'sort=lastModifiedDate,desc&size=' + displayPref('homeUpdatedSize')), libsReady]).then(([data]) => data), (res) => {
       const updatedList = res?.content || [];
       let html = '';
       if (updatedList.length > 0) {
@@ -1126,7 +1276,7 @@
 
       return html;
     });
-    load('home-added', seriesURL + 'sort=createdDate,desc&size=' + displayPref('homeAddedSize'), (res) => {
+    load('home-added', () => Promise.all([api(seriesURL + 'sort=createdDate,desc&size=' + displayPref('homeAddedSize')), libsReady]).then(([data]) => data), (res) => {
       const addedList = res?.content || [];
       let html = '';
       if (addedList.length > 0) {
@@ -1148,6 +1298,7 @@
 
   async function renderLibraries(libraryID) {
     const seq = routeSeq;
+    teardownShelfObserver();
     const sp = new URLSearchParams(location.search);
     const q = sp.get('q') || '';
     const readStatus = sp.get('read_status') || '';
@@ -1159,15 +1310,61 @@
     const publisher = sp.get('publisher') || '';
     const author = sp.get('author') || '';
     const sort = sp.get('sort') || 'lastModifiedDate,desc';
-    const page = Math.max(0, parseInt(sp.get('page') || '0', 10) || 0);
+    // Match the backend (`strings.Contains(strings.ToLower(strings.TrimSpace(sort)), "random")`)
+    // so variants like `Random` or `random,desc` also use `ORDER BY RANDOM()`.
+    // Such sorts reshuffle on every request, so appending pages would silently
+    // drop works that were never sampled while the footer still claimed
+    // "loaded everything". Random roaming stays on plain pagination.
+    const isRandomSort = sort.trim().toLowerCase().includes('random');
+    const infiniteEnabled = Boolean(displayPref('shelfInfiniteScroll'));
+    const infinite = infiniteEnabled && !isRandomSort;
+    const rawPage = Math.max(0, parseInt(sp.get('page') || '0', 10) || 0);
+    const page = infinite ? 0 : rawPage;
     const size = displayPref('shelfPageSize');
+    const shelfUserId = (state.auth && state.auth.userId) || '';
+
+    const buildURL = (overrides = {}) => {
+      const nextLib = overrides.libraryID !== undefined ? overrides.libraryID : libraryID;
+      const base = nextLib ? `/libraries/${encodeURIComponent(nextLib)}` : '/libraries';
+      const nextSp = new URLSearchParams(location.search);
+      Object.entries(overrides).forEach(([k, v]) => {
+        if (k === 'libraryID') return;
+        if (v === '' || v === null || v === undefined) nextSp.delete(k);
+        else nextSp.set(k, String(v));
+      });
+      if (overrides.page === undefined) nextSp.delete('page');
+      const qs = nextSp.toString();
+      return qs ? `${base}?${qs}` : base;
+    };
 
     document.title = '浏览书库 · MangaAlpha';
+    // Cards already in the DOM were rendered for one specific account. A sibling
+    // tab can switch users, so reuse them only for that same user and fall back
+    // to the skeleton otherwise — never hand another account's titles over.
     const oldList = document.getElementById('library-cards');
-    const currentCards = oldList?.innerHTML || document.getElementById('library-updating')?.innerHTML || '';
+    const staleList = document.getElementById('library-updating');
+    const cardsOwner = oldList?.getAttribute('data-user-id') ?? staleList?.getAttribute('data-user-id') ?? null;
+    // Fail closed on an empty userId: an old `data-user-id=""` grid is not a
+    // safe preview for any account.
+    const currentCards = Boolean(shelfUserId) && cardsOwner === shelfUserId
+      ? (oldList?.innerHTML || staleList?.innerHTML || '')
+      : '';
     renderShell('libraries', currentCards
-      ? `<p id="library-list-status" role="status">正在更新列表…</p><div id="library-updating" class="poster-grid" style="opacity:.5" inert>${currentCards}</div>`
-      : '<p id="library-list-status" role="status">正在加载漫画列表…</p>', q);
+      ? `<p id="library-list-status" class="list-status" role="status">正在更新列表…</p><div id="library-updating" class="poster-grid poster-grid-stale" data-user-id="${esc(shelfUserId)}" inert>${currentCards}</div>`
+      : `<p id="library-list-status" class="visually-hidden" role="status">正在加载漫画列表…</p><div id="library-skeleton" class="poster-grid" aria-hidden="true">${posterSkeletonHTML(12)}</div>`, q);
+
+    // Abort the request when the route or the filters change, so a slow page
+    // cannot land on a newer view (or trip the global 401 redirect) after the
+    // user has already navigated away.
+    const shelfAbort = typeof AbortController === 'function' ? new AbortController() : null;
+    if (shelfAbort) state.shelfAbort = shelfAbort;
+    // Always build the opts object (even without AbortController) so every shelf
+    // read carries the current user id. auth.go rejects a stale X-FK115-User-Id
+    // with 409 USER_CONTEXT_MISMATCH after a cross-tab account switch instead of
+    // letting another account's titles land in this DOM.
+    const apiOpts = {};
+    if (shelfAbort) apiOpts.signal = shelfAbort.signal;
+    if (shelfUserId) apiOpts.headers = { 'X-FK115-User-Id': shelfUserId };
 
     try {
       const apiParams = new URLSearchParams();
@@ -1193,38 +1390,44 @@
         ['f-pub', '/api/v1/publishers', '出版社', publisher],
       ].map(async ([id, path, label, selected]) => {
         try {
-          const values = await api(path);
+          const values = await api(path, apiOpts);
           return [id, label, selected, values || [], false];
         } catch (_) {
           return [id, label, selected, [], true];
         }
       });
-      const [libs, res] = await Promise.all([api('/api/v1/libraries'), api(`${seriesPath}?${apiParams.toString()}`)]);
+      const [libs, res] = await Promise.all([
+        api('/api/v1/libraries', apiOpts),
+        api(`${seriesPath}?${apiParams.toString()}`, apiOpts),
+      ]);
       if (seq !== routeSeq) return;
+      if (infinite && sp.has('page') && typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+        history.replaceState(null, '', buildURL({}));
+      }
       state.libraries = libs || [];
       const items = (res && res.content) || [];
       const totalElements = Number((res && res.totalElements) || 0);
       const totalPages = Number((res && res.totalPages) || 0);
 
-      const buildURL = (overrides) => {
-        const nextLib = overrides.libraryID !== undefined ? overrides.libraryID : libraryID;
-        const base = nextLib ? `/libraries/${encodeURIComponent(nextLib)}` : '/libraries';
-        const nextSp = new URLSearchParams(location.search);
-        Object.entries(overrides).forEach(([k, v]) => {
-          if (k === 'libraryID') return;
-          if (v === '' || v === null || v === undefined) nextSp.delete(k);
-          else nextSp.set(k, String(v));
-        });
-        if (overrides.page === undefined) nextSp.delete('page');
-        const qs = nextSp.toString();
-        return qs ? `${base}?${qs}` : base;
-      };
-
       const content = document.getElementById('page-content');
       if (!content) return;
+      const activeLib = state.libraries.find((l) => l.id === libraryID);
+      const chipsHTML = filterChipsHTML(sp);
+      const outOfRangePage = !infinite && items.length === 0 && totalElements > 0 && page > 0;
+      const libraryTitle = activeLib ? activeLib.name : '浏览书库';
+      const modeLabel = infinite
+        ? '无限滚动'
+        : (isRandomSort && infiniteEnabled ? '随机漫游 · 分页浏览' : '分页浏览');
       content.innerHTML = `
-        <div class="section-block" style="margin-bottom:16px">
-          <div class="lib-strip">
+        <div class="browse-head">
+          <div class="browse-heading">
+            <div class="browse-title-row">
+              <h1 class="browse-title">${esc(libraryTitle)}</h1>
+              <span class="browse-count" id="shelf-count">共 <strong>${totalElements.toLocaleString()}</strong> 部作品</span>
+            </div>
+            <p class="browse-sub">${chipsHTML ? (activeLib ? '当前书库筛选结果' : '全部书库筛选结果') : (activeLib ? '当前书库内的全部作品' : '全部已启用书库')} · 每页 ${size} 部 · ${modeLabel}</p>
+          </div>
+          <div class="lib-strip" role="navigation" aria-label="书库切换">
             <a href="${esc(buildURL({ libraryID: '' }))}" data-nav class="lib-pill ${!libraryID ? 'active' : ''}">全部书库</a>
             ${state.libraries.map((l) => `
               <a href="${esc(buildURL({ libraryID: l.id }))}" data-nav class="lib-pill ${libraryID === l.id ? 'active' : ''}">
@@ -1235,80 +1438,129 @@
           </div>
         </div>
 
-        <div class="filter-panel">
-          <div class="filter-row">
-            <input type="text" id="f-q" class="filter-search-input" placeholder="关键词（中文译名 / 原文件夹名 / 别名 / 作者）" value="${esc(q)}">
-            <select id="f-sort">
-              <option value="lastModifiedDate,desc" ${sort === 'lastModifiedDate,desc' ? 'selected' : ''}>按最近更新</option>
-              <option value="createdDate,desc" ${sort === 'createdDate,desc' ? 'selected' : ''}>按最新入库</option>
-              <option value="metadata.titleSort,asc" ${sort === 'metadata.titleSort,asc' ? 'selected' : ''}>按标题 A-Z</option>
-              <option value="bgmRank,asc" ${sort === 'bgmRank,asc' ? 'selected' : ''}>按 Bangumi 排名</option>
-              <option value="bgmScore,desc" ${sort === 'bgmScore,desc' ? 'selected' : ''}>按 Bangumi 评分</option>
-              <option value="random" ${sort === 'random' ? 'selected' : ''}>随机漫游</option>
-            </select>
-            <select id="f-read">
-              <option value="">阅读：全部</option>
-              <option value="UNREAD" ${readStatus === 'UNREAD' ? 'selected' : ''}>未读</option>
-              <option value="IN_PROGRESS" ${readStatus === 'IN_PROGRESS' ? 'selected' : ''}>阅读中</option>
-              <option value="READ" ${readStatus === 'READ' ? 'selected' : ''}>已读完</option>
-            </select>
-            <select id="f-scrape">
-              <option value="">匹配：全部</option>
-              <option value="matched" ${scrapeStatus === 'matched' ? 'selected' : ''}>已匹配</option>
-              <option value="manual" ${scrapeStatus === 'manual' ? 'selected' : ''}>手动指定</option>
-              <option value="unmatched" ${scrapeStatus === 'unmatched' ? 'selected' : ''}>未匹配</option>
-              <option value="none" ${(scrapeStatus === 'none' || scrapeStatus === 'pending') ? 'selected' : ''}>尚未刮削</option>
-            </select>
-            <select id="f-oneshot">
-              <option value="">形态：全部</option>
-              <option value="false" ${oneshot === 'false' ? 'selected' : ''}>多卷系列</option>
-              <option value="true" ${oneshot === 'true' ? 'selected' : ''}>单本 One-Shot</option>
-            </select>
-          </div>
-          <div class="filter-row">
-            <select id="f-status">
-              <option value="">连载：全部</option>
-              <option value="ONGOING" ${seriesStatus === 'ONGOING' ? 'selected' : ''}>连载中</option>
-              <option value="ENDED" ${seriesStatus === 'ENDED' ? 'selected' : ''}>已完结</option>
-              <option value="HIATUS" ${seriesStatus === 'HIATUS' ? 'selected' : ''}>休刊</option>
-              <option value="ABANDONED" ${seriesStatus === 'ABANDONED' ? 'selected' : ''}>中止</option>
-            </select>
-            <select id="f-genre" disabled>
-              <option value="">类型加载中…</option>
-              ${genre ? `<option value="${esc(genre)}" selected>${esc(genre)}</option>` : ''}
-            </select>
-            <select id="f-tag" disabled>
-              <option value="">标签加载中…</option>
-              ${tag ? `<option value="${esc(tag)}" selected>${esc(tag)}</option>` : ''}
-            </select>
-            <select id="f-pub" disabled>
-              <option value="">出版社加载中…</option>
-              ${publisher ? `<option value="${esc(publisher)}" selected>${esc(publisher)}</option>` : ''}
-            </select>
-            <input type="text" id="f-author" class="filter-author-input" placeholder="作者筛选" value="${esc(author)}">
-            <button type="button" class="btn btn-primary btn-sm" id="f-apply">筛选</button>
-            <button type="button" class="btn btn-sm" id="f-reset">重置</button>
-            <div class="filter-merge-wrap">
-              <label class="check-row filter-merge-toggle" title="仅网页书架生效，第三方客户端仍独立展示，不改卷列表与阅读进度">
-                <input type="checkbox" id="f-merge-bgm" ${mergedWorks() ? 'checked' : ''}>
-                <span>合并相同 Bangumi ID</span>
-              </label>
-              <span class="filter-merge-hint">（仅网页书架生效，第三方客户端仍独立展示）</span>
+        <form class="filter-panel" id="filter-form" role="search">
+          <div class="filter-search-row">
+            <label class="filter-search-box">
+              <span class="filter-search-icon" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+              </span>
+              <input type="search" id="f-q" class="filter-search-input" aria-label="搜索书名、原文件夹名、别名或作者" placeholder="搜索书名、原文件夹名、别名或作者…" value="${esc(q)}" autocomplete="off">
+            </label>
+            <label class="filter-field filter-field-sort">
+              <span class="filter-label">排序</span>
+              <select id="f-sort">
+                <option value="lastModifiedDate,desc" ${sort === 'lastModifiedDate,desc' ? 'selected' : ''}>最近更新</option>
+                <option value="createdDate,desc" ${sort === 'createdDate,desc' ? 'selected' : ''}>最新入库</option>
+                <option value="metadata.titleSort,asc" ${sort === 'metadata.titleSort,asc' ? 'selected' : ''}>标题 A-Z</option>
+                <option value="bgmRank,asc" ${sort === 'bgmRank,asc' ? 'selected' : ''}>Bangumi 排名</option>
+                <option value="bgmScore,desc" ${sort === 'bgmScore,desc' ? 'selected' : ''}>Bangumi 评分</option>
+                <option value="random" ${isRandomSort ? 'selected' : ''}>随机漫游</option>
+              </select>
+            </label>
+            <div class="filter-actions">
+              <button type="submit" class="btn btn-primary" id="f-apply">筛选</button>
+              <button type="button" class="btn" id="f-reset">重置</button>
             </div>
-            <span class="filter-count" style="margin-left:auto;color:var(--text-muted);font-size:12.5px">共 ${totalElements.toLocaleString()} 部作品</span>
           </div>
-        </div>
+          <div class="filter-grid">
+            <label class="filter-field">
+              <span class="filter-label">阅读</span>
+              <select id="f-read">
+                <option value="">全部</option>
+                <option value="UNREAD" ${readStatus === 'UNREAD' ? 'selected' : ''}>未读</option>
+                <option value="IN_PROGRESS" ${readStatus === 'IN_PROGRESS' ? 'selected' : ''}>阅读中</option>
+                <option value="READ" ${readStatus === 'READ' ? 'selected' : ''}>已读完</option>
+              </select>
+            </label>
+            <label class="filter-field">
+              <span class="filter-label">匹配</span>
+              <select id="f-scrape">
+                <option value="">全部</option>
+                <option value="matched" ${scrapeStatus === 'matched' ? 'selected' : ''}>已匹配</option>
+                <option value="manual" ${scrapeStatus === 'manual' ? 'selected' : ''}>手动指定</option>
+                <option value="unmatched" ${scrapeStatus === 'unmatched' ? 'selected' : ''}>未匹配</option>
+                <option value="none" ${(scrapeStatus === 'none' || scrapeStatus === 'pending') ? 'selected' : ''}>尚未刮削</option>
+              </select>
+            </label>
+            <label class="filter-field">
+              <span class="filter-label">形态</span>
+              <select id="f-oneshot">
+                <option value="">全部</option>
+                <option value="false" ${oneshot === 'false' ? 'selected' : ''}>多卷系列</option>
+                <option value="true" ${oneshot === 'true' ? 'selected' : ''}>单本 One-Shot</option>
+              </select>
+            </label>
+            <label class="filter-field">
+              <span class="filter-label">连载</span>
+              <select id="f-status">
+                <option value="">全部</option>
+                <option value="ONGOING" ${seriesStatus === 'ONGOING' ? 'selected' : ''}>连载中</option>
+                <option value="ENDED" ${seriesStatus === 'ENDED' ? 'selected' : ''}>已完结</option>
+                <option value="HIATUS" ${seriesStatus === 'HIATUS' ? 'selected' : ''}>休刊</option>
+                <option value="ABANDONED" ${seriesStatus === 'ABANDONED' ? 'selected' : ''}>中止</option>
+              </select>
+            </label>
+            <label class="filter-field">
+              <span class="filter-label">类型</span>
+              <select id="f-genre" disabled>
+                <option value="">全部</option>
+                ${genre ? `<option value="${esc(genre)}" selected>${esc(genre)}</option>` : ''}
+              </select>
+            </label>
+            <label class="filter-field">
+              <span class="filter-label">标签</span>
+              <select id="f-tag" disabled>
+                <option value="">全部</option>
+                ${tag ? `<option value="${esc(tag)}" selected>${esc(tag)}</option>` : ''}
+              </select>
+            </label>
+            <label class="filter-field">
+              <span class="filter-label">出版社</span>
+              <select id="f-pub" disabled>
+                <option value="">全部</option>
+                ${publisher ? `<option value="${esc(publisher)}" selected>${esc(publisher)}</option>` : ''}
+              </select>
+            </label>
+            <label class="filter-field">
+              <span class="filter-label">作者</span>
+              <input type="text" id="f-author" class="filter-author-input" placeholder="全部作者" value="${esc(author)}" autocomplete="off">
+            </label>
+          </div>
+          <div class="filter-foot">
+            ${chipsHTML ? `<div class="filter-chips" id="f-active">${chipsHTML}</div>` : '<div class="filter-chips" id="f-active"></div>'}
+            <label class="pref-toggle pref-toggle-inline filter-merge-toggle" for="f-merge-bgm" title="仅网页书架生效，第三方客户端仍独立展示，不改卷列表与阅读进度">
+              <span class="pref-toggle-text">
+                <strong>合并相同 Bangumi ID</strong>
+                <span class="filter-merge-hint">（仅网页书架生效，第三方客户端仍独立展示）</span>
+              </span>
+              <span class="switch">
+                <input type="checkbox" id="f-merge-bgm" ${mergedWorks() ? 'checked' : ''}>
+                <span class="switch-track" aria-hidden="true"></span>
+              </span>
+            </label>
+          </div>
+        </form>
 
         ${items.length > 0
-          ? `<div class="poster-grid" id="library-cards">${items.map((item) => seriesCardHTML(item, libraryID)).join('')}</div>`
-          : `<div class="empty-box">没有找到符合筛选条件的漫画作品。</div>`}
-
-        ${totalPages > 1 ? `
-          <div class="pagination">
-            <button type="button" class="btn btn-sm" id="pg-prev" ${page <= 0 ? 'disabled' : ''}>上一页</button>
-            <span style="color:var(--text-secondary)">第 ${page + 1} / ${totalPages} 页</span>
-            <button type="button" class="btn btn-sm" id="pg-next" ${page + 1 >= totalPages ? 'disabled' : ''}>下一页</button>
-          </div>` : ''}
+          ? `<div class="poster-grid" id="library-cards" data-user-id="${esc(shelfUserId)}">${items.map((item) => seriesCardHTML(item, libraryID)).join('')}</div>
+             ${infinite
+               ? '<div class="shelf-status" id="shelf-load-status" role="status" aria-live="polite"></div><div class="shelf-sentinel" id="shelf-sentinel" aria-hidden="true"></div>'
+               : (totalPages > 1 ? `
+                  <nav class="pagination" aria-label="分页">
+                    <button type="button" class="btn" id="pg-prev" ${page <= 0 ? 'disabled' : ''}>← 上一页</button>
+                    <span class="pagination-info">第 <strong>${page + 1}</strong> / ${totalPages} 页</span>
+                    <button type="button" class="btn" id="pg-next" ${page + 1 >= totalPages ? 'disabled' : ''}>下一页 →</button>
+                  </nav>` : '')}`
+          : `<div class="empty-box shelf-empty-box">
+              <p>${outOfRangePage
+                ? '当前页码超出范围，可返回第一页查看作品。'
+                : chipsHTML
+                  ? '没有找到符合筛选条件的漫画作品，试试放宽筛选条件。'
+                  : (activeLib ? `「${esc(activeLib.name)}」暂无可展示的漫画作品。` : '当前书架暂无可展示的漫画作品。')}</p>
+              ${outOfRangePage
+                ? '<button type="button" class="btn btn-sm btn-primary" id="empty-reset">返回第一页</button>'
+                : (chipsHTML ? '<button type="button" class="btn btn-sm" id="empty-reset">清除筛选条件</button>' : '')}
+            </div>`}
       `;
 
       const applyFilters = () => {
@@ -1325,16 +1577,19 @@
           author: document.getElementById('f-author').value.trim(),
         }));
       };
-      document.getElementById('f-apply').onclick = applyFilters;
-      document.getElementById('f-q').addEventListener('keydown', (e) => { if (e.key === 'Enter') applyFilters(); });
-      document.getElementById('f-author').addEventListener('keydown', (e) => { if (e.key === 'Enter') applyFilters(); });
+      const filterForm = document.getElementById('filter-form');
+      if (filterForm) filterForm.onsubmit = (e) => { e.preventDefault(); applyFilters(); };
       ['f-sort', 'f-read', 'f-scrape', 'f-oneshot', 'f-status', 'f-genre', 'f-tag', 'f-pub'].forEach((id) => {
-        document.getElementById(id).onchange = applyFilters;
+        const select = document.getElementById(id);
+        if (select) select.onchange = applyFilters;
       });
-      document.getElementById('f-merge-bgm').onchange = (e) => {
-        localStorage.setItem('fk115_merge_bangumi', e.target.checked ? '1' : '0');
-        navigate(buildURL({}), true);
-      };
+      const mergeToggle = document.getElementById('f-merge-bgm');
+      if (mergeToggle) {
+        mergeToggle.onchange = (e) => {
+          localStorage.setItem('fk115_merge_bangumi', e.target.checked ? '1' : '0');
+          navigate(buildURL({}), true);
+        };
+      }
       filters.forEach(async (loaded) => {
         const [id, label, selected, values, failed] = await loaded;
         if (seq !== routeSeq) return;
@@ -1342,22 +1597,198 @@
         if (!select) return;
         const choices = values.slice(0, id === 'f-genre' ? undefined : 150);
         if (selected && !choices.includes(selected)) choices.unshift(selected);
-        select.innerHTML = `<option value="">${label}：${failed ? '加载失败' : '全部'}</option>` +
+        select.innerHTML = `<option value="">${failed ? '加载失败' : '全部'}</option>` +
           choices.map((v) => `<option value="${esc(v)}" ${v === selected ? 'selected' : ''}>${esc(v)}</option>`).join('');
         select.disabled = failed && !selected;
       });
-      document.getElementById('f-reset').onclick = () => {
-        navigate(libraryID ? `/libraries/${encodeURIComponent(libraryID)}` : '/libraries');
-      };
-      if (totalPages > 1) {
-        document.getElementById('pg-prev').onclick = () => navigate(buildURL({ page: page - 1 }));
-        document.getElementById('pg-next').onclick = () => navigate(buildURL({ page: page + 1 }));
+      content.querySelectorAll('[data-filter-clear]').forEach((button) => {
+        button.onclick = () => navigate(buildURL({ [button.getAttribute('data-filter-clear')]: '' }));
+      });
+      const clearAll = document.getElementById('f-clear-all');
+      if (clearAll) {
+        clearAll.onclick = () => navigate(libraryID ? `/libraries/${encodeURIComponent(libraryID)}` : '/libraries');
+      }
+      const resetBtn = document.getElementById('f-reset');
+      if (resetBtn) {
+        resetBtn.onclick = () => navigate(libraryID ? `/libraries/${encodeURIComponent(libraryID)}` : '/libraries');
+      }
+      const emptyReset = document.getElementById('empty-reset');
+      if (emptyReset) {
+        emptyReset.onclick = () => navigate(outOfRangePage ? buildURL({}) : (libraryID ? `/libraries/${encodeURIComponent(libraryID)}` : '/libraries'));
+      }
+      // Out-of-range pages render the empty box instead of the pager, so the
+      // buttons may legitimately be absent here.
+      if (!infinite && totalPages > 1) {
+        const prevBtn = document.getElementById('pg-prev');
+        const nextBtn = document.getElementById('pg-next');
+        if (prevBtn) prevBtn.onclick = () => navigate(buildURL({ page: page - 1 }));
+        if (nextBtn) nextBtn.onclick = () => navigate(buildURL({ page: page + 1 }));
+      }
+
+      // Infinite scroll mode: keep the address bar on the first page and append
+      // subsequent pages as the sentinel below the grid becomes visible. The
+      // route sequence guards against filters/navigation changing mid-request.
+      if (infinite && items.length > 0) {
+        const seenIDs = new Set(items.map((item) => item && item.id).filter(Boolean));
+        let loadedCount = items.length;
+        let currentTotal = totalElements;
+        let nextPage = page + 1;
+        let loading = false;
+        // Set while the error banner is showing so a stray intersection cannot
+        // silently re-fire the failing request behind the "重试" button.
+        let paused = false;
+        let done = totalElements === 0 || nextPage >= totalPages;
+        const useObserver = typeof IntersectionObserver === 'function';
+        const status = document.getElementById('shelf-load-status');
+        const countChip = document.getElementById('shelf-count');
+        const grid = document.getElementById('library-cards');
+        const sentinel = document.getElementById('shelf-sentinel');
+        let observer = null;
+
+        const updateCountChip = () => {
+          if (countChip) {
+            countChip.innerHTML = `共 <strong>${currentTotal.toLocaleString()}</strong> 部作品`;
+          }
+        };
+
+        const sentinelNearViewport = () => {
+          if (!sentinel || !sentinel.isConnected || typeof sentinel.getBoundingClientRect !== 'function') return false;
+          const viewH = window.innerHeight || document.documentElement?.clientHeight || 0;
+          return sentinel.getBoundingClientRect().top <= viewH + 800;
+        };
+
+        const stopObserver = () => {
+          if (!observer) return;
+          // Only clear the shared reference if it is still ours: a delayed
+          // callback from an old route must not blank the new route's observer.
+          if (state.shelfObserver === observer) state.shelfObserver = null;
+          try { observer.disconnect(); } catch (_) {}
+          observer = null;
+        };
+
+        const pauseObserver = () => {
+          paused = true;
+          if (observer && sentinel && typeof observer.unobserve === 'function') {
+            try { observer.unobserve(sentinel); } catch (_) {}
+          }
+        };
+
+        const resumeObserver = () => {
+          paused = false;
+          if (!observer || done) return;
+          if (sentinel && typeof observer.observe === 'function') {
+            try { observer.observe(sentinel); } catch (_) {}
+          }
+        };
+
+        const showLoaded = () => {
+          if (!status) return;
+          const topBtn = nextPage > 1
+            ? '<button type="button" class="btn btn-sm shelf-top-btn" id="shelf-back-top">↑ 回到顶部</button>'
+            : '';
+          if (done) {
+            status.innerHTML = `<span class="shelf-status-pill">已加载全部 <strong>${loadedCount.toLocaleString()}</strong> 部作品</span>${topBtn}`;
+          } else if (useObserver) {
+            status.innerHTML = `<span class="shelf-status-pill">已加载 <strong>${loadedCount.toLocaleString()}</strong> / ${currentTotal.toLocaleString()} 部作品 · 继续下滑自动加载</span>${topBtn}`;
+          } else {
+            status.innerHTML = `<span class="shelf-status-pill">已加载 <strong>${loadedCount.toLocaleString()}</strong> / ${currentTotal.toLocaleString()} 部作品</span><button type="button" class="btn btn-sm" id="shelf-load-more">加载更多</button>${topBtn}`;
+            const moreBtn = document.getElementById('shelf-load-more');
+            if (moreBtn) moreBtn.onclick = loadMore;
+          }
+          const backTop = document.getElementById('shelf-back-top');
+          if (backTop) {
+            backTop.onclick = () => {
+              const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+              window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
+            };
+          }
+        };
+
+        const loadMore = async () => {
+          if (loading || done) return;
+          loading = true;
+          paused = false;
+          let shouldContinue = false;
+          if (status) {
+            status.innerHTML = '<span class="shelf-status-pill shelf-status-loading"><span class="spinner spinner-sm" aria-hidden="true"></span> 正在加载更多…</span>';
+          }
+          try {
+            const moreParams = new URLSearchParams(apiParams);
+            moreParams.set('page', String(nextPage));
+            const more = await api(`${seriesPath}?${moreParams.toString()}`, apiOpts);
+            if (seq !== routeSeq) return;
+            const moreItems = (more && more.content) || [];
+            if (more && typeof more.totalElements === 'number' && Number.isFinite(more.totalElements)) {
+              currentTotal = more.totalElements;
+              updateCountChip();
+            }
+            const freshItems = moreItems.filter((item) => {
+              if (!item || !item.id) return true;
+              if (seenIDs.has(item.id)) return false;
+              seenIDs.add(item.id);
+              return true;
+            });
+            if (grid && freshItems.length > 0) {
+              grid.insertAdjacentHTML('beforeend', freshItems.map((item) => seriesCardHTML(item, libraryID)).join(''));
+              loadedCount += freshItems.length;
+            }
+            const morePages = more && typeof more.totalPages === 'number' ? more.totalPages : totalPages;
+            nextPage += 1;
+            done = moreItems.length === 0 || nextPage >= morePages;
+            if (done) stopObserver();
+            showLoaded();
+            shouldContinue = !done && moreItems.length > 0 && useObserver;
+          } catch (err) {
+            if (seq !== routeSeq || isAbortError(err)) return;
+            if (status) {
+              status.innerHTML = `<span class="shelf-status-error">加载失败：${esc(err.message)}</span><button type="button" class="btn btn-sm">重试</button>`;
+              const retry = status.querySelector('button');
+              if (retry) {
+                retry.onclick = () => {
+                  status.innerHTML = '';
+                  resumeObserver();
+                  loadMore();
+                };
+              }
+            }
+            pauseObserver();
+          } finally {
+            loading = false;
+          }
+          if (shouldContinue && seq === routeSeq) {
+            const scheduleNext = typeof window.requestAnimationFrame === 'function'
+              ? window.requestAnimationFrame.bind(window)
+              : (cb) => setTimeout(cb, 0);
+            scheduleNext(() => {
+              if (seq === routeSeq && !loading && !done && !paused && sentinelNearViewport()) {
+                loadMore();
+              }
+            });
+          }
+        };
+        showLoaded();
+        if (!done && sentinel && useObserver) {
+          observer = new IntersectionObserver((entries) => {
+            if (seq !== routeSeq) {
+              stopObserver();
+              return;
+            }
+            if (paused) return;
+            if (entries.some((entry) => entry.isIntersecting)) loadMore();
+          }, { rootMargin: '800px 0px' });
+          observer.observe(sentinel);
+          state.shelfObserver = observer;
+        }
       }
     } catch (err) {
-      if (seq !== routeSeq) return;
+      if (seq !== routeSeq || isAbortError(err)) return;
+      const skeleton = document.getElementById('library-skeleton');
+      if (skeleton) skeleton.remove();
       const status = document.getElementById('library-list-status');
       if (status) {
-        status.innerHTML = `列表加载失败：${esc(err.message)} <button type="button" class="btn btn-sm">重试</button>`;
+        const isInitial = !document.getElementById('library-updating');
+        status.className = isInitial ? 'empty-box shelf-empty-box' : 'list-status list-status-error';
+        status.innerHTML = `<p>列表加载失败：${esc(err.message)}</p><button type="button" class="btn btn-sm btn-primary">重试</button>`;
         status.querySelector('button').onclick = () => renderLibraries(libraryID);
       }
     }
@@ -8044,6 +8475,7 @@
   let routeSeq = 0;
   async function route() {
     const seq = ++routeSeq;
+    teardownShelfObserver();
     closeConfirmModal(false);
     try {
       const st = await api('/admin/api/auth/status', { allow401: true });
