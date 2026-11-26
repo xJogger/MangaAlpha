@@ -167,16 +167,24 @@ func ParseSQLiteBlobCoverRef(raw string) (sourceID, kind, recordID string, ok bo
 }
 
 func openKomgaReadOnlySQLite(dbPath string) (*sql.DB, error) {
+	db, _, err := openKomgaSQLiteSnapshot(dbPath)
+	return db, err
+}
+
+// openKomgaSQLiteSnapshot reports when a pending WAL could not be read and
+// the returned database contains only checkpointed data.
+func openKomgaSQLiteSnapshot(dbPath string) (*sql.DB, bool, error) {
 	if strings.TrimSpace(dbPath) == "" {
-		return nil, errors.New("sqlite path must not be empty")
+		return nil, false, errors.New("sqlite path must not be empty")
 	}
 	hasWAL, _ := DetectSQLiteWALWarning(dbPath)
 	if hasWAL && fileReadable(dbPath+"-wal") && fileReadable(dbPath+"-shm") {
 		if db, err := openReadOnlySQLiteWithMode(dbPath, false); err == nil {
-			return db, nil
+			return db, false, nil
 		}
 	}
-	return openReadOnlySQLiteWithMode(dbPath, true)
+	db, err := openReadOnlySQLiteWithMode(dbPath, true)
+	return db, hasWAL, err
 }
 
 func fileReadable(path string) bool {
@@ -194,11 +202,15 @@ func openReadOnlySQLiteWithMode(path string, immutable bool) (*sql.DB, error) {
 		return nil, err
 	}
 	uriPath := filepath.ToSlash(abs)
+	uriPath = strings.ReplaceAll(uriPath, "%", "%25")
 	uriPath = strings.ReplaceAll(uriPath, "?", "%3F")
 	uriPath = strings.ReplaceAll(uriPath, "#", "%23")
 	dsn := "file:" + uriPath + "?mode=ro"
 	if immutable {
 		dsn += "&immutable=1"
+	} else {
+		// SQLite must open the existing WAL index read-only as well.
+		dsn += "&readonly_shm=1"
 	}
 	dsn += "&_pragma=query_only(1)"
 	db, err := sql.Open("sqlite", dsn)
@@ -207,7 +219,9 @@ func openReadOnlySQLiteWithMode(path string, immutable bool) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(2)
-	if err := db.Ping(); err != nil {
+	// Force SQLite to read the database schema and acquire a WAL snapshot.
+	var count int
+	if err := db.QueryRow("SELECT count(*) FROM sqlite_schema").Scan(&count); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -219,7 +233,7 @@ func hasKomgaRequiredTables(tables map[string]bool) bool {
 }
 
 // DetectKomgaSchema validates required Komga tables and discovers optional subtables.
-func DetectKomgaSchema(ctx context.Context, db *sql.DB) (KomgaSchemaInfo, error) {
+func DetectKomgaSchema(ctx context.Context, db sqliteQueryer) (KomgaSchemaInfo, error) {
 	if db == nil {
 		return KomgaSchemaInfo{}, errors.New("sqlite db must not be nil")
 	}
@@ -254,7 +268,7 @@ func ReadKomgaSeries(ctx context.Context, db *sql.DB, seriesID string) (*KomgaSe
 	if err != nil {
 		return nil, err
 	}
-	entries, err := queryKomgaSeries(ctx, db, schemaInfo, seriesID)
+	entries, err := queryKomgaSeries(ctx, db, schemaInfo, seriesID, true)
 	if err != nil {
 		return nil, err
 	}
@@ -270,10 +284,10 @@ func ReadKomgaAllSeries(ctx context.Context, db *sql.DB) ([]KomgaSeriesEntry, er
 	if err != nil {
 		return nil, err
 	}
-	return queryKomgaSeries(ctx, db, schemaInfo, "")
+	return queryKomgaSeries(ctx, db, schemaInfo, "", true)
 }
 
-func queryKomgaSeries(ctx context.Context, db *sql.DB, info KomgaSchemaInfo, onlySeriesID string) ([]KomgaSeriesEntry, error) {
+func queryKomgaSeries(ctx context.Context, db sqliteQueryer, info KomgaSchemaInfo, onlySeriesID string, includeBooks bool) ([]KomgaSeriesEntry, error) {
 	seriesCols, err := tableColumns(ctx, db, "SERIES")
 	if err != nil {
 		return nil, err
@@ -394,10 +408,11 @@ WHERE 1=1`,
 	if err := loadKomgaSeriesSubtables(ctx, db, info, onlySeriesID, seriesList, indexByID); err != nil {
 		return nil, err
 	}
-	if err := loadKomgaBooks(ctx, db, info, onlySeriesID, seriesList, indexByID); err != nil {
-		return nil, err
+	if includeBooks {
+		if err := loadKomgaBooks(ctx, db, info, onlySeriesID, seriesList, indexByID); err != nil {
+			return nil, err
+		}
 	}
-
 	for i := range seriesList {
 		finalizeKomgaSeriesEntry(&seriesList[i])
 	}
@@ -406,7 +421,7 @@ WHERE 1=1`,
 
 func loadKomgaSeriesSubtables(
 	ctx context.Context,
-	db *sql.DB,
+	db sqliteQueryer,
 	info KomgaSchemaInfo,
 	onlySeriesID string,
 	seriesList []KomgaSeriesEntry,
@@ -571,7 +586,7 @@ func loadKomgaSeriesSubtables(
 
 func loadKomgaBooks(
 	ctx context.Context,
-	db *sql.DB,
+	db sqliteQueryer,
 	info KomgaSchemaInfo,
 	onlySeriesID string,
 	seriesList []KomgaSeriesEntry,
@@ -859,9 +874,50 @@ func isNSFWKeyword(raw string) bool {
 	return false
 }
 
+// komgaCoverRating resolves the actual thumbnail owner and classifies its series.
+func komgaCoverRating(ctx context.Context, db sqliteQueryer, kind, thumbID, entryID, parentEntryID string) (bool, error) {
+	var ownerID, seriesID string
+	var query string
+	switch kind {
+	case SQLiteBlobKindKomgaSeries:
+		query = `SELECT SERIES_ID, SERIES_ID FROM THUMBNAIL_SERIES WHERE ID=?`
+	case SQLiteBlobKindKomgaBook:
+		query = `SELECT b.ID, b.SERIES_ID FROM THUMBNAIL_BOOK t JOIN BOOK b ON b.ID=t.BOOK_ID WHERE t.ID=?`
+	default:
+		return false, ErrInvalidConfig
+	}
+	if err := db.QueryRowContext(ctx, query, thumbID).Scan(&ownerID, &seriesID); err != nil {
+		return false, err
+	}
+	if seriesID == "" || (entryID != "" && ownerID != entryID) || (parentEntryID != "" && seriesID != parentEntryID) {
+		return false, ErrEntryNotFound
+	}
+	info, err := DetectKomgaSchema(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	entries, err := queryKomgaSeries(ctx, db, info, seriesID, false)
+	if err != nil {
+		return false, err
+	}
+	if len(entries) != 1 {
+		return false, ErrEntryNotFound
+	}
+	return entries[0].NSFW, nil
+}
+
 // ReadKomgaThumbnailBLOB lazily reads a single THUMBNAIL_SERIES or THUMBNAIL_BOOK BLOB
 // strictly in read-only mode, enforcing a 16 MiB cap to prevent OOM.
 func ReadKomgaThumbnailBLOB(ctx context.Context, dbPath, kind, thumbID string) ([]byte, string, error) {
+	db, err := openKomgaReadOnlySQLite(dbPath)
+	if err != nil {
+		return nil, "", err
+	}
+	defer db.Close()
+	return readKomgaThumbnailBLOB(ctx, db, kind, thumbID)
+}
+
+func readKomgaThumbnailBLOB(ctx context.Context, db sqliteQueryer, kind, thumbID string) ([]byte, string, error) {
 	thumbID = strings.TrimSpace(thumbID)
 	if thumbID == "" {
 		return nil, "", ErrEntryNotFound
@@ -875,12 +931,6 @@ func ReadKomgaThumbnailBLOB(ctx context.Context, dbPath, kind, thumbID string) (
 	default:
 		return nil, "", fmt.Errorf("%w: unsupported thumbnail kind %q", ErrInvalidConfig, kind)
 	}
-
-	db, err := openKomgaReadOnlySQLite(dbPath)
-	if err != nil {
-		return nil, "", err
-	}
-	defer db.Close()
 
 	tables, err := listSQLiteTables(ctx, db)
 	if err != nil {
@@ -955,7 +1005,7 @@ func appendUniqueKomgaAuthor(list []KomgaAuthor, item KomgaAuthor) []KomgaAuthor
 	return append(list, item)
 }
 
-func tableColumns(ctx context.Context, db *sql.DB, tableName string) (map[string]bool, error) {
+func tableColumns(ctx context.Context, db sqliteQueryer, tableName string) (map[string]bool, error) {
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info("%s")`, strings.ReplaceAll(tableName, `"`, `""`)))
 	if err != nil {
 		return nil, err

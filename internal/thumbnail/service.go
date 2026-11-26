@@ -94,8 +94,7 @@ type Service struct {
 
 	externalMu             sync.RWMutex
 	externalFetcher        ExternalCoverFetcher
-	bookExternalFetcher    ExternalCoverFetcher
-	bookExternalFlight     singleflight.Group
+	bookExternalFetcher    BookExternalCoverFetcher
 	tankobonMatcher        TankobonMatcher
 	nsfwFallbackFetcher    NSFWFallbackCoverFetcher
 	invalidateNSFWFallback func()
@@ -152,7 +151,15 @@ func (s *Service) SetExternalCoverFetcher(fetcher ExternalCoverFetcher) {
 	s.externalMu.Lock()
 	defer s.externalMu.Unlock()
 	s.externalFetcher = fetcher
-	s.bookExternalFetcher = fetcher
+	s.bookExternalFetcher = nil
+	if fetcher != nil {
+		s.bookExternalFetcher = func(ctx context.Context, sourceID, entryID, parentEntryID, coverURL string) ([]byte, string, error) {
+			if parentEntryID != "" && !strings.HasPrefix(coverURL, "sqlite-blob://") {
+				entryID = parentEntryID
+			}
+			return fetcher(ctx, sourceID, entryID, coverURL)
+		}
+	}
 }
 
 func (s *Service) SetNSFWFallbackCoverFetcher(fetcher NSFWFallbackCoverFetcher, invalidate func()) {
@@ -697,7 +704,7 @@ func isBangumiCoverFile(name string) bool {
 	if !strings.HasPrefix(name, "bgm_") || !strings.HasSuffix(name, ".jpg") {
 		return false
 	}
-	id, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(name, "bgm_"), ".jpg"), 10, 64)
+	id, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(name, "bgm_"), ".jpg"), "_unverified"), 10, 64)
 	return err == nil && id > 0
 }
 

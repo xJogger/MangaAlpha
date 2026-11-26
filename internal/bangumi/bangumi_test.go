@@ -677,7 +677,7 @@ INSERT INTO bgm_subjects VALUES(200,1001,1,0,'Legacy Series','旧版系列','','
 		case "/v0/subjects/200/subjects":
 			_, _ = io.WriteString(w, `[
 				{"id": 201, "type": 1, "name": "Vol.1", "name_cn": "第一卷", "relation": "单行本", "images": {"common": "https://lain.bgm.tv/pic/cover/c/201.jpg"}},
-				{"id": 202, "type": 1, "name": "Vol.2", "name_cn": "第二卷", "relation": "单行本", "images": {"large": "https://lain.bgm.tv/pic/cover/l/202.jpg"}},
+				{"id": 202, "type": 1, "name": "Vol.2", "name_cn": "第二卷", "relation": "单行本", "nsfw": false, "images": {"large": "https://lain.bgm.tv/pic/cover/l/202.jpg"}},
 				{"id": 203, "type": 1, "name": "Vol.3", "name_cn": "第三卷", "relation": "单行本", "images": {}},
 				{"id": 204, "type": 1, "name": "Spin-off", "name_cn": "衍生作", "relation": "番外篇", "images": {}},
 				{"id": 205, "type": 1, "name": "Secret Vol", "name_cn": "成人番外", "relation": "单行本", "nsfw": true, "images": {}}
@@ -704,8 +704,8 @@ INSERT INTO bgm_subjects VALUES(200,1001,1,0,'Legacy Series','旧版系列','','
 		t.Fatalf("expected 1 unauthenticated call without NSFW scope, calls=%d auth=%v", apiCalls.Load(), seenAuthHeader.Load())
 	}
 	if len(items) != 3 ||
-		items[0].SubjectID != 201 || items[0].Order != 1 || items[0].CoverURL != "https://lain.bgm.tv/pic/cover/c/201.jpg" ||
-		items[1].SubjectID != 202 || items[1].Order != 2 || items[1].CoverURL != "https://lain.bgm.tv/pic/cover/l/202.jpg" ||
+		items[0].SubjectID != 201 || items[0].NSFWKnown || items[0].Order != 1 || items[0].CoverURL != "https://lain.bgm.tv/pic/cover/c/201.jpg" ||
+		items[1].SubjectID != 202 || !items[1].NSFWKnown || items[1].NSFW || items[1].Order != 2 || items[1].CoverURL != "https://lain.bgm.tv/pic/cover/l/202.jpg" ||
 		items[2].SubjectID != 203 || items[2].Order != 3 || items[2].CoverURL != "https://api.bgm.tv/v0/subjects/203/image?type=common" {
 		t.Fatalf("unexpected fallback tankobons: %+v", items)
 	}
@@ -713,16 +713,24 @@ INSERT INTO bgm_subjects VALUES(200,1001,1,0,'Legacy Series','旧版系列','','
 	// With NSFW scope: Bearer token is sent and NSFW tankobon 205 is included.
 	nsfwCtx := database.WithUserScope(ctx, database.UserScope{AllowNSFW: true, ShowNSFW: true})
 	nsfwItems, err := svc.TankobonsForSubject(nsfwCtx, 200, true)
-	if err != nil || len(nsfwItems) != 4 || nsfwItems[3].SubjectID != 205 || !nsfwItems[3].NSFW {
+	if err != nil || len(nsfwItems) != 4 || nsfwItems[3].SubjectID != 205 || !nsfwItems[3].NSFW || !nsfwItems[3].NSFWKnown {
 		t.Fatalf("expected 4 tankobons with NSFW scope, got %+v err=%v", nsfwItems, err)
 	}
 	if seenAuthHeader.Load() != "Bearer fixture-secret-token" {
 		t.Fatalf("expected Bearer token on api.bgm.tv with NSFW scope, got %v", seenAuthHeader.Load())
 	}
 
-	// Now import a fresh v5 archive zip with sorted tankobons and verify OfflineTankobons hits 0 network calls.
-	_ = os.Chmod(legacyDBPath, 0o600)
-	zipPath := filepath.Join(tmp, "v5.zip")
+	// The writable v4 migration adds an empty relations table, but cannot
+	// populate it until the same upstream dump is imported again.
+	if err := os.Chmod(legacyDBPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	svc.archive.upgradeExistingIndexIfNeeded()
+	var relationCount int
+	if err := svc.archive.db.QueryRowContext(ctx, `SELECT count(*) FROM bgm_subject_relations`).Scan(&relationCount); err != nil || relationCount != 0 {
+		t.Fatalf("migrated v4 relations: count=%d err=%v", relationCount, err)
+	}
+
 	var zbuf bytes.Buffer
 	zw := zip.NewWriter(&zbuf)
 	writeZ := func(name, content string) {
@@ -739,11 +747,41 @@ INSERT INTO bgm_subjects VALUES(200,1001,1,0,'Legacy Series','旧版系列','','
 			`{"subject_id":300,"relation_type":1003,"related_subject_id":301,"order":1}`+"\n",
 	)
 	_ = zw.Close()
-	if err := os.WriteFile(zipPath, zbuf.Bytes(), 0o600); err != nil {
-		t.Fatal(err)
+	var downloads int
+	updateClient := &http.Client{Transport: matchingTransport(func(r *http.Request) (*http.Response, error) {
+		w := httptest.NewRecorder()
+		switch r.URL.Path {
+		case "/latest.json":
+			_, _ = io.WriteString(w, `{"name":"legacy-v4","browser_download_url":"https://archive.example.test/dump.zip"}`)
+		case "/dump.zip":
+			downloads++
+			if _, found, err := svc.archive.SubjectByID(ctx, 200); err != nil || !found {
+				t.Fatalf("legacy index unavailable during download: found=%v err=%v", found, err)
+			}
+			_, _ = w.Write(zbuf.Bytes())
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+		return w.Result(), nil
+	})}
+	svc.archive.SetMetaURL("https://archive.example.test/latest.json")
+	update := func() ArchiveStatus {
+		t.Helper()
+		status, err := svc.UpdateArchiveFromSource(ctx, ArchiveSourceCustom, "https://archive.example.test/latest.json", false, updateClient)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return status
 	}
-	if err := svc.ImportArchiveZip(ctx, zipPath, "v5.zip", "2026-11-26T00:00:00Z"); err != nil {
-		t.Fatal(err)
+	if status := update(); status.LastCheckResult != "updated" || downloads != 1 {
+		t.Fatalf("v4 same-dump upgrade was skipped: %+v downloads=%d", status, downloads)
+	}
+	var format string
+	if err := svc.archive.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key='import_format_version'`).Scan(&format); err != nil || format != "5" {
+		t.Fatalf("import version: %q err=%v", format, err)
+	}
+	if status := update(); status.LastCheckResult != "up_to_date" || downloads != 1 {
+		t.Fatalf("completed import downloaded again: %+v downloads=%d", status, downloads)
 	}
 
 	callsBefore := apiCalls.Load()
@@ -751,7 +789,7 @@ INSERT INTO bgm_subjects VALUES(200,1001,1,0,'Legacy Series','旧版系列','','
 	if err != nil || apiCalls.Load() != callsBefore {
 		t.Fatalf("expected TankobonsForSubject to use offline archive without network calls, err=%v callsDelta=%d", err, apiCalls.Load()-callsBefore)
 	}
-	if len(offlineItems) != 2 || offlineItems[0].SubjectID != 301 || offlineItems[0].ISBN != "978-1" || offlineItems[1].SubjectID != 302 || offlineItems[1].Order != 2 {
+	if len(offlineItems) != 2 || offlineItems[0].SubjectID != 301 || !offlineItems[0].NSFWKnown || offlineItems[0].ISBN != "978-1" || offlineItems[1].SubjectID != 302 || offlineItems[1].Order != 2 {
 		t.Fatalf("unexpected sorted offline tankobons: %+v", offlineItems)
 	}
 }

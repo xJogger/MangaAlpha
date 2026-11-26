@@ -49,7 +49,7 @@ func TestBookCoverPriorityAndSourceOverride(t *testing.T) {
 	}
 	assertCover(second.ID, 80, 120)
 	s.SetBangumiCoverFetcher(func(context.Context, string, int64) ([]byte, error) { return bgm, nil })
-	s.SetBookExternalCoverFetcher(func(_ context.Context, source, entry, ref string) ([]byte, string, error) {
+	s.SetBookExternalCoverFetcher(func(_ context.Context, source, entry, _, ref string) ([]byte, string, error) {
 		if source != "catalog" || entry != "external-book" || ref != "sqlite-blob://catalog/komga-book/cover" {
 			t.Errorf("unexpected external reference %q %q %q", source, entry, ref)
 		}
@@ -170,10 +170,10 @@ func TestBookCoverOfflineMatchAndNSFWCacheIsolation(t *testing.T) {
 	matchCalls, fetchCalls := 0, 0
 	s.SetTankobonMatcher(func(_ context.Context, _ database.Series, _ database.SeriesMetadata, books []VolumeMatchBook, allowLive bool) ([]VolumeMatchResult, error) {
 		matchCalls++
-		if allowLive || len(books) != 1 || books[0].BookID != book.ID {
+		if allowLive || len(books) != 2 {
 			t.Fatalf("reader matcher received live=%v books=%v", allowLive, books)
 		}
-		return []VolumeMatchResult{{BookID: book.ID, SubjectID: 42, NSFW: true}}, nil
+		return []VolumeMatchResult{{BookID: book.ID, SubjectID: 42, NSFW: true, NSFWKnown: true}}, nil
 	})
 	raw := testPNG(t, 30, 40)
 	s.SetBangumiCoverFetcher(func(context.Context, string, int64) ([]byte, error) {
@@ -191,5 +191,48 @@ func TestBookCoverOfflineMatchAndNSFWCacheIsolation(t *testing.T) {
 	}
 	if _, ok, err := s.GetBookCover(restricted, book.ID); err != nil || ok || matchCalls != 1 || fetchCalls != 1 {
 		t.Fatalf("private image served from disk after switching scopes: %v %v", ok, err)
+	}
+}
+
+func TestUnknownTankobonCoverRequiresPublicVerification(t *testing.T) {
+	store, book, _ := thumbnailTestStore(t)
+	dir := t.TempDir()
+	s, err := NewWithDataDir(store, filepath.Join(dir, "series"), dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := testPNG(t, 15, 20)
+	publicFetcherCalls, verifiedFetcherCalls := 0, 0
+	verificationDenied := errors.New("subject rating could not be verified")
+	s.SetPublicBangumiCoverFetcher(func(context.Context, string, int64) ([]byte, error) {
+		publicFetcherCalls++
+		return raw, nil
+	})
+	s.SetBangumiCoverFetcher(func(ctx context.Context, _ string, _ int64) ([]byte, error) {
+		verifiedFetcherCalls++
+		scope, _ := database.UserScopeFromContext(ctx)
+		if !scope.EffectiveShowNSFW() {
+			return nil, verificationDenied
+		}
+		return raw, nil
+	})
+	scope := database.UserScope{UserID: "reader", AllowNSFW: true, ShowNSFW: true}
+	match := VolumeMatchResult{BookID: book.ID, SubjectID: 42}
+	meta := database.BookMetadata{}
+	if cover, _, err := s.CacheBookBangumiCover(database.WithUserScope(t.Context(), scope), book.ID, meta, &match, false); err != nil || len(cover.Bytes) == 0 {
+		t.Fatalf("authorized fetch failed: %v", err)
+	}
+	scope.ShowNSFW = false
+	if cover, _, err := s.CacheBookBangumiCover(database.WithUserScope(t.Context(), scope), book.ID, meta, &match, false); !errors.Is(err, verificationDenied) || len(cover.Bytes) != 0 {
+		t.Fatalf("unknown cover bypassed public verification: len=%d err=%v", len(cover.Bytes), err)
+	}
+	if publicFetcherCalls != 0 || verifiedFetcherCalls != 2 {
+		t.Fatalf("unchecked fetches=%d checked fetches=%d", publicFetcherCalls, verifiedFetcherCalls)
+	}
+	if saved, _, err := store.BookMetadataByID(t.Context(), book.ID); err != nil || saved.BgmSubjectID != 0 {
+		t.Fatalf("unknown rating was persisted: %+v err=%v", saved, err)
+	}
+	if _, err := os.Stat(filepath.Join(s.bookBgmDir, "bgm_42_unverified.jpg.public")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unverified cover marked public: %v", err)
 	}
 }

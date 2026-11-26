@@ -1323,7 +1323,7 @@
                 <a href="/libraries/${encodeURIComponent(l.id)}" data-nav class="lib-pill">
                   <span>${esc(l.name)}</span>
                   <span class="badge">${esc(providerLabel(l.providerType, l.webdavAccountName))}</span>
-                  ${l.oneshotsDirectory ? `<span class="badge badge-accent">单本</span>` : ''}
+                  ${l.oneshotsDirectory === '.' ? `<span class="badge badge-accent">单本</span>` : (l.oneshotsDirectory ? `<span class="badge badge-accent">含单篇</span>` : '')}
                 </a>
               `).join('')}
             </div>

@@ -23,6 +23,7 @@ type VolumeMatchResult struct {
 	SubjectID int64
 	CoverURL  string
 	NSFW      bool
+	NSFWKnown bool
 	Title     string
 	Date      string
 	Summary   string
@@ -43,7 +44,7 @@ var (
 	vmVolWordPrefixRe = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])(?:vol\.?|volume)\.?[\s_-]*0*(\d+(?:\.\d+)?)(?:\s*[-~～]\s*(?:vol\.?|v)?[\s._-]*0*\d+(?:\.\d+)?)?`)
 	vmVLetterPrefixRe = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])v\.?[\s_-]*0*(\d+(?:\.\d+)?)(?:\s*[-~～]\s*v?[\s._-]*0*\d+(?:\.\d+)?)?`)
 
-	vmSeriesCompleteBracketRe = regexp.MustCompile(`(?i)[\[【(（]\s*(?:全\s*\d+\s*[卷册冊集巻]?|\d+(?:\s*[-~～]\s*\d+)?\s*[卷册冊集巻]?\s*(?:完|全|未完))\s*[\]】)）]`)
+	vmSeriesCompleteBracketRe = regexp.MustCompile(`(?i)[\[【(（]\s*(?:(?:完结|完結|完|已完结|已完結|未完)|全\s*\d+\s*[卷册冊集巻]?|\d+(?:\s*[-~～]\s*\d+)?\s*[卷册冊集巻]?\s*(?:完|全|未完))\s*[\]】)）]`)
 	vmFullOneVolRe            = regexp.MustCompile(`(?:全\s*[一1]\s*[卷册冊]|全\s*0*1\s*[卷册冊集巻])`)
 	vmDateNoiseRe             = regexp.MustCompile(`(?:\b(?:19|20)\d{2}[-./年]\d{1,2}(?:[-./月]\d{1,2}日?)?\b|[\[【(（]\s*(?:19|20)\d{2}\s*[\]】)）])`)
 	vmResNoiseRe              = regexp.MustCompile(`(?i)(?:\b\d+\s*(?:px|dpi|mb|gb|kb|k)\b|\b\d{3,5}\s*p\b|[\[【(（]\s*\d{2,4}\s*[p页頁]\s*[\]】)）]|\b\d+\s*[x×]\s*\d+\b|\b(?:r-?18|18\+|18禁|c\d{2,3})\b|\brev\s*\d+\b)`)
@@ -52,6 +53,8 @@ var (
 	vmBracketNumRe            = regexp.MustCompile(`(?:\(|（|\[|【)\s*#?\s*0*(\d+(?:\.\d+)?)(?:\s*[-~～]\s*#?\s*0*\d+(?:\.\d+)?)?\s*(?:\)|）|\]|】)`)
 	vmTrailingNumRe           = regexp.MustCompile(`(?:^|[\s_\-#.])0*(\d+(?:\.\d+)?)(?:\s*[-~～]\s*0*\d+(?:\.\d+)?)?\s*$`)
 	vmLeadingPureNumRe        = regexp.MustCompile(`^\s*0*(\d+(?:\.\d+)?)(?:\s*[-~～]\s*0*\d+(?:\.\d+)?)?\s*$`)
+
+	vmVolumeRangeRe = regexp.MustCompile(`(?i)\d\s*[-~～]\s*(?:(?:vol(?:ume)?|v)\.?\s*)?\d`)
 
 	vmExtraLatinRe     = regexp.MustCompile(`(?i)(?:^|[^a-z])(?:sp|ex|ova|oad|special|extra|omake|bonus|fanbook|databook|artbook|guidebook|anthology)(?:$|[^a-z])`)
 	vmExtraCJKKeywords = []string{
@@ -71,7 +74,7 @@ var (
 // single-chapter / missing-volume protections.
 func MatchBooksToTankobons(
 	parentSubjectID int64,
-	seriesOneShot bool,
+	_ bool,
 	books []VolumeMatchBook,
 	tankobons []TankobonSubject,
 ) []VolumeMatchResult {
@@ -83,7 +86,7 @@ func MatchBooksToTankobons(
 		if len(books) > 1 || parentSubjectID <= 0 {
 			return nil
 		}
-		if !seriesOneShot && isSingleChapterFilename(books[0].Name) {
+		if isSingleChapterFilename(books[0].Name) {
 			return nil
 		}
 		return []VolumeMatchResult{
@@ -127,7 +130,41 @@ func MatchBooksToTankobons(
 
 	commonPrefix := detectCommonTankobonPrefix(parsedTankobons)
 
-	var results []VolumeMatchResult
+	type matchCandidate struct {
+		result   VolumeMatchResult
+		priority int
+		tied     bool
+	}
+	candidates := make(map[int64]matchCandidate)
+	var subjectOrder []int64
+	addMatch := func(pb parsedMatchBook, idx int, matchedBy string) {
+		subject := parsedTankobons[idx].subj
+		priority := 1
+		if matchedBy == "volume_number" {
+			priority = 2
+			stem := vmSeriesCompleteBracketRe.ReplaceAllString(pb.stemSimp, " ")
+			stem = vmDateNoiseRe.ReplaceAllString(stem, " ")
+			if !vmVolumeRangeRe.MatchString(stem) {
+				priority = 3
+				if vmExplicitVolRe.MatchString(stem) {
+					priority = 4
+				}
+			}
+		}
+		current, exists := candidates[subject.SubjectID]
+		switch {
+		case !exists || priority > current.priority:
+			candidates[subject.SubjectID] = matchCandidate{
+				result: toVolumeMatchResult(pb.book.BookID, subject, matchedBy), priority: priority,
+			}
+			if !exists {
+				subjectOrder = append(subjectOrder, subject.SubjectID)
+			}
+		case priority == current.priority:
+			current.tied = true
+			candidates[subject.SubjectID] = current
+		}
+	}
 	for _, pb := range parsedBooks {
 		if pb.blockedChapter {
 			continue
@@ -136,7 +173,7 @@ func MatchBooksToTankobons(
 		if !pb.isExtra {
 			if pb.partKind != "" {
 				if tIdx := findTankobonByPart(parsedTankobons, pb.partKind); tIdx >= 0 {
-					results = append(results, toVolumeMatchResult(pb.book.BookID, parsedTankobons[tIdx].subj, "volume_number"))
+					addMatch(pb, tIdx, "volume_number")
 					continue
 				}
 				if !pb.hasVol {
@@ -148,7 +185,7 @@ func MatchBooksToTankobons(
 			}
 			if pb.hasVol {
 				if tIdx := findTankobonByVolume(parsedTankobons, pb.vol); tIdx >= 0 {
-					results = append(results, toVolumeMatchResult(pb.book.BookID, parsedTankobons[tIdx].subj, "volume_number"))
+					addMatch(pb, tIdx, "volume_number")
 					continue
 				}
 				// Missing volume: do NOT fall back to shifting positions or fuzzy title matching.
@@ -157,7 +194,13 @@ func MatchBooksToTankobons(
 		}
 
 		if tIdx := findTankobonByTitle(pb, parsedTankobons, commonPrefix); tIdx >= 0 {
-			results = append(results, toVolumeMatchResult(pb.book.BookID, parsedTankobons[tIdx].subj, "title"))
+			addMatch(pb, tIdx, "title")
+		}
+	}
+	var results []VolumeMatchResult
+	for _, id := range subjectOrder {
+		if candidate := candidates[id]; !candidate.tied {
+			results = append(results, candidate.result)
 		}
 	}
 	return results
@@ -193,14 +236,16 @@ func stripArchiveExt(name string) string {
 }
 
 func isSingleChapterFilename(rawName string) bool {
-	stem := ToSimplified(stripArchiveExt(rawName))
+	stem := vmSeriesCompleteBracketRe.ReplaceAllString(ToSimplified(stripArchiveExt(rawName)), " ")
 	if stem == "" {
 		return false
 	}
 	return vmChapterRe.MatchString(stem) && !vmExplicitVolRe.MatchString(stem)
 }
 
-func hasExtraMarker(simp string) bool {
+// IsVolumeExtra reports whether a volume name identifies supplemental material.
+func IsVolumeExtra(name string) bool {
+	simp := ToSimplified(name)
 	lower := strings.ToLower(simp)
 	for _, kw := range vmExtraCJKKeywords {
 		if strings.Contains(lower, kw) {
@@ -224,12 +269,12 @@ func parseBookForMatch(book VolumeMatchBook) parsedMatchBook {
 		return pb
 	}
 
-	if vmChapterRe.MatchString(stem) && !vmExplicitVolRe.MatchString(stem) {
+	if isSingleChapterFilename(book.Name) {
 		pb.blockedChapter = true
 		return pb
 	}
 
-	pb.isExtra = hasExtraMarker(stem)
+	pb.isExtra = IsVolumeExtra(stem)
 	if pb.isExtra {
 		return pb
 	}
@@ -256,7 +301,7 @@ func parseTankobonsForMatch(tankobons []TankobonSubject) []parsedMatchTankobon {
 			subj:     t,
 			nameCN:   cn,
 			nameOrig: orig,
-			isExtra:  hasExtraMarker(cn + " " + orig),
+			isExtra:  IsVolumeExtra(cn + " " + orig),
 		}
 		if !pt.isExtra {
 			for _, candidate := range []string{cn, orig} {
@@ -757,6 +802,7 @@ func toVolumeMatchResult(bookID string, t TankobonSubject, matchedBy string) Vol
 		SubjectID: t.SubjectID,
 		CoverURL:  coverURL,
 		NSFW:      t.NSFW,
+		NSFWKnown: t.NSFWKnown,
 		Title:     title,
 		Date:      t.Date,
 		Summary:   t.Summary,

@@ -1190,47 +1190,6 @@ func (s *SidecarStore) GetEntry(ctx context.Context, entryID string) (*Entry, er
 	return getEntryFromUpstream(ctx, s.upstreamDB, s.sourceID, s.schema, entryID)
 }
 
-// ResolveBlobSeriesID resolves the owning series/entry ID for a parsed sqlite-blob reference.
-func (s *SidecarStore) ResolveBlobSeriesID(ctx context.Context, kind, recordID, entryIDHint string) string {
-	if s == nil || s.upstreamDB == nil {
-		return ""
-	}
-	recordID = strings.TrimSpace(recordID)
-	entryIDHint = strings.TrimSpace(entryIDHint)
-	var seriesID string
-	switch kind {
-	case SQLiteBlobKindKomgaSeries:
-		if recordID != "" {
-			_ = s.upstreamDB.QueryRowContext(ctx, `SELECT SERIES_ID FROM thumbnail_series WHERE ID = ? LIMIT 1`, recordID).Scan(&seriesID)
-		}
-	case SQLiteBlobKindKomgaBook:
-		if recordID != "" {
-			_ = s.upstreamDB.QueryRowContext(ctx, `
-SELECT b.SERIES_ID FROM BOOK b
-JOIN thumbnail_book tb ON tb.BOOK_ID = b.ID
-WHERE tb.ID = ? LIMIT 1`, recordID).Scan(&seriesID)
-		}
-		if seriesID == "" && entryIDHint != "" {
-			_ = s.upstreamDB.QueryRowContext(ctx, `SELECT SERIES_ID FROM BOOK WHERE ID = ? LIMIT 1`, entryIDHint).Scan(&seriesID)
-		}
-	case SQLiteBlobKindOpenEntry:
-		return recordID
-	case SQLiteBlobKindOpenBook:
-		if sid, bkey, ok := strings.Cut(recordID, ":"); ok && sid != "" {
-			_ = bkey
-			return sid
-		}
-		key := recordID
-		if key == "" {
-			key = entryIDHint
-		}
-		if key != "" {
-			_ = s.upstreamDB.QueryRowContext(ctx, `SELECT series_entry_id FROM books WHERE book_key = ? LIMIT 1`, key).Scan(&seriesID)
-		}
-	}
-	return strings.TrimSpace(seriesID)
-}
-
 func komgaSeriesToEntry(sourceID string, ks *KomgaSeriesEntry) *Entry {
 	if ks == nil {
 		return nil

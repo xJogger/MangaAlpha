@@ -29,6 +29,22 @@ type fallbackCoverLookup struct {
 }
 
 func (m *Manager) FetchCover(ctx context.Context, sourceID, entryID, coverURL string) ([]byte, string, error) {
+	return m.fetchCover(ctx, sourceID, entryID, "", coverURL)
+}
+
+// FetchBookCover checks a book's upstream parent binding when it is available.
+func (m *Manager) FetchBookCover(ctx context.Context, sourceID, entryID, parentEntryID, coverURL string) ([]byte, string, error) {
+	return m.fetchCover(ctx, sourceID, entryID, parentEntryID, coverURL)
+}
+
+func (m *Manager) fetchCover(ctx context.Context, sourceID, entryID, parentEntryID, coverURL string) ([]byte, string, error) {
+	blobSourceID, kind, key, isBlob := ParseSQLiteBlobCoverRef(coverURL)
+	if isBlob {
+		if blobSourceID != sourceID {
+			return nil, "", ErrInvalidConfig
+		}
+		return m.fetchBlobCover(ctx, sourceID, strings.TrimSpace(entryID), strings.TrimSpace(parentEntryID), kind, key)
+	}
 	src, err := m.store.GetMetadataSource(ctx, sourceID)
 	if err != nil {
 		return nil, "", err
@@ -36,67 +52,94 @@ func (m *Manager) FetchCover(ctx context.Context, sourceID, entryID, coverURL st
 	if !src.Enabled || !src.Ready || src.Kind != KindOfflineSQLite || m.covers == nil || coverURL == "" {
 		return nil, "", ErrUnavailable
 	}
-	blobSrcID, blobKind, blobRecID, isBlob := ParseSQLiteBlobCoverRef(coverURL)
 	if scope, ok := database.UserScopeFromContext(ctx); ok && !scope.AllowNSFW {
-		if err := m.checkCoverNSFWAllowed(ctx, sourceID, entryID, blobKind, blobRecID, isBlob); err != nil {
-			return nil, "", err
-		}
-	}
-	if isBlob {
-		if blobSrcID != src.ID {
-			return nil, "", ErrInvalidConfig
-		}
-		upstream := m.upstreamPath(src)
-		if upstream == "" {
+		entry, err := m.entry(ctx, sourceID, firstNonEmpty(parentEntryID, entryID))
+		if err != nil || entry.IsNSFW {
 			return nil, "", ErrUnavailable
 		}
-		if src.LocalPath != "" && filepath.Clean(src.LocalPath) != m.sqlitePath(src.ID) {
-			if _, err := checkedLocalFile(upstream); err != nil {
-				return nil, "", ErrUnavailable
-			}
-		}
-		cacheEntryID := entryID
-		if strings.TrimSpace(cacheEntryID) == "" {
-			cacheEntryID = blobKind + "-" + blobRecID
-		}
-		data, err := m.covers.GetOrLoadLocal(ctx, sourceID, cacheEntryID, coverURL, maxSQLiteBlobCoverBytes, func(loadCtx context.Context) ([]byte, string, error) {
-			switch blobKind {
-			case SQLiteBlobKindKomgaSeries, SQLiteBlobKindKomgaBook:
-				return ReadKomgaThumbnailBLOB(loadCtx, upstream, blobKind, blobRecID)
-			case SQLiteBlobKindOpenEntry, SQLiteBlobKindOpenBook:
-				return ReadOpenCoverBLOB(loadCtx, upstream, blobKind, blobRecID)
-			default:
-				return nil, "", ErrInvalidConfig
-			}
-		})
-		return data.Bytes, data.MediaType, err
 	}
 	u, err := validateHTTPURL(coverURL)
 	if err != nil || u.User != nil {
 		return nil, "", ErrInvalidConfig
 	}
-	data, err := m.covers.GetOrFetch(ctx, sourceID, entryID, coverURL)
+	data, err := m.covers.GetOrFetch(ctx, sourceID, firstNonEmpty(parentEntryID, entryID), coverURL)
 	return data.Bytes, data.MediaType, err
 }
 
-func (m *Manager) checkCoverNSFWAllowed(ctx context.Context, sourceID, entryID, blobKind, blobRecID string, isBlob bool) error {
-	if entry, err := m.entry(ctx, sourceID, entryID); err == nil {
-		if entry.IsNSFW {
-			return ErrUnavailable
-		}
-		return nil
+func (m *Manager) fetchBlobCover(ctx context.Context, sourceID, entryID, parentEntryID, kind, key string) ([]byte, string, error) {
+	// Hold the source generation stable through authorization and cache lookup.
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	src, err := m.store.GetMetadataSource(ctx, sourceID)
+	if err != nil {
+		return nil, "", err
 	}
-	if isBlob {
-		m.mu.RLock()
-		sidecar := m.sidecars[sourceID]
-		m.mu.RUnlock()
-		if seriesID := sidecar.ResolveBlobSeriesID(ctx, blobKind, blobRecID, entryID); seriesID != "" {
-			if entry, err := m.entry(ctx, sourceID, seriesID); err == nil && !entry.IsNSFW {
-				return nil
+	if !src.Enabled || !src.Ready || src.Kind != KindOfflineSQLite || m.covers == nil {
+		return nil, "", ErrUnavailable
+	}
+	upstream := m.upstreamPath(src)
+	if upstream == "" {
+		return nil, "", ErrUnavailable
+	}
+	if src.LocalPath != "" && filepath.Clean(src.LocalPath) != m.sqlitePath(src.ID) {
+		if _, err := checkedLocalFile(upstream); err != nil {
+			return nil, "", ErrUnavailable
+		}
+	}
+	db, checkpointedOnly, err := openKomgaSQLiteSnapshot(upstream)
+	if err != nil {
+		return nil, "", ErrUnavailable
+	}
+	defer db.Close()
+	showNSFW := m.store.ShowNSFW(ctx)
+	if checkpointedOnly && !showNSFW {
+		return nil, "", ErrUnavailable
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, "", ErrUnavailable
+	}
+	defer tx.Rollback()
+
+	var nsfw bool
+	var seriesID, bookKey string
+	load := func(loadCtx context.Context) ([]byte, string, error) {
+		switch kind {
+		case SQLiteBlobKindKomgaSeries, SQLiteBlobKindKomgaBook:
+			return readKomgaThumbnailBLOB(loadCtx, tx, kind, key)
+		default:
+			return readOpenCoverBLOB(loadCtx, tx, kind, seriesID, bookKey)
+		}
+	}
+	switch kind {
+	case SQLiteBlobKindKomgaSeries, SQLiteBlobKindKomgaBook:
+		nsfw, err = komgaCoverRating(ctx, tx, kind, key, entryID, parentEntryID)
+	case SQLiteBlobKindOpenEntry, SQLiteBlobKindOpenBook:
+		seriesID = key
+		if kind == SQLiteBlobKindOpenBook {
+			seriesID, bookKey, err = resolveOpenBookCover(ctx, tx, key, entryID, parentEntryID)
+			key = openBookCoverKey(seriesID, bookKey)
+		} else if entryID != "" && entryID != seriesID {
+			err = ErrEntryNotFound
+		}
+		if err == nil {
+			var entry *Entry
+			entry, err = getMangaAlphaMetaV1Entry(ctx, tx, sourceID, seriesID)
+			if err == nil {
+				nsfw = entry.IsNSFW
 			}
 		}
 	}
-	return ErrUnavailable
+	if err != nil || (nsfw && !showNSFW) {
+		return nil, "", ErrUnavailable
+	}
+	if entryID == "" {
+		entryID = kind + "-" + key
+	}
+	ref := EncodeSQLiteBlobCoverRef(sourceID, kind, key)
+	cacheKey := strings.Join([]string{ref, src.LocalSHA256, src.LastUpdatedAt}, "\x00")
+	data, err := m.covers.GetOrLoadLocal(ctx, sourceID, entryID, cacheKey, maxSQLiteBlobCoverBytes, load)
+	return data.Bytes, data.MediaType, err
 }
 
 // FetchFallbackNSFWCover resolves a cover from offline sources without rebinding the series.

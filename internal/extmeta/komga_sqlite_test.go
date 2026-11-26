@@ -463,3 +463,123 @@ INSERT INTO books VALUES(
 		t.Fatalf("expected ErrUnsupportedSchema for repo JSON, got %v", err)
 	}
 }
+
+func TestReadOnlySQLiteRealWAL(t *testing.T) {
+	ctx := t.Context()
+	liveDir := t.TempDir()
+	livePath := filepath.Join(liveDir, "catalog.sqlite")
+	writer, err := sql.Open("sqlite", livePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+	if _, err := writer.ExecContext(ctx, `
+PRAGMA journal_mode=WAL;
+PRAGMA wal_autocheckpoint=0;
+CREATE TABLE checkpointed(id INTEGER PRIMARY KEY);
+PRAGMA wal_checkpoint(TRUNCATE);
+CREATE TABLE wal_only(id INTEGER PRIMARY KEY);
+INSERT INTO wal_only VALUES(42);`); err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[string][]byte)
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		bytes, err := os.ReadFile(livePath + suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[suffix] = bytes
+	}
+	// Use an independent inode for the reader, as in a separate Komga
+	// process. The SQLite VFS shares SHM mappings for in-process connections.
+	readDir := t.TempDir()
+	readPath := filepath.Join(readDir, "catalog.sqlite")
+	for suffix, content := range files {
+		if err := os.WriteFile(readPath+suffix, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(readDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(readDir, 0o700)
+	readOnly, err := openKomgaReadOnlySQLite(readPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id int
+	err = readOnly.QueryRowContext(ctx, "SELECT id FROM wal_only").Scan(&id)
+	_ = readOnly.Close()
+	if err != nil || id != 42 {
+		t.Fatalf("WAL-only schema and row unavailable: id=%d err=%v", id, err)
+	}
+	for suffix, before := range files {
+		if after, err := os.ReadFile(readPath + suffix); err != nil || !bytes.Equal(before, after) {
+			t.Fatalf("read-only connection changed %q: %v", suffix, err)
+		}
+	}
+
+	// A copied WAL with no SHM must fall back to the checkpointed main file
+	// without trying to create an index next to it.
+	copyDir := t.TempDir()
+	copyPath := filepath.Join(copyDir, "catalog.sqlite")
+	for _, suffix := range []string{"", "-wal"} {
+		if err := os.WriteFile(copyPath+suffix, files[suffix], 0o400); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(copyDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(copyDir, 0o700)
+	fallback, checkpointedOnly, err := openKomgaSQLiteSnapshot(copyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !checkpointedOnly {
+		t.Error("checkpointed fallback did not report unread pending WAL")
+	}
+	tables, err := listSQLiteTables(ctx, fallback)
+	_ = fallback.Close()
+	if err != nil || !tables["checkpointed"] || tables["wal_only"] {
+		t.Fatalf("wrong checkpointed snapshot: tables=%v err=%v", tables, err)
+	}
+	if _, err := os.Stat(copyPath + "-shm"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("readonly reader created -shm: %v", err)
+	}
+	if warned, size := DetectSQLiteWALWarning(copyPath); !warned || size != int64(len(files["-wal"])) {
+		t.Fatalf("missing WAL checkpoint warning: warned=%v size=%d", warned, size)
+	}
+}
+
+func TestOpenBookCoverKeysWithDelimiters(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "open.sqlite")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execManagerFixture(t, db, `
+CREATE TABLE entries(id TEXT PRIMARY KEY);
+CREATE TABLE books(series_entry_id TEXT, book_key TEXT, cover_blob BLOB, PRIMARY KEY(series_entry_id, book_key));
+INSERT INTO entries VALUES ('a:b'),('a'),('a/b'),('literal');
+INSERT INTO books VALUES ('a:b','c',?),('a','b:c',?),('a/b','v/01',?),('literal','plain:key',?);`,
+		encodeTestPNG(t), encodeTestJPEG(t), encodeTestPNG(t), encodeTestJPEG(t))
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ key, mediaType string }{
+		{openBookCoverKey("a:b", "c"), "image/png"},
+		{openBookCoverKey("a", "b:c"), "image/jpeg"},
+		{openBookCoverKey("a/b", "v/01"), "image/png"},
+		{"plain:key", "image/jpeg"},
+	} {
+		_, mediaType, err := ReadOpenCoverBLOB(t.Context(), dbPath, SQLiteBlobKindOpenBook, tc.key)
+		if err != nil || mediaType != tc.mediaType {
+			t.Fatalf("cover key %q resolved to %q: %v", tc.key, mediaType, err)
+		}
+	}
+	if _, _, err := ReadOpenCoverBLOB(t.Context(), dbPath, SQLiteBlobKindOpenBook, "a:b:c"); !errors.Is(err, ErrEntryNotFound) {
+		t.Fatalf("ambiguous old compound key accepted: %v", err)
+	}
+}

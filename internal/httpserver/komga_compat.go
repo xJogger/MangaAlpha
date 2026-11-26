@@ -124,8 +124,12 @@ func (s *Server) patchKomgaClientSettings(w http.ResponseWriter, r *http.Request
 		if update.Value == nil {
 			err = s.store.DeleteClientSetting(r.Context(), key)
 		} else {
+			value := *update.Value
+			if _, enum := webUIClientSettingEnums[strings.TrimSpace(key)]; enum {
+				value = strings.TrimSpace(value)
+			}
 			err = s.store.UpsertClientSetting(
-				r.Context(), key, *update.Value, update.AllowUnauthenticated,
+				r.Context(), key, value, update.AllowUnauthenticated,
 			)
 		}
 		if err != nil {

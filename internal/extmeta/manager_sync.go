@@ -3,6 +3,7 @@ package extmeta
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"io"
@@ -86,8 +87,21 @@ func (m *Manager) ImportUploadedSQLite(
 	reader io.Reader,
 	onProgress func(written int64),
 ) (database.MetadataSource, error) {
+	if strings.TrimSpace(sourceID) == "" {
+		return database.MetadataSource{}, ErrInvalidConfig
+	}
+	return m.ImportConfiguredSQLite(ctx, sourceID, filename, reader, SourceConfig{}, onProgress)
+}
+
+// ImportConfiguredSQLite validates the upload and publishes the source and its
+// index together. An empty sourceID creates a source only when publication succeeds.
+func (m *Manager) ImportConfiguredSQLite(ctx context.Context, sourceID, filename string, reader io.Reader, cfg SourceConfig, onProgress func(int64)) (database.MetadataSource, error) {
 	sourceID = strings.TrimSpace(sourceID)
 	filename = strings.TrimSpace(filename)
+	create := sourceID == ""
+	if create {
+		sourceID = "msrc_" + strings.ToLower(rand.Text())
+	}
 	if !isValidSourceID(sourceID) || filename == "" || reader == nil {
 		return database.MetadataSource{}, ErrInvalidConfig
 	}
@@ -110,12 +124,34 @@ func (m *Manager) ImportUploadedSQLite(
 		m.mu.Unlock()
 	}()
 
-	src, err := m.store.GetMetadataSource(ctx, sourceID)
-	if err != nil {
-		return database.MetadataSource{}, err
+	previous := database.MetadataSource{}
+	src := database.MetadataSource{ID: sourceID, Kind: KindOfflineSQLite, Enabled: true}
+	if !create {
+		var err error
+		previous, err = m.store.GetMetadataSource(ctx, sourceID)
+		if err != nil {
+			return database.MetadataSource{}, err
+		}
+		src = previous
 	}
 	if src.Kind != KindOfflineSQLite {
 		return database.MetadataSource{}, ErrInvalidConfig
+	}
+	configured := src
+	setOption(&configured.Name, cfg.Name)
+	setOption(&configured.Description, cfg.Description)
+	setOption(&configured.Enabled, cfg.Enabled)
+	setOption(&configured.TagDictSourceID, cfg.TagDictSourceID)
+	setOption(&configured.TagDisplayMode, cfg.TagDisplayMode)
+	setOption(&configured.AutoUpdate, cfg.AutoUpdate)
+	if err := validateSource(configured, false); err != nil {
+		return database.MetadataSource{}, err
+	}
+	if src.RepoID == "" {
+		src = configured
+	}
+	if cfg.Enabled == nil && !src.Ready && src.LastUpdatedAt == "" {
+		src.Enabled = true
 	}
 
 	staging, err := os.MkdirTemp(m.root, ".upload-")
@@ -143,35 +179,25 @@ func (m *Manager) ImportUploadedSQLite(
 		return database.MetadataSource{}, err
 	}
 
-	now, ready, empty := timestamp(), true, ""
-	sidecarPath := m.indexPath(src.ID)
-	state := database.MetadataSourceSyncState{
-		Ready:           &ready,
-		EntryCount:      &indexed,
-		SidecarPath:     &sidecarPath,
-		FileSize:        &dlRes.DecompressedBytes,
-		LocalSHA256:     &dlRes.SHA256,
-		LastUpdatedAt:   &now,
-		LastCheckedAt:   &now,
-		LastError:       &empty,
-		RemoteETag:      &empty,
-		RemoteLastMod:   &empty,
-		RemoteUpdatedAt: &empty,
-	}
-	if !src.Enabled && !src.Ready && src.LastUpdatedAt == "" {
-		state.Enabled = &ready
-	}
-
 	src.LocalPath = ""
 	src.SchemaType = resolvedSchema
+	src.SidecarPath = m.indexPath(src.ID)
+	src.Ready, src.EntryCount = true, indexed
+	src.FileSize, src.LocalSHA256 = dlRes.DecompressedBytes, dlRes.SHA256
+	src.LastUpdatedAt = timestamp()
+	src.LastCheckedAt = src.LastUpdatedAt
+	src.LastError, src.RemoteETag, src.RemoteLastMod, src.RemoteUpdatedAt = "", "", "", ""
 	files := map[string]string{
 		m.sqlitePath(src.ID): upstream,
-		sidecarPath:          index,
+		src.SidecarPath:      index,
 	}
-	if err := m.publishSync(ctx, src, staging, state, files, nil, nil); err != nil {
-		return database.MetadataSource{}, err
-	}
-	return m.store.GetMetadataSource(ctx, src.ID)
+	var saved database.MetadataSource
+	err = m.publishSource(ctx, src, previous, staging, files, func() error {
+		var err error
+		saved, err = m.store.UpsertMetadataSource(ctx, src)
+		return err
+	})
+	return saved, err
 }
 
 func (m *Manager) Syncs() []SyncRun {
@@ -478,11 +504,61 @@ func (m *Manager) syncSource(ctx context.Context, src database.MetadataSource, f
 	return false, m.publishSync(ctx, src, staging, state, files, dict, mappings)
 }
 
-func (m *Manager) publishSync(ctx context.Context, src database.MetadataSource, staging string, state database.MetadataSourceSyncState, files map[string]string, dict *TagDictionary, mappings []MappingRecord) (err error) {
+func (m *Manager) publishSync(ctx context.Context, src database.MetadataSource, staging string, state database.MetadataSourceSyncState, files map[string]string, dict *TagDictionary, mappings []MappingRecord) error {
+	previous, err := m.store.GetMetadataSource(ctx, src.ID)
+	if err != nil {
+		return err
+	}
+	return m.publishSource(ctx, src, previous, staging, files, func() error {
+		if src.Kind == KindOfflineSQLite {
+			setOption(&src.Enabled, state.Enabled)
+			setOption(&src.Ready, state.Ready)
+			setOption(&src.EntryCount, state.EntryCount)
+			setOption(&src.SidecarPath, state.SidecarPath)
+			setOption(&src.FileSize, state.FileSize)
+			setOption(&src.LocalSHA256, state.LocalSHA256)
+			setOption(&src.RemoteETag, state.RemoteETag)
+			setOption(&src.RemoteLastMod, state.RemoteLastMod)
+			setOption(&src.RemoteUpdatedAt, state.RemoteUpdatedAt)
+			setOption(&src.LastUpdatedAt, state.LastUpdatedAt)
+			_, err := m.store.UpsertMetadataSource(ctx, src)
+			return err
+		}
+		var mappingSources []database.MetadataSource
+		if src.Kind == KindMappingPack {
+			mappingSources, err = m.store.ListMetadataSources(ctx, KindMappingPack)
+			if err != nil {
+				return err
+			}
+		}
+		saved, err := m.store.UpdateMetadataSourceSyncState(ctx, src.ID, state)
+		if err != nil {
+			return err
+		}
+		switch src.Kind {
+		case KindTagDictionary:
+			m.dictionaries[src.ID] = dict
+		case KindMappingPack:
+			m.mappings[src.ID] = mappings
+			for i := range mappingSources {
+				if mappingSources[i].ID == src.ID {
+					mappingSources[i] = saved
+				}
+			}
+			m.rebuildMappings(mappingSources)
+		}
+		return nil
+	})
+}
+
+func (m *Manager) publishSource(ctx context.Context, src, previous database.MetadataSource, staging string, files map[string]string, commit func() error) (err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if m.closed {
+		return ErrUnavailable
 	}
 	if src.Kind == KindOfflineSQLite {
 		m.unloadSource(src.ID)
@@ -498,8 +574,8 @@ func (m *Manager) publishSync(ctx context.Context, src database.MetadataSource, 
 		for i := len(undo) - 1; i >= 0; i-- {
 			err = errors.Join(err, undo[i]())
 		}
-		if src.Kind == KindOfflineSQLite && src.Ready {
-			err = errors.Join(err, m.loadSource(src))
+		if previous.Kind == KindOfflineSQLite && previous.Ready {
+			err = errors.Join(err, m.loadSource(previous))
 		}
 	}()
 	for dest, file := range files {
@@ -522,38 +598,10 @@ func (m *Manager) publishSync(ctx context.Context, src database.MetadataSource, 
 			return err
 		}
 	}
-	var mappingSources []database.MetadataSource
-	if src.Kind == KindMappingPack {
-		mappingSources, err = m.store.ListMetadataSources(ctx, KindMappingPack)
-		if err != nil {
-			return err
-		}
-	}
-	saved, err := m.store.UpdateMetadataSourceSyncState(ctx, src.ID, state)
-	if err != nil {
+	if err := commit(); err != nil {
 		return err
 	}
-	if src.Kind == KindOfflineSQLite && src.SchemaType != "" {
-		if _, schemaErr := m.store.DB().ExecContext(ctx,
-			`UPDATE metadata_sources SET schema_type=?, local_path=? WHERE id=?`,
-			src.SchemaType, src.LocalPath, src.ID,
-		); schemaErr != nil {
-			return schemaErr
-		}
-	}
 	m.invalidateFallbackCoverCacheLocked()
-	switch src.Kind {
-	case KindTagDictionary:
-		m.dictionaries[src.ID] = dict
-	case KindMappingPack:
-		m.mappings[src.ID] = mappings
-		for i := range mappingSources {
-			if mappingSources[i].ID == src.ID {
-				mappingSources[i] = saved
-			}
-		}
-		m.rebuildMappings(mappingSources)
-	}
 	return nil
 }
 

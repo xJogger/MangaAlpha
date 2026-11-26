@@ -149,12 +149,11 @@ func New(_ context.Context, options Options) (*App, error) {
 		subjectID := *meta.BgmSubjectID
 		var items []bangumi.TankobonSubject
 		var err error
-		if allowLive {
+		// Preserve offline relation ordering even when the caller hides adult entries.
+		offlineCtx := database.WithUserScope(ctx, database.UserScope{AllowNSFW: true, ShowNSFW: true})
+		items, _, err = bangumiService.OfflineTankobons(offlineCtx, subjectID)
+		if err == nil && len(items) == 0 && allowLive {
 			items, err = bangumiService.TankobonsForSubject(ctx, subjectID, true)
-		} else {
-			// Keep relation ordering and the distinction between an absent relation and a blocked volume.
-			offlineCtx := database.WithUserScope(ctx, database.UserScope{AllowNSFW: true, ShowNSFW: true})
-			items, _, err = bangumiService.OfflineTankobons(offlineCtx, subjectID)
 		}
 		if err != nil {
 			return nil, err
@@ -169,15 +168,13 @@ func New(_ context.Context, options Options) (*App, error) {
 		matches := bangumi.MatchBooksToTankobons(subjectID, series.EffectiveOneShot(), volumes, items)
 		out := make([]thumbnail.VolumeMatchResult, 0, len(matches))
 		for _, match := range matches {
-			if match.SubjectID == subjectID {
-				match.NSFW = meta.IsNSFW
-				if meta.NSFWLock && !meta.IsNSFW {
-					official, found, err := bangumiService.OfflineSubject(ctx, series, subjectID)
-					match.NSFW = err != nil || !found || official.IsNSFW
-				}
+			if match.MatchedBy == "oneshot_fallback" {
+				official, found, err := bangumiService.OfflineSubject(offlineCtx, series, subjectID)
+				match.NSFWKnown = err == nil && found
+				match.NSFW = meta.IsNSFW || (match.NSFWKnown && official.IsNSFW)
 			}
 			out = append(out, thumbnail.VolumeMatchResult{
-				BookID: match.BookID, SubjectID: match.SubjectID, CoverURL: match.CoverURL, NSFW: match.NSFW,
+				BookID: match.BookID, SubjectID: match.SubjectID, CoverURL: match.CoverURL, NSFW: match.NSFW, NSFWKnown: match.NSFWKnown,
 			})
 		}
 		return out, nil
@@ -209,35 +206,12 @@ func New(_ context.Context, options Options) (*App, error) {
 		}
 		return fetchPublicBangumiCover(ctx, proxyURLProvider(ctx), coverURL, subjectID)
 	})
-	thumbnailService.SetBookExternalCoverFetcher(func(ctx context.Context, sourceID, entryID, coverURL string) ([]byte, string, error) {
+	thumbnailService.SetBookExternalCoverFetcher(func(ctx context.Context, sourceID, entryID, parentEntryID, coverURL string) ([]byte, string, error) {
 		if sourceID == "" && !strings.HasPrefix(coverURL, extmeta.SQLiteBlobCoverPrefix) {
 			cover, err := externalCovers.GetOrFetch(ctx, "book-custom", entryID, coverURL)
 			return cover.Bytes, cover.MediaType, err
 		}
-		if !strings.HasPrefix(coverURL, extmeta.SQLiteBlobCoverPrefix) {
-			return metadataManager.FetchCover(ctx, sourceID, entryID, coverURL)
-		}
-		refSource, kind, recordID, ok := extmeta.ParseSQLiteBlobCoverRef(coverURL)
-		if !ok || refSource != sourceID {
-			return nil, "", extmeta.ErrInvalidConfig
-		}
-		source, err := store.GetMetadataSource(ctx, sourceID)
-		if err != nil || !source.Enabled || !source.Ready || source.Kind != extmeta.KindOfflineSQLite {
-			return nil, "", extmeta.ErrUnavailable
-		}
-		path := source.LocalPath
-		if path == "" {
-			path = filepath.Join(dataDir, "extmeta", source.ID+".sqlite")
-		}
-		key := strings.Join([]string{coverURL, source.LocalSHA256, source.LastUpdatedAt}, "\x00")
-		return thumbnailService.CacheOfflineBookCover(ctx, key, func(ctx context.Context) ([]byte, string, error) {
-			switch kind {
-			case extmeta.SQLiteBlobKindOpenBook, extmeta.SQLiteBlobKindOpenEntry:
-				return extmeta.ReadOpenCoverBLOB(ctx, path, kind, recordID)
-			default:
-				return extmeta.ReadKomgaThumbnailBLOB(ctx, path, kind, recordID)
-			}
-		})
+		return metadataManager.FetchBookCover(ctx, sourceID, entryID, parentEntryID, coverURL)
 	})
 	thumbnailService.SetNSFWFallbackCoverFetcher(metadataManager.FetchFallbackNSFWCover, metadataManager.InvalidateFallbackCoverCache)
 	metadataManager.StartScheduler()

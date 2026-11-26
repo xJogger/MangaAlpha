@@ -392,6 +392,7 @@ func (c *LiveClient) SubjectRelations(ctx context.Context, subjectID int64) ([]T
 	}
 	allowNSFW := showLiveNSFW(ctx)
 	out := make([]TankobonSubject, 0, len(rawItems))
+	order := 0
 	for _, item := range rawItems {
 		if item.ID <= 0 || strings.TrimSpace(item.Relation) != "单行本" {
 			continue
@@ -399,6 +400,7 @@ func (c *LiveClient) SubjectRelations(ctx context.Context, subjectID int64) ([]T
 		if item.Type != 0 && item.Type != 1 {
 			continue
 		}
+		order++
 		isNSFW := item.NSFW != nil && *item.NSFW
 		if isNSFW && !allowNSFW {
 			continue
@@ -416,8 +418,9 @@ func (c *LiveClient) SubjectRelations(ctx context.Context, subjectID int64) ([]T
 			NameCN:    strings.TrimSpace(item.NameCN),
 			Date:      strings.TrimSpace(item.Date),
 			Summary:   strings.TrimSpace(item.Summary),
-			Order:     len(out) + 1,
+			Order:     order,
 			NSFW:      isNSFW,
+			NSFWKnown: item.NSFW != nil,
 			CoverURL:  coverURL,
 		})
 	}

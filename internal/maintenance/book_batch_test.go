@@ -33,7 +33,7 @@ func TestBatchBookCoversOnlyReadsPageWhenRequested(t *testing.T) {
 		if !live || len(books) != 2 {
 			t.Errorf("batch matcher received live=%v books=%v", live, books)
 		}
-		return []thumbnail.VolumeMatchResult{{BookID: "book-1", SubjectID: 41}}, nil
+		return []thumbnail.VolumeMatchResult{{BookID: "book-1", SubjectID: 41, NSFWKnown: true}}, nil
 	})
 	thumbs.SetBangumiCoverFetcher(func(context.Context, string, int64) ([]byte, error) { return page, nil })
 
@@ -195,5 +195,36 @@ func assertBatchTableCount(t *testing.T, store *database.Store, table string, wa
 	var got int
 	if err := store.DB().QueryRow("SELECT count(*) FROM " + table).Scan(&got); err != nil || got != want {
 		t.Fatalf("%s count=%d want=%d err=%v", table, got, want, err)
+	}
+}
+
+func TestBookBatchUnknownTankobonKeepsConfirmedBinding(t *testing.T) {
+	store, thumbs, manager, raw := bookBatchFixture(t)
+	ctx := t.Context()
+	if err := store.UpsertBookScrapedMetadata(ctx, "book-1", database.BookScrapedMetadata{
+		BgmSubjectID: 41, MatchOrigin: "auto",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	thumbs.SetPublicBangumiCoverFetcher(func(_ context.Context, _ string, id int64) ([]byte, error) {
+		if id != 41 {
+			t.Errorf("unknown subject passed to the unchecked public fetcher: %d", id)
+		}
+		return raw, nil
+	})
+	book, err := store.BookByID(ctx, "book-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, _, err := store.BookMetadataByID(ctx, book.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := thumbnail.VolumeMatchResult{BookID: book.ID, SubjectID: 42}
+	if generated, err := manager.batchBookCover(ctx, book, meta, &unknown, nil, JobOptions{Force: true}); err != nil || !generated {
+		t.Fatalf("existing binding unavailable: generated=%v err=%v", generated, err)
+	}
+	if saved, _, err := store.BookMetadataByID(ctx, book.ID); err != nil || saved.BgmSubjectID != 41 {
+		t.Fatalf("confirmed binding was replaced: %+v err=%v", saved, err)
 	}
 }

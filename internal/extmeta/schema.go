@@ -336,7 +336,12 @@ func probeTagDictionaryFile(path string) (SQLiteProbeResult, error) {
 	}, nil
 }
 
-func listSQLiteTables(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+type sqliteQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func listSQLiteTables(ctx context.Context, db sqliteQueryer) (map[string]bool, error) {
 	rows, err := db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type IN ('table','view')`)
 	if err != nil {
 		return nil, err
@@ -416,7 +421,7 @@ func getEntryFromUpstream(ctx context.Context, db *sql.DB, sourceID, schema, ent
 	}
 }
 
-func getMangaAlphaMetaV1Entry(ctx context.Context, db *sql.DB, sourceID, entryID string) (*Entry, error) {
+func getMangaAlphaMetaV1Entry(ctx context.Context, db sqliteQueryer, sourceID, entryID string) (*Entry, error) {
 	cols, err := tableColumns(ctx, db, "entries")
 	if err != nil {
 		return nil, err
@@ -659,78 +664,124 @@ ORDER BY %s`,
 	return out, rows.Err()
 }
 
-// ReadOpenCoverBLOB lazily reads a single cover_blob from an open-format SQLite DB
-// (entries for kind="open-entry", books for kind="open-book"), strictly read-only and <= 16 MiB.
-func ReadOpenCoverBLOB(ctx context.Context, dbPath, kind, key string) ([]byte, string, error) {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return nil, "", ErrEntryNotFound
-	}
-	switch kind {
-	case SQLiteBlobKindOpenEntry, SQLiteBlobKindOpenBook:
-	default:
-		return nil, "", fmt.Errorf("%w: unsupported open cover kind %q", ErrInvalidConfig, kind)
-	}
+// openBookCoverKey encodes each component independently so separators inside
+// source IDs and book keys cannot change the referenced row.
+func openBookCoverKey(seriesID, bookKey string) string {
+	return "/" + url.PathEscape(seriesID) + "/" + url.PathEscape(bookKey)
+}
 
+func resolveOpenBookCover(ctx context.Context, db sqliteQueryer, key, entryID, parentEntryID string) (string, string, error) {
+	if key == "" {
+		return "", "", ErrEntryNotFound
+	}
+	var predicate string
+	var args []any
+	switch {
+	case key == entryID && entryID != "":
+		predicate, args = "b.book_key=?", []any{key}
+	case strings.HasPrefix(key, "/"):
+		series, book, ok := strings.Cut(strings.TrimPrefix(key, "/"), "/")
+		if !ok || strings.Contains(book, "/") {
+			return "", "", ErrInvalidConfig
+		}
+		seriesID, seriesErr := url.PathUnescape(series)
+		bookKey, bookErr := url.PathUnescape(book)
+		if seriesErr != nil || bookErr != nil || seriesID == "" || bookKey == "" || (entryID != "" && bookKey != entryID) {
+			return "", "", ErrInvalidConfig
+		}
+		predicate, args = "b.series_entry_id=? AND b.book_key=?", []any{seriesID, bookKey}
+	case entryID != "":
+		// Legacy colon-separated refs use the bare book key in book_metadata.
+		series, ok := strings.CutSuffix(key, ":"+entryID)
+		if !ok || series == "" {
+			return "", "", ErrInvalidConfig
+		}
+		predicate, args = "b.series_entry_id=? AND b.book_key=?", []any{series, entryID}
+	default:
+		if strings.Contains(key, ":") {
+			seriesID, bookKey, err := queryOpenBookOwner(ctx, db, parentEntryID, "b.series_entry_id || ':' || b.book_key=?", key)
+			if !errors.Is(err, sql.ErrNoRows) {
+				return seriesID, bookKey, err
+			}
+		}
+		predicate, args = "b.book_key=?", []any{key}
+	}
+	seriesID, bookKey, err := queryOpenBookOwner(ctx, db, parentEntryID, predicate, args...)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = ErrEntryNotFound
+	}
+	return seriesID, bookKey, err
+}
+
+func queryOpenBookOwner(ctx context.Context, db sqliteQueryer, parentEntryID, predicate string, args ...any) (seriesID, bookKey string, err error) {
+	if parentEntryID != "" {
+		predicate += " AND b.series_entry_id=?"
+		args = append(args, parentEntryID)
+	}
+	rows, err := db.QueryContext(ctx, `
+SELECT b.series_entry_id,b.book_key FROM books b
+JOIN entries e ON e.id=b.series_entry_id WHERE `+predicate+` LIMIT 2`, args...)
+	if err != nil {
+		return "", "", err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", "", err
+		}
+		return "", "", sql.ErrNoRows
+	}
+	if err := rows.Scan(&seriesID, &bookKey); err != nil {
+		return "", "", err
+	}
+	if rows.Next() {
+		return "", "", ErrEntryNotFound
+	}
+	return seriesID, bookKey, rows.Err()
+}
+
+// ReadOpenCoverBLOB lazily reads a single cover_blob from an open-format SQLite DB.
+func ReadOpenCoverBLOB(ctx context.Context, dbPath, kind, key string) ([]byte, string, error) {
 	db, err := openKomgaReadOnlySQLite(dbPath)
 	if err != nil {
 		return nil, "", err
 	}
 	defer db.Close()
+	key = strings.TrimSpace(key)
+	if kind == SQLiteBlobKindOpenBook {
+		seriesID, bookKey, err := resolveOpenBookCover(ctx, db, key, "", "")
+		if err != nil {
+			return nil, "", err
+		}
+		return readOpenCoverBLOB(ctx, db, kind, seriesID, bookKey)
+	}
+	return readOpenCoverBLOB(ctx, db, kind, key, "")
+}
 
-	tables, err := listSQLiteTables(ctx, db)
-	if err != nil {
-		return nil, "", err
+func readOpenCoverBLOB(ctx context.Context, db sqliteQueryer, kind, seriesID, bookKey string) ([]byte, string, error) {
+	var where string
+	args := []any{maxSQLiteBlobCoverBytes, seriesID}
+	switch kind {
+	case SQLiteBlobKindOpenEntry:
+		where = "entries WHERE id=?"
+	case SQLiteBlobKindOpenBook:
+		where = "books WHERE series_entry_id=? AND book_key=?"
+		args = append(args, bookKey)
+	default:
+		return nil, "", ErrInvalidConfig
 	}
 
-	var (
-		blobSize sql.NullInt64
-		blob     []byte
-	)
-	if kind == SQLiteBlobKindOpenEntry {
-		if !tables["entries"] {
-			return nil, "", ErrEntryNotFound
-		}
-		cols, err := tableColumns(ctx, db, "entries")
-		if err != nil || !cols["cover_blob"] || !cols["id"] {
-			return nil, "", ErrEntryNotFound
-		}
-		err = db.QueryRowContext(ctx, `
+	var blobSize sql.NullInt64
+	var blob []byte
+	err := db.QueryRowContext(ctx, `
 SELECT LENGTH(cover_blob),
        CASE WHEN LENGTH(cover_blob) <= ? THEN cover_blob ELSE NULL END
-FROM entries WHERE id = ? LIMIT 1`, maxSQLiteBlobCoverBytes, key).Scan(&blobSize, &blob)
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, "", ErrEntryNotFound
-		}
-		if err != nil {
-			return nil, "", err
-		}
-	} else {
-		if !tables["books"] {
-			return nil, "", ErrEntryNotFound
-		}
-		cols, err := tableColumns(ctx, db, "books")
-		if err != nil || !cols["cover_blob"] || !cols["book_key"] {
-			return nil, "", ErrEntryNotFound
-		}
-		err = db.QueryRowContext(ctx, `
-SELECT LENGTH(cover_blob),
-       CASE WHEN LENGTH(cover_blob) <= ? THEN cover_blob ELSE NULL END
-FROM books WHERE book_key = ? LIMIT 1`, maxSQLiteBlobCoverBytes, key).Scan(&blobSize, &blob)
-		if errors.Is(err, sql.ErrNoRows) && cols["series_entry_id"] {
-			if sid, bkey, ok := strings.Cut(key, ":"); ok && sid != "" && bkey != "" {
-				err = db.QueryRowContext(ctx, `
-SELECT LENGTH(cover_blob),
-       CASE WHEN LENGTH(cover_blob) <= ? THEN cover_blob ELSE NULL END
-FROM books WHERE series_entry_id = ? AND book_key = ? LIMIT 1`, maxSQLiteBlobCoverBytes, sid, bkey).Scan(&blobSize, &blob)
-			}
-		}
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, "", ErrEntryNotFound
-		}
-		if err != nil {
-			return nil, "", err
-		}
+FROM `+where+` LIMIT 1`, args...).Scan(&blobSize, &blob)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, "", ErrEntryNotFound
+	}
+	if err != nil {
+		return nil, "", err
 	}
 
 	if blobSize.Valid && blobSize.Int64 > maxSQLiteBlobCoverBytes {

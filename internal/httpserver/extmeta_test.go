@@ -604,6 +604,84 @@ INSERT INTO entries VALUES ('oe1','Open Entry','','[]','','[]','Manga','',9,0,1,
 		t.Fatalf("komga blob entry cover = %d ct=%q len=%d", coverW.Code, coverW.Header().Get("Content-Type"), coverW.Body.Len())
 	}
 
+	// A valid replacement payload must not be published when any later part fails.
+	before, err := store.GetMetadataSource(ctx, createdView.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeFiles := make(map[string][]byte)
+	for _, filename := range []string{filepath.Join(srv.runtime.DataDir, "extmeta", before.ID+".sqlite"), before.SidecarPath} {
+		content, err := os.ReadFile(filename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeFiles[filename] = content
+	}
+	for _, malformed := range []string{"duplicate file", "damaged tail", "unknown field", "invalid option"} {
+		t.Run(malformed, func(t *testing.T) {
+			var body bytes.Buffer
+			mw := multipart.NewWriter(&body)
+			if err := mw.WriteField("sourceId", before.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := mw.WriteField("name", "Should not replace existing name"); err != nil {
+				t.Fatal(err)
+			}
+			addFile := func() {
+				t.Helper()
+				part, err := mw.CreateFormFile("file", "replacement.sqlite")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := part.Write(openRaw); err != nil {
+					t.Fatal(err)
+				}
+			}
+			addFile()
+			switch malformed {
+			case "duplicate file":
+				addFile()
+			case "damaged tail":
+				// Leave a valid boundary after the file, then corrupt the
+				// final delimiter after the ordinary form field.
+				if err := mw.WriteField("description", "replacement"); err != nil {
+					t.Fatal(err)
+				}
+			case "unknown field":
+				if err := mw.WriteField("unexpected", "invalid"); err != nil {
+					t.Fatal(err)
+				}
+			case "invalid option":
+				if err := mw.WriteField("tagDisplayMode", "invalid"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := mw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if malformed == "damaged tail" {
+				body.Truncate(body.Len() - 3)
+				body.WriteString("!\r\n")
+			}
+			req := httptest.NewRequest(http.MethodPost, "/admin/api/metadata/sources/upload", &body)
+			req.Header.Set("Content-Type", mw.FormDataContentType())
+			req.Header.Set("X-API-Key", adminKey)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("got %d, want 400: %s", w.Code, w.Body.String())
+			}
+			if after, err := store.GetMetadataSource(ctx, before.ID); err != nil || after != before {
+				t.Fatalf("rejected upload changed the source: err=%v", err)
+			}
+			for filename, expected := range beforeFiles {
+				if got, err := os.ReadFile(filename); err != nil || !bytes.Equal(got, expected) {
+					t.Fatalf("rejected upload changed %s: err=%v", filepath.Base(filename), err)
+				}
+			}
+		})
+	}
+
 	// 5. Overwrite existing source with .sqlite.gz (mangaalpha_meta_v2) -> 200 OK.
 	updResp := makeUploadReq(adminKey, "open.sqlite.gz", openGZ.Bytes(), true, [][2]string{{"sourceId", createdView.ID}})
 	if updResp.Code != http.StatusOK {

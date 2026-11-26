@@ -195,8 +195,8 @@ CREATE TABLE books (
 - 当系列通过自动刮削或手工绑定命中含 `books` 分表的 `mangaalpha_meta_v1` / `v2` 条目时，系统会自动将旗下分册与本地单册按三层瀑布流对齐：
   1. 归一化文件名精确匹配（去归档扩展名、剥离常见方括号组名标签、繁简/日文异体字折叠）；
   2. 明确无歧义卷号匹配（识别 `Vol.XX`、`第XX巻/卷` 及结构化 `number`/`number_sort`，隔离章节与卷号防串书）；
-  3. 归一化标题相似度或唯一单册（One-shot）安全一对一对齐。
-- 写入 `book_metadata` 时严格遵守 9 个分册字段锁（`TitleLock`、`SummaryLock`、`NumberLock`、`NumberSortLock`、`ReleaseDateLock`、`ISBNLock`、`AuthorsLock`、`TagsLock`、`LinksLock`），自动刮削严格跳过 `match_origin IN ('manual', 'agent')` 的已锁定单册；`books.cover_blob`（当 `books.cover_url` 为空时）同样编码为 `sqlite-blob://<sourceID>/open-book/<seriesEntryID>:<bookKey>` 懒加载缓存，非 Bangumi 外部源写入期间始终保留系列已有 `bgm_subject_id`。
+  3. 归一化标题相似度。仅当本地系列与上游系列各有一册时才允许一对一回退。
+- 各层都校验可解析的卷号和番外标记。写入 `book_metadata` 时严格遵守 9 个分册字段锁（`TitleLock`、`SummaryLock`、`NumberLock`、`NumberSortLock`、`ReleaseDateLock`、`ISBNLock`、`AuthorsLock`、`TagsLock`、`LinksLock`），自动刮削严格跳过 `match_origin IN ('manual', 'agent')` 的已锁定单册；`books.cover_blob`（当 `books.cover_url` 为空时）编码为 `sqlite-blob://<sourceID>/open-book/<recordID>`。生成引用时独立转义 `series_entry_id` 和 `book_key`，再将复合键编码为 URL 路径段。读取旧引用时按父条目归属校验，遇到歧义则拒绝读取。写入非 Bangumi 外部源时保留系列已有的 `bgm_subject_id`。
 
 ---
 
@@ -207,18 +207,16 @@ MangaAlpha 原生支持将导出的只读 Komga `database.sqlite` 作为离线�
 ### 4.1 Web 流式大文件上传接入
 
 - **接口端点**：`POST /admin/api/metadata/sources/upload`（受 `requireAdmin`、同源 CSRF 与 `X-FK115-User-Id` 校验保护）。
-- **流式协议**：使用 `multipart/form-data`（可传 `name`、`sourceId`、`description`、`enabled`、`tagDictSourceId`、`tagDisplayMode`、`autoUpdate` 与 `file` 字段）；服务端基于流式 `MultipartReader` 逐块读写落盘（**不触发 `ParseMultipartForm` 双份落盘与内存缓冲**），支持直接上传 `.sqlite` / `.sqlite3` / `.db` 以及 `.zip` / `.gz` / `.zst` 压缩包，单文件流式上限 **10 GiB**。
-- **格式校验**：落盘前校验 SQLite3 文件头魔数 `SQLite format 3\x00` 与 `ProbeSQLiteFile` 结构合法性，非法格式直接拒绝并原子清理临时文件；支持创建新源（`201 Created`）或覆盖更新已有源并自动重建 Sidecar 索引。
-- **反向代理配置提示**：上传大型 Komga `database.sqlite`（数百 MB 至数 GB）时，请务必调大前置反向代理的请求体上限与超时设置，例如：
-  - **Nginx**：`client_max_body_size 10G;` 并适当调高 `proxy_read_timeout` / `proxy_send_timeout`；
-  - **Caddy**：在站点块配置 `request_body { max_size 10GB }`。
+- **流式协议**。使用 `multipart/form-data`，支持 `name`、`sourceId`、`description`、`kind`、`enabled`、`tagDictSourceId`、`tagDisplayMode`、`autoUpdate` 和一个 `file` 字段。服务端逐块暂存上传文件，支持 `.sqlite`、`.sqlite3`、`.db`、`.zip`、`.gz`、`.zst`，单文件上限 **10 GiB**。读完整个 multipart 请求并验证 SQLite 文件头、表结构及 Sidecar 索引后，才发布新源（`201 Created`）或替换已有源（`200 OK`）。
+- **临时空间**。系统临时目录需要容纳上传文件。导入目录同时需要容纳解压后的 SQLite、正在构建的 Sidecar 和覆盖时保留的旧文件。ZIP 还需要一份压缩包副本用于读取中央目录。系统临时目录与数据目录位于同一磁盘时，按各项空间之和预留容量。
+- **反向代理**。请求体上限需计入 multipart 边界与表单字段。服务端总请求体上限为 **10 GiB + 2 MiB**。可将 Nginx 的 `client_max_body_size` 或 Caddy 的 `request_body max_size` 设为 `10739515392` 字节，并为上传、解压和索引构建预留足够的超时。
 
 ### 4.2 本机 `localPath` 挂载与 `-wal` Checkpoint 注意事项
 
 - 支持在管理后台创建或编辑 `offline_sqlite` 源时填写绝对路径 `localPath`（禁止软链接逃逸与 `..` 路径穿越）。
-- **WAL 日志与 Checkpoint 告警**：运行中的 Komga 可能将最新修改写入同目录的 `database.sqlite-wal` 尚未合并回主库。MangaAlpha 对只读挂载源采用安全只读打开策略（仅当 `-wal` 与 `-shm` 同时可读时附带 WAL 读取，若仅存在孤立 `-wal` 则以 `immutable=1` 打开避免在只读挂载点创建 `-shm` 报错）。同时源列表（`GET /admin/api/metadata/sources`）与概览（`GET /admin/api/metadata/overview`）会返回：
-  - `schemaFormat`：识别出的数据库格式（如 `komga_sqlite_v1`、`mangaalpha_meta_v2`）；
-  - `walWarning` / `walWarningBytes` / `walWarningMessage`：当同目录检测到非空 `-wal` 文件时置为 `true` 并提示管理员先停止 Komga 或执行 `PRAGMA wal_checkpoint(TRUNCATE);` 后再复制或同步，避免缺失最新增量数据。
+- **WAL 日志与 Checkpoint 告警**。复制或上传 Komga 数据库前，请先停止 Komga，或在 Komga 所在端执行 `PRAGMA wal_checkpoint(TRUNCATE);` 并确认成功，使最新事务合并到主文件。单独上传 SQLite 文件只能导入主文件中的数据。
+- 本机挂载源在 `-wal` 和 `-shm` 都可读时尝试读取 WAL，并通过实际表结构查询验证能否打开。边车文件缺失或查询失败时，以 `immutable=1` 读取已 Checkpoint 的主文件。只读接入无需创建或修改上游文件。回退期间，隐藏 NSFW 的账号暂时无法读取该源的 BLOB 封面，因为 WAL 中可能包含尚未读取到的分级变更。
+- 源列表（`GET /admin/api/metadata/sources`）和概览（`GET /admin/api/metadata/overview`）返回 `schemaFormat`。发现非空 `-wal` 时返回 `walWarning`、`walWarningBytes` 和 `walWarningMessage`，提示先做 Checkpoint 再同步。
 
 ### 4.3 系列/分册刮削与 BLOB 封面按需懒缓存
 

@@ -184,6 +184,19 @@ func validateProxyURL(raw string) (*url.URL, error) {
 	}
 }
 
+// ValidateExternalURL checks that raw is a public HTTP/HTTPS URL safe against
+// literal private/loopback/internal host SSRF.
+func ValidateExternalURL(raw string) error {
+	u, err := validateHTTPURL(raw)
+	if err != nil {
+		return err
+	}
+	if u.User != nil {
+		return ErrInvalidURL
+	}
+	return validateTargetURL(u, false)
+}
+
 func validateHTTPURL(raw string) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

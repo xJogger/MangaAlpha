@@ -356,7 +356,7 @@ VALUES('aria',539,'https://bgm.example.test/539.jpg','auto','none','2026-01-01T0
 	execManagerFixture(t, store.DB(), `DELETE FROM books WHERE id='mb2'`)
 	seedWave2BBook(t, store, "mb2", "aria", "lib-main", "Renamed Vol.02.cbz", 2.0)                  // Tier 2 vol=2 -> kb2 (locked fields)
 	seedWave2BBook(t, store, "mb3", "aria", "lib-main", "[OtherScan] Aqua Prologue Special.cbz", 5) // Tier 1 normalized filename -> kb3 (manual protect)
-	seedWave2BBook(t, store, "mb4", "aria", "lib-main", "Evening Gondola Guide.cbz", 8)             // Tier 3 title match -> kb4
+	seedWave2BBook(t, store, "mb4", "aria", "lib-main", "Evening Gondola Guide [Bonus].cbz", 8)     // Tier 3 title match -> kb4
 	seedWave2BBook(t, store, "u-b1", "unrecognized-dir", "lib-main", "RandomFile.cbz", 1)
 
 	locked := true
@@ -443,7 +443,7 @@ VALUES('aria',539,'https://bgm.example.test/539.jpg','auto','none','2026-01-01T0
 		t.Fatalf("mb4 Tier-3 title similarity failed: %+v", bm4)
 	}
 
-	// Check cached book_metadata hint match without ArchiveMetaReader.
+	// Check cached book_metadata hint match without opening an archive.
 	uMeta, err := store.SeriesMetadataByID(ctx, database.Series{ID: "unrecognized-dir", LibraryID: "lib-main", Name: "Completely Unknown Folder 999"})
 	if err != nil || uMeta.ExtEntryID != "k-s1" {
 		t.Fatalf("cached book_metadata fallback failed: %+v, err=%v", uMeta, err)
@@ -455,7 +455,12 @@ VALUES('aria',539,'https://bgm.example.test/539.jpg','auto','none','2026-01-01T0
 	if err != nil || sfMime != "image/jpeg" || !bytes.Equal(sfBytes, jpgBytes) {
 		t.Fatalf("FetchCover komga-series failed: mime=%q err=%v", sfMime, err)
 	}
-	cachedData, hit := m.covers.readCachedFromDisk(src.ID, "k-s1", sm.ExtCoverURL)
+	currentSource, err := store.GetMetadataSource(ctx, src.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheKey := strings.Join([]string{sm.ExtCoverURL, currentSource.LocalSHA256, currentSource.LastUpdatedAt}, "\x00")
+	cachedData, hit := m.covers.readCachedFromDisk(src.ID, "k-s1", cacheKey)
 	if !hit || !cachedData.FromCache || !bytes.Equal(cachedData.Bytes, jpgBytes) {
 		t.Fatalf("expected disk cache hit after lazy BLOB fetch, hit=%v", hit)
 	}
@@ -465,7 +470,16 @@ VALUES('aria',539,'https://bgm.example.test/539.jpg','auto','none','2026-01-01T0
 	}
 
 	// NSFW user restriction must block Komga NSFW series & book BLOB covers.
-	safeCtx := database.WithUserScope(ctx, database.UserScope{UserID: "reader", IsAdmin: false, AllowNSFW: false, ShowNSFW: false})
+	safeCtx := database.WithUserScope(ctx, database.UserScope{UserID: "reader", AllowNSFW: true, ShowNSFW: false})
+	if _, _, err := m.FetchCover(safeCtx, src.ID, "k-s1", sm.ExtCoverURL); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("cached cover was authorized by a potentially stale checkpoint: %v", err)
+	}
+	if err := os.Remove(komgaPath + "-wal"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.FetchCover(safeCtx, src.ID, "k-s1", sm.ExtCoverURL); err != nil {
+		t.Fatalf("checkpointed public cover unavailable: %v", err)
+	}
 	nsfwSeriesCover := EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindKomgaSeries, "ts-2")
 	nsfwBookCover := EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindKomgaBook, "tb-sec")
 	if _, _, err := m.FetchCover(safeCtx, src.ID, "k-s2", nsfwSeriesCover); !errors.Is(err, ErrUnavailable) {
@@ -477,6 +491,51 @@ VALUES('aria',539,'https://bgm.example.test/539.jpg','auto','none','2026-01-01T0
 	if gotBytes, gotMime, err := m.FetchCover(adminCtx, src.ID, "kb-sec", nsfwBookCover); err != nil || gotMime != "image/png" || !bytes.Equal(gotBytes, pngBytes) {
 		t.Fatalf("expected admin NSFW book cover fetch to succeed, mime=%q err=%v", gotMime, err)
 	}
+	for _, tc := range []struct{ entry, ref string }{{"k-s1", nsfwSeriesCover}, {"kb1", nsfwBookCover}} {
+		if _, _, err := m.FetchCover(adminCtx, src.ID, tc.entry, tc.ref); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("mismatched Komga cover owner accepted: %v", err)
+		}
+	}
+
+	// Both locally stored references and their cached bytes predate the new rating.
+	upstream, err := sql.Open("sqlite", komgaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execManagerFixture(t, upstream, `UPDATE SERIES_METADATA SET AGE_RATING=18 WHERE SERIES_ID='k-s1'`)
+	if err := upstream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	syncManagerFixture(t, m, src, true, "success")
+	for _, tc := range []struct{ entry, ref string }{{"k-s1", sm.ExtCoverURL}, {"kb1", bm1.ExtCoverURL}} {
+		if _, _, err := m.FetchCover(adminCtx, src.ID, tc.entry, tc.ref); err != nil {
+			t.Fatalf("authorized user could not warm the refreshed cache: %v", err)
+		}
+		if _, _, err := m.FetchCover(safeCtx, src.ID, tc.entry, tc.ref); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("refreshed NSFW Komga cover served to user with showNSFW off: %v", err)
+		}
+	}
+
+	// Surface a genuine write error in scrape statistics.
+	execManagerFixture(t, store.DB(), `
+CREATE TRIGGER fail_volume_write BEFORE UPDATE ON book_metadata WHEN old.book_id='mb1'
+BEGIN SELECT RAISE(ABORT,'fixture book write failure'); END`)
+	failedRun, err := m.StartMultiScrape(ctx, "lib-main", "force", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForManager(t, func() bool {
+		for _, current := range m.ScrapeRuns() {
+			if current.ID == failedRun.ID && current.CompletedAt != "" {
+				if current.Status != "partial" || current.Failed != 1 {
+					t.Fatalf("book write failure was not counted: %+v", current)
+				}
+				return true
+			}
+		}
+		return false
+	})
+
 }
 
 func TestMangaAlphaMetaV2ExtendedColsBooksAndBlobCache(t *testing.T) {
@@ -521,7 +580,7 @@ func TestMangaAlphaMetaV2ExtendedColsBooksAndBlobCache(t *testing.T) {
 
 	bm, ok, err := store.BookMetadataByID(ctx, "gb1")
 	if err != nil || !ok || bm.Title != "Departing Earth" || bm.ISBN != "978-1111111111" ||
-		bm.ExtCoverURL != EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindOpenBook, "s1:vol-1") {
+		bm.ExtCoverURL != EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindOpenBook, openBookCoverKey("s1", "vol-1")) {
 		t.Fatalf("unexpected open-v2 aligned book metadata: ok=%v err=%v %+v", ok, err, bm)
 	}
 
@@ -534,6 +593,55 @@ func TestMangaAlphaMetaV2ExtendedColsBooksAndBlobCache(t *testing.T) {
 	if err != nil || bmime != "image/png" || !bytes.Equal(bb, pngBytes) {
 		t.Fatalf("FetchCover open-book failed (or collided with s2): mime=%q err=%v", bmime, err)
 	}
+	safeCtx := database.WithUserScope(ctx, database.UserScope{UserID: "reader", AllowNSFW: true})
+	adminCtx := database.WithUserScope(ctx, database.UserScope{IsAdmin: true, AllowNSFW: true, ShowNSFW: true})
+	otherRef := EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindOpenBook, openBookCoverKey("s2", "vol-1"))
+	for _, tc := range []struct {
+		ref      string
+		expected []byte
+	}{
+		{bm.ExtCoverURL, pngBytes},
+		{otherRef, jpgBytes},
+		{EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindOpenBook, "s1:vol-1"), pngBytes},
+	} {
+		if raw, _, err := m.FetchCover(safeCtx, src.ID, "vol-1", tc.ref); err != nil || !bytes.Equal(raw, tc.expected) {
+			t.Fatalf("open book cover picked the wrong series: err=%v", err)
+		}
+	}
+	legacyBare := EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindOpenBook, "vol-1")
+	if _, _, err := m.FetchCover(adminCtx, src.ID, "vol-1", legacyBare); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("ambiguous legacy book key accepted: %v", err)
+	}
+	if raw, _, err := m.FetchBookCover(safeCtx, src.ID, "vol-1", "s1", legacyBare); err != nil || !bytes.Equal(raw, pngBytes) {
+		t.Fatalf("legacy key did not resolve through the book's parent binding: %v", err)
+	}
+	if _, _, err := m.FetchBookCover(adminCtx, src.ID, "vol-1", "s2", bm.ExtCoverURL); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("mismatched parent binding accepted: %v", err)
+	}
+	upstream, err := sql.Open("sqlite", v2Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execManagerFixture(t, upstream, `UPDATE entries SET is_nsfw=1 WHERE id='s1'`)
+	if err := upstream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	syncManagerFixture(t, m, src, true, "success")
+	if _, _, err := m.FetchCover(adminCtx, src.ID, "vol-1", bm.ExtCoverURL); err != nil {
+		t.Fatalf("authorized user could not warm the refreshed cache: %v", err)
+	}
+	for _, ref := range []string{bm.ExtCoverURL, EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindOpenBook, "s1:vol-1")} {
+		if _, _, err := m.FetchCover(safeCtx, src.ID, "vol-1", ref); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("refreshed NSFW open book cover served to user with showNSFW off: %v", err)
+		}
+	}
+	if _, _, err := m.FetchCover(safeCtx, src.ID, "s1", saved.ExtCoverURL); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("refreshed NSFW open entry cover served to user with showNSFW off: %v", err)
+	}
+	if raw, _, err := m.FetchCover(safeCtx, src.ID, "vol-1", otherRef); err != nil || !bytes.Equal(raw, jpgBytes) {
+		t.Fatalf("other series with the same key was affected: %v", err)
+	}
+
 }
 
 func TestImportUploadedSQLiteFormatsAndValidation(t *testing.T) {
@@ -632,5 +740,76 @@ func TestImportUploadedSQLiteFormatsAndValidation(t *testing.T) {
 	hits, err := m.sidecars[src.ID].SearchByTitle(ctx, "银河铁道", 5)
 	if err != nil || len(hits) == 0 || !slices.ContainsFunc(hits, func(h SearchMatch) bool { return h.EntryID == "s1" }) {
 		t.Fatalf("existing sidecar damaged after failed upload: hits=%+v err=%v", hits, err)
+	}
+}
+
+func TestAlignSeriesBooksRejectsConflictingVolumesAndLeftoverExtras(t *testing.T) {
+	t.Run("bracket removal never erases volume conflicts", func(t *testing.T) {
+		locals := []localBookCandidate{{ID: "one", Name: "作品 [v03].cbz"}}
+		remotes := []remoteBookEntry{{EntryID: "one", FileNames: []string{"作品 [v02].cbz"}}}
+		if pairs := alignSeriesBooks(locals, remotes); len(pairs) != 0 {
+			t.Fatalf("paired different volumes: %+v", pairs)
+		}
+	})
+	t.Run("unrelated extras cannot use the single book fallback", func(t *testing.T) {
+		locals := []localBookCandidate{
+			{ID: "one", Name: "作品 [v01].cbz"},
+			{ID: "extra", Name: "未刊番外篇.cbz"},
+		}
+		remotes := []remoteBookEntry{
+			{EntryID: "one", FileNames: []string{"作品 [v01].cbz"}},
+			{EntryID: "extra", FileNames: []string{"来访者特典.cbz"}},
+		}
+		if pairs := alignSeriesBooks(locals, remotes); len(pairs) != 1 || pairs[0] != (bookMatchPair{0, 0}) {
+			t.Fatalf("unexpected multi-volume alignment: %+v", pairs)
+		}
+		remotes[1].FileNames = []string{"作品 [v02].cbz"}
+		locals[1].Name = "作品 [番外].cbz"
+		if pairs := alignSeriesBooks(locals, remotes); len(pairs) != 1 || pairs[0] != (bookMatchPair{0, 0}) {
+			t.Fatalf("paired an extra with a missing main volume: %+v", pairs)
+		}
+	})
+}
+
+func TestAlignedBookWriteRejectsStaleSeriesBinding(t *testing.T) {
+	store, m, _ := newTestManager(t, ManagerOptions{})
+	ctx := t.Context()
+	seedMetadataLibrary(t, store, "catalog", true)
+	seedMetadataSeries(t, store, "series", "catalog", "Work")
+	seedWave2BBook(t, store, "book", "series", "catalog", "Work v01.cbz", 1)
+	execManagerFixture(t, store.DB(), `
+INSERT INTO series_metadata(series_id,ext_source_id,ext_entry_id,match_origin,updated_at)
+VALUES ('series','source','old','auto','')`)
+	locals := []localBookCandidate{{ID: "book", Name: "Work v01.cbz"}}
+	remotes := []remoteBookEntry{{EntryID: "volume", FileNames: []string{"Work v01.cbz"}, Title: "Stale title"}}
+	pairs := alignSeriesBooks(locals, remotes)
+	if len(pairs) != 1 {
+		t.Fatalf("fixture failed to align: %+v", pairs)
+	}
+
+	// Hold the rebind uncommitted while the stale writer starts. The writer
+	// must take the immediate transaction before checking the current binding.
+	rebind, err := store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rebind.Rollback()
+	if _, err := rebind.ExecContext(ctx, `UPDATE series_metadata SET ext_entry_id='new',match_origin='manual' WHERE series_id='series'`); err != nil {
+		t.Fatal(err)
+	}
+	started, done := make(chan struct{}), make(chan error, 1)
+	go func() {
+		close(started)
+		done <- m.writeAlignedSeriesBooks(ctx, "series", "source", "old", "auto", locals, remotes, pairs)
+	}()
+	<-started
+	if err := rebind.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, database.ErrMetadataChanged) {
+		t.Fatalf("stale writer was not rejected: %v", err)
+	}
+	if meta, exists, err := store.BookMetadataByID(ctx, "book"); err != nil || exists {
+		t.Fatalf("stale writer changed the book: %+v err=%v", meta, err)
 	}
 }

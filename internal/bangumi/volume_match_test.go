@@ -192,3 +192,24 @@ func TestMatchBooksToTankobonsEmptyTankobonsPolicies(t *testing.T) {
 		t.Fatalf("expected 0 matches for multi-volume series without tankobons, got %+v", resMulti)
 	}
 }
+
+func TestVolumeMatchCompletionTagsAndDuplicateVolumes(t *testing.T) {
+	chapter := VolumeMatchBook{BookID: "chapter", Name: "作品 第1话 [全1卷] [完结].cbz", Number: "1"}
+	targets := []TankobonSubject{{SubjectID: 101, Name: "作品 Vol.01"}, {SubjectID: 102, Name: "作品 Vol.02"}}
+	for _, relations := range [][]TankobonSubject{targets, nil} {
+		if matches := MatchBooksToTankobons(100, true, []VolumeMatchBook{chapter}, relations); len(matches) != 0 {
+			t.Fatalf("chapter matched as a volume: %+v", matches)
+		}
+	}
+	books := []VolumeMatchBook{
+		{BookID: "range", Name: "作品 Vol.01-02.cbz"},
+		{BookID: "exact", Name: "作品 Vol.01.cbz"},
+	}
+	if matches := MatchBooksToTankobons(100, false, books, targets); len(matches) != 1 || matches[0].BookID != "exact" || matches[0].SubjectID != 101 {
+		t.Fatalf("exact volume did not beat the range: %+v", matches)
+	}
+	books[0].Name = "作品 Vol.01 [Other Edition].cbz"
+	if matches := MatchBooksToTankobons(100, false, books, targets); len(matches) != 0 {
+		t.Fatalf("ambiguous duplicate volumes were bound: %+v", matches)
+	}
+}

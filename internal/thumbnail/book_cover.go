@@ -28,6 +28,7 @@ type VolumeMatchResult struct {
 	SubjectID int64
 	CoverURL  string
 	NSFW      bool
+	NSFWKnown bool
 }
 
 // TankobonMatcher aligns local volume names with a series' Bangumi volumes.
@@ -150,7 +151,7 @@ func (s *Service) visibleBookCover(ctx context.Context, id string, data Data) (D
 }
 
 func (s *Service) fetchBookUserCover(ctx context.Context, book database.Book, m database.BookMetadata, source string) Data {
-	var sourceID, entryID, coverURL string
+	var sourceID, entryID, parentEntryID, coverURL string
 	switch source {
 	case "custom":
 		if m.CustomCoverPath != "" && filepath.Base(m.CustomCoverPath) == m.CustomCoverPath {
@@ -165,20 +166,16 @@ func (s *Service) fetchBookUserCover(ctx context.Context, book database.Book, m 
 		entryID, coverURL = book.ID, m.CustomCoverURL
 	case "ext":
 		sourceID, entryID, coverURL = m.ExtSourceID, m.ExtEntryID, m.ExtCoverURL
-		if sourceID != "" && coverURL != "" && !strings.HasPrefix(coverURL, "sqlite-blob://") {
-			// External cover access follows the source's series-level rating.
-			var parentEntryID string
-			if err := s.store.DB().QueryRowContext(ctx, `
-SELECT ext_entry_id FROM series_metadata WHERE series_id=? AND ext_source_id=?`, book.SeriesID, sourceID).Scan(&parentEntryID); err == nil && parentEntryID != "" {
-				entryID = parentEntryID
-			}
+		if sourceID != "" && coverURL != "" {
+			_ = s.store.DB().QueryRowContext(ctx, `
+SELECT ext_entry_id FROM series_metadata WHERE series_id=? AND ext_source_id=?`, book.SeriesID, sourceID).Scan(&parentEntryID)
 		}
 	}
 	s.externalMu.RLock()
 	fetch := s.bookExternalFetcher
 	s.externalMu.RUnlock()
 	if fetch != nil && coverURL != "" {
-		if raw, mediaType, err := fetch(ctx, sourceID, entryID, coverURL); err == nil {
+		if raw, mediaType, err := fetch(ctx, sourceID, entryID, parentEntryID, coverURL); err == nil {
 			return Data{Bytes: raw, MediaType: mediaType}
 		}
 	}
@@ -194,19 +191,49 @@ func (s *Service) matchBookCover(ctx context.Context, book database.Book, meta d
 	if err != nil {
 		return Data{}
 	}
-	matches, err := s.MatchTankobons(ctx, series, seriesMeta, []VolumeMatchBook{
-		{BookID: book.ID, Name: book.Name, Number: meta.Number},
-	}, false)
-	if err != nil || len(matches) == 0 {
+	rows, err := s.store.DB().QueryContext(ctx, `
+SELECT b.id,b.name,coalesce(m.number,'') FROM books b
+LEFT JOIN book_metadata m ON m.book_id=b.id WHERE b.series_id=?`, series.ID)
+	if err != nil {
 		return Data{}
 	}
-	data, _, _ := s.CacheBookBangumiCover(ctx, book.ID, meta, &matches[0], false)
-	return data
+	defer rows.Close()
+	var volumes []VolumeMatchBook
+	for rows.Next() {
+		var volume VolumeMatchBook
+		if err := rows.Scan(&volume.BookID, &volume.Name, &volume.Number); err != nil {
+			return Data{}
+		}
+		volumes = append(volumes, volume)
+	}
+	if rows.Err() != nil {
+		return Data{}
+	}
+	matches, err := s.MatchTankobons(ctx, series, seriesMeta, volumes, false)
+	if err != nil {
+		return Data{}
+	}
+	for _, match := range matches {
+		if match.BookID == book.ID {
+			data, _, _ := s.CacheBookBangumiCover(ctx, book.ID, meta, &match, false)
+			return data
+		}
+	}
+	return Data{}
 }
 
 // CacheBookBangumiCover resolves an existing binding or an eligible new match.
 func (s *Service) CacheBookBangumiCover(ctx context.Context, bookID string, meta database.BookMetadata, match *VolumeMatchResult, force bool) (Data, bool, error) {
 	if match != nil && match.SubjectID > 0 && (meta.BgmSubjectID == 0 || force) {
+		if !match.NSFWKnown {
+			if match.NSFW && !s.store.ShowNSFW(ctx) {
+				return Data{}, false, nil
+			}
+			path := filepath.Join(s.bookBgmDir, fmt.Sprintf("bgm_%d_unverified.jpg", match.SubjectID))
+			cached := len(s.readBangumiCover(path, !s.store.ShowNSFW(ctx))) > 0
+			data, err := s.fetchBangumiCover(ctx, match.SubjectID, match.CoverURL, path, match.NSFW, false)
+			return data, !cached && len(data.Bytes) > 0, err
+		}
 		var err error
 		meta, err = s.bindBookBangumiCover(ctx, bookID, meta.BgmSubjectID, *match, force)
 		if err != nil {
@@ -256,7 +283,9 @@ func (s *Service) bookBangumiPath(subjectID int64) string {
 	return filepath.Join(s.bookBgmDir, fmt.Sprintf("bgm_%d.jpg", subjectID))
 }
 
-func (s *Service) SetBookExternalCoverFetcher(fetcher ExternalCoverFetcher) {
+type BookExternalCoverFetcher func(ctx context.Context, sourceID, entryID, parentEntryID, coverURL string) ([]byte, string, error)
+
+func (s *Service) SetBookExternalCoverFetcher(fetcher BookExternalCoverFetcher) {
 	s.externalMu.Lock()
 	defer s.externalMu.Unlock()
 	s.bookExternalFetcher = fetcher
@@ -455,33 +484,4 @@ func bookCustomCoverName(id string) string {
 		return id + ".jpg"
 	}
 	return fileName(id)
-}
-
-// CacheOfflineBookCover lazily decodes a cover from an already validated offline source.
-func (s *Service) CacheOfflineBookCover(ctx context.Context, key string, read func(context.Context) ([]byte, string, error)) ([]byte, string, error) {
-	target := filepath.Join(s.bookThumbnailDir, "external", fileName(key))
-	if raw, err := os.ReadFile(target); err == nil {
-		return raw, "image/jpeg", nil
-	}
-	value, err, _ := s.bookExternalFlight.Do(key, func() (any, error) {
-		if raw, err := os.ReadFile(target); err == nil {
-			return raw, nil
-		}
-		raw, _, err := read(ctx)
-		if err != nil {
-			return nil, err
-		}
-		jpeg, _, _, err := compressWithMaxEdge(raw, 420)
-		if err != nil {
-			return nil, err
-		}
-		if err := writeAtomic(target, jpeg); err != nil {
-			return nil, err
-		}
-		return jpeg, nil
-	})
-	if err != nil {
-		return nil, "", err
-	}
-	return value.([]byte), "image/jpeg", nil
 }

@@ -19,7 +19,8 @@ import (
 )
 
 const (
-	maxHTTPMetadataUploadBytes int64 = (10 << 30) + (2 << 20) // 10 GiB upload + multipart framing
+	maxMetadataUploadFileBytes int64 = 10 << 30
+	maxHTTPMetadataUploadBytes int64 = maxMetadataUploadFileBytes + (2 << 20) // 10 GiB upload + multipart framing
 	maxUploadFormFieldBytes    int64 = 64 << 10
 )
 
@@ -200,235 +201,150 @@ func (s *Server) uploadMetadataSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
-	fields := map[string]string{
-		"sourceId": strings.TrimSpace(r.URL.Query().Get("sourceId")),
-		"kind":     extmeta.KindOfflineSQLite,
-	}
-	var (
-		uploaded       bool
-		createdNew     bool
-		importedDirect bool
-		uploadedSrc    database.MetadataSource
-		uploadFilename string
-		tempFilePath   string
-	)
-	cleanupTemp := func() {
+	fields := make(map[string]string)
+	var uploadFilename, tempFilePath string
+	defer func() {
 		if tempFilePath != "" {
 			_ = os.Remove(tempFilePath)
-			tempFilePath = ""
 		}
-	}
-	defer cleanupTemp()
-
-	applyFormField := func(name, val string) error {
-		switch name {
-		case "sourceId", "name", "description", "kind", "enabled", "tagDictSourceId", "tagDisplayMode", "autoUpdate":
-			fields[name] = strings.TrimSpace(val)
+	}()
+	readError := func(err error) {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) || r.Context().Err() != nil {
+			s.metadataError(w, err)
+			return
 		}
-		return nil
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid multipart upload.")
 	}
 
 	for {
 		part, err := mr.NextPart()
-		if errors.Is(err, io.EOF) {
+		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			s.metadataError(w, err)
+			readError(err)
 			return
 		}
-		formName := strings.TrimSpace(part.FormName())
-		if formName != "file" {
-			data, readErr := io.ReadAll(io.LimitReader(part, maxUploadFormFieldBytes+1))
-			_ = part.Close()
-			if readErr != nil {
-				s.metadataError(w, readErr)
+		name := part.FormName()
+		switch name {
+		case "file":
+			if tempFilePath != "" || part.FileName() == "" {
+				writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Expected exactly one file part.")
+				return
+			}
+			uploadFilename = sanitizeUploadFilename(part.FileName())
+			tmp, err := os.CreateTemp("", ".fk115-upload-part-*")
+			if err != nil {
+				s.metadataError(w, err)
+				return
+			}
+			tempFilePath = tmp.Name()
+			size, copyErr := io.Copy(tmp, io.LimitReader(part, maxMetadataUploadFileBytes+1))
+			closeErr := tmp.Close()
+			if copyErr != nil {
+				var pathErr *os.PathError
+				if errors.As(copyErr, &pathErr) {
+					s.metadataError(w, copyErr)
+				} else {
+					readError(copyErr)
+				}
+				return
+			}
+			if closeErr != nil {
+				s.metadataError(w, closeErr)
+				return
+			}
+			if size > maxMetadataUploadFileBytes {
+				s.metadataError(w, &http.MaxBytesError{Limit: maxMetadataUploadFileBytes})
+				return
+			}
+		case "sourceId", "name", "description", "kind", "enabled", "tagDictSourceId", "tagDisplayMode", "autoUpdate":
+			if _, duplicate := fields[name]; duplicate || part.FileName() != "" {
+				writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid or repeated multipart field.")
+				return
+			}
+			data, err := io.ReadAll(io.LimitReader(part, maxUploadFormFieldBytes+1))
+			if err != nil {
+				readError(err)
 				return
 			}
 			if int64(len(data)) > maxUploadFormFieldBytes {
 				writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Multipart form field exceeds size limit.")
 				return
 			}
-			_ = applyFormField(formName, string(data))
-			continue
-		}
-		if uploaded {
-			_ = part.Close()
-			writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Multiple file parts are not supported.")
-			return
-		}
-		uploaded = true
-		uploadFilename = sanitizeUploadFilename(part.FileName())
-
-		if fields["kind"] != "" && fields["kind"] != extmeta.KindOfflineSQLite {
-			_ = part.Close()
-			writeError(w, http.StatusBadRequest, "INVALID_METADATA_CONFIG", "Invalid metadata source kind for SQLite upload.")
-			return
-		}
-
-		// When sourceId (or name for a new source) precedes the file part, stream
-		// directly into ImportUploadedSQLite without writing an intermediate file.
-		if targetID := fields["sourceId"]; targetID != "" {
-			uploadedSrc, err = s.metadata.ImportUploadedSQLite(ctx, targetID, uploadFilename, part, nil)
-			_ = part.Close()
-			if err != nil {
-				s.metadataError(w, err)
-				return
-			}
-			importedDirect = true
-			continue
-		}
-		if fields["name"] != "" {
-			enabled := parseUploadBool(fields["enabled"], true)
-			createdSrc, addErr := s.metadata.AddCustomSource(ctx, database.MetadataSource{
-				Kind:            extmeta.KindOfflineSQLite,
-				Name:            fields["name"],
-				Description:     fields["description"],
-				TagDictSourceID: fields["tagDictSourceId"],
-				TagDisplayMode:  fields["tagDisplayMode"],
-				AutoUpdate:      firstUploadNonEmpty(fields["autoUpdate"], "manual"),
-				Enabled:         enabled,
-			})
-			if addErr != nil {
-				_ = part.Close()
-				s.metadataError(w, addErr)
-				return
-			}
-			createdNew = true
-			fields["sourceId"] = createdSrc.ID
-			uploadedSrc, err = s.metadata.ImportUploadedSQLite(ctx, createdSrc.ID, uploadFilename, part, nil)
-			_ = part.Close()
-			if err != nil {
-				_ = s.metadata.DeleteSource(ctx, createdSrc.ID)
-				s.metadataError(w, err)
-				return
-			}
-			importedDirect = true
-			continue
-		}
-
-		// If the file part appeared before sourceId/name, spill once to a bounded temp file.
-		tmpFile, tmpErr := os.CreateTemp("", ".fk115-upload-part-*")
-		if tmpErr != nil {
-			_ = part.Close()
-			s.metadataError(w, tmpErr)
-			return
-		}
-		tempFilePath = tmpFile.Name()
-		_, copyErr := io.Copy(tmpFile, io.LimitReader(part, maxHTTPMetadataUploadBytes))
-		closeErr := tmpFile.Close()
-		_ = part.Close()
-		if copyErr != nil {
-			s.metadataError(w, copyErr)
-			return
-		}
-		if closeErr != nil {
-			s.metadataError(w, closeErr)
+			fields[name] = strings.TrimSpace(string(data))
+		default:
+			writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Unknown multipart field.")
 			return
 		}
 	}
-
-	if !uploaded {
+	// NextPart stops at the closing delimiter. Drain any epilogue so the
+	// request size limit still applies to the entire body.
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		readError(err)
+		return
+	}
+	if tempFilePath == "" {
 		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Missing uploaded metadata file.")
 		return
 	}
-	if fields["kind"] != "" && fields["kind"] != extmeta.KindOfflineSQLite {
-		if createdNew {
-			_ = s.metadata.DeleteSource(ctx, fields["sourceId"])
-		}
-		writeError(w, http.StatusBadRequest, "INVALID_METADATA_CONFIG", "Invalid metadata source kind for SQLite upload.")
+	if kind := fields["kind"]; kind != "" && kind != extmeta.KindOfflineSQLite {
+		s.metadataError(w, extmeta.ErrInvalidConfig)
 		return
 	}
-
-	if !importedDirect {
-		targetID := fields["sourceId"]
-		if targetID == "" {
-			name := fields["name"]
-			if name == "" {
-				name = defaultUploadSourceName(uploadFilename)
-			}
-			enabled := parseUploadBool(fields["enabled"], true)
-			createdSrc, addErr := s.metadata.AddCustomSource(ctx, database.MetadataSource{
-				Kind:            extmeta.KindOfflineSQLite,
-				Name:            name,
-				Description:     fields["description"],
-				TagDictSourceID: fields["tagDictSourceId"],
-				TagDisplayMode:  fields["tagDisplayMode"],
-				AutoUpdate:      firstUploadNonEmpty(fields["autoUpdate"], "manual"),
-				Enabled:         enabled,
-			})
-			if addErr != nil {
-				s.metadataError(w, addErr)
-				return
-			}
-			createdNew = true
-			targetID = createdSrc.ID
-			fields["sourceId"] = targetID
-		}
-		f, openErr := os.Open(tempFilePath)
-		if openErr != nil {
-			if createdNew {
-				_ = s.metadata.DeleteSource(ctx, targetID)
-			}
-			s.metadataError(w, openErr)
+	sourceID := strings.TrimSpace(r.URL.Query().Get("sourceId"))
+	if id, supplied := fields["sourceId"]; supplied {
+		if sourceID != "" && id != sourceID {
+			s.metadataError(w, extmeta.ErrInvalidConfig)
 			return
 		}
-		uploadedSrc, err = s.metadata.ImportUploadedSQLite(ctx, targetID, uploadFilename, f, nil)
-		_ = f.Close()
-		if err != nil {
-			if createdNew {
-				_ = s.metadata.DeleteSource(ctx, targetID)
-			}
-			s.metadataError(w, err)
-			return
-		}
+		sourceID = id
 	}
-
-	// Apply any optional metadata configuration updates supplied alongside an upload
-	// (including fields transmitted after the file part).
-	cfg := extmeta.SourceConfig{}
-	var hasCfg bool
-	if !createdNew {
-		if v := fields["name"]; v != "" && v != uploadedSrc.Name {
-			cfg.Name = &v
-			hasCfg = true
-		}
-		if v := fields["description"]; v != "" && v != uploadedSrc.Description {
-			cfg.Description = &v
-			hasCfg = true
-		}
+	var cfg extmeta.SourceConfig
+	if name := fields["name"]; name != "" {
+		cfg.Name = &name
+	} else if sourceID == "" {
+		name := defaultUploadSourceName(uploadFilename)
+		cfg.Name = &name
+	}
+	if v := fields["description"]; v != "" {
+		cfg.Description = &v
 	}
 	if v, ok := fields["enabled"]; ok {
-		b := parseUploadBool(v, uploadedSrc.Enabled)
-		if b != uploadedSrc.Enabled {
-			cfg.Enabled = &b
-			hasCfg = true
+		enabled, valid := parseUploadBool(v)
+		if !valid {
+			s.metadataError(w, extmeta.ErrInvalidConfig)
+			return
 		}
+		cfg.Enabled = &enabled
 	}
-	if v, ok := fields["tagDictSourceId"]; ok && v != uploadedSrc.TagDictSourceID {
+	if v, ok := fields["tagDictSourceId"]; ok {
 		cfg.TagDictSourceID = &v
-		hasCfg = true
 	}
-	if v, ok := fields["tagDisplayMode"]; ok && v != uploadedSrc.TagDisplayMode {
+	if v, ok := fields["tagDisplayMode"]; ok {
 		cfg.TagDisplayMode = &v
-		hasCfg = true
 	}
-	if v := fields["autoUpdate"]; v != "" && v != uploadedSrc.AutoUpdate {
+	if v := fields["autoUpdate"]; v != "" {
 		cfg.AutoUpdate = &v
-		hasCfg = true
-	}
-	if hasCfg && uploadedSrc.RepoID == "" {
-		if updated, cfgErr := s.metadata.UpdateSourceConfig(ctx, uploadedSrc.ID, cfg); cfgErr == nil {
-			uploadedSrc = updated
-		}
 	}
 
+	f, err := os.Open(tempFilePath)
+	if err != nil {
+		s.metadataError(w, err)
+		return
+	}
+	defer f.Close()
+	src, err := s.metadata.ImportConfiguredSQLite(r.Context(), sourceID, uploadFilename, f, cfg, nil)
+	if err != nil {
+		s.metadataError(w, err)
+		return
+	}
 	status := http.StatusOK
-	if createdNew {
+	if sourceID == "" {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, s.metadata.SourceView(ctx, uploadedSrc))
+	writeJSON(w, status, s.metadata.SourceView(r.Context(), src))
 }
 
 func sanitizeUploadFilename(raw string) string {
@@ -453,24 +369,15 @@ func defaultUploadSourceName(filename string) string {
 	return name
 }
 
-func parseUploadBool(raw string, fallback bool) bool {
+func parseUploadBool(raw string) (value, valid bool) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "1", "true", "yes", "on":
-		return true
+		return true, true
 	case "0", "false", "no", "off":
-		return false
+		return false, true
 	default:
-		return fallback
+		return false, false
 	}
-}
-
-func firstUploadNonEmpty(values ...string) string {
-	for _, v := range values {
-		if strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
-		}
-	}
-	return ""
 }
 
 func (s *Server) deleteMetadataSource(w http.ResponseWriter, r *http.Request) {

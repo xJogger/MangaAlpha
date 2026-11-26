@@ -38,6 +38,7 @@ const (
 	SettingArchiveCustomMetaURL = "bangumi_archive_custom_url"
 	archiveUserAgent            = "xJogger/fake-komga-115/2.5 (https://github.com/xJogger/MangaAlpha)"
 	currentTermsSchemaVersion   = "5"
+	currentImportFormatVersion  = "5"
 	relationTypeTankobon        = 1003
 )
 
@@ -51,6 +52,7 @@ type TankobonSubject struct {
 	ISBN      string `json:"isbn"`
 	Order     int    `json:"order"`
 	NSFW      bool   `json:"nsfw"`
+	NSFWKnown bool   `json:"nsfwKnown"`
 	CoverURL  string `json:"coverUrl"`
 }
 
@@ -120,14 +122,15 @@ type ArchiveIndex struct {
 	httpClient *http.Client
 	proxyRaw   string
 
-	mu                sync.RWMutex
-	db                *sql.DB
-	hasRelationsTable bool
-	hasISBNCol        bool
-	status            ArchiveStatus
-	cancel            context.CancelFunc
-	onImport          func()
-	onUpdateDone      func(result, dumpName, errMsg string)
+	mu                  sync.RWMutex
+	db                  *sql.DB
+	hasRelationsTable   bool
+	importFormatVersion string
+	hasISBNCol          bool
+	status              ArchiveStatus
+	cancel              context.CancelFunc
+	onImport            func()
+	onUpdateDone        func(result, dumpName, errMsg string)
 }
 
 func NewArchiveIndex(dir string, logger *slog.Logger) (*ArchiveIndex, error) {
@@ -358,7 +361,7 @@ func (a *ArchiveIndex) runOnlineUpdate(ctx context.Context, force bool, metaURL 
 
 	if !force {
 		a.mu.RLock()
-		curReady := a.status.Ready
+		curReady := a.status.Ready && a.importFormatVersion == currentImportFormatVersion
 		curName := strings.TrimSpace(a.status.DumpName)
 		curDigest := strings.ToLower(strings.TrimSpace(a.status.DumpDigest))
 		a.mu.RUnlock()
@@ -789,13 +792,14 @@ ON CONFLICT(subject_id,relation_type,related_subject_id) DO UPDATE SET sort_orde
 	}
 	importedAt := time.Now().UTC().Format(time.RFC3339)
 	for k, v := range map[string]string{
-		"dump_name":            dumpName,
-		"dump_created_at":      dumpCreatedAt,
-		"dump_digest":          strings.ToLower(strings.TrimSpace(dumpDigest)),
-		"imported_at":          importedAt,
-		"subject_count":        fmt.Sprintf("%d", importedCount),
-		"terms_schema_version": currentTermsSchemaVersion,
-		"includes_nsfw":        "1",
+		"dump_name":             dumpName,
+		"import_format_version": currentImportFormatVersion,
+		"dump_created_at":       dumpCreatedAt,
+		"dump_digest":           strings.ToLower(strings.TrimSpace(dumpDigest)),
+		"imported_at":           importedAt,
+		"subject_count":         fmt.Sprintf("%d", importedCount),
+		"terms_schema_version":  currentTermsSchemaVersion,
+		"includes_nsfw":         "1",
 	} {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO meta(key,value) VALUES(?,?)`, k, v); err != nil {
 			tx.Rollback()
@@ -828,6 +832,7 @@ PRAGMA journal_mode = DELETE;
 	}
 
 	if err := os.Rename(stagingPath, a.dbPath); err != nil {
+		a.openExistingIfPresent()
 		return err
 	}
 	a.openExistingIfPresent()
@@ -1102,6 +1107,7 @@ func (a *ArchiveIndex) openExistingIfPresent() {
 	}
 	a.db = db
 	a.hasRelationsTable = hasRelTable
+	a.importFormatVersion = meta["import_format_version"]
 	a.hasISBNCol = hasISBNCol
 	a.status.Ready = count > 0
 	a.status.DumpName = meta["dump_name"]
@@ -1344,6 +1350,7 @@ ORDER BY r.sort_order ASC, r.related_subject_id ASC`
 		item.Summary = strings.TrimSpace(item.Summary)
 		item.ISBN = strings.TrimSpace(item.ISBN)
 		item.NSFW = isNSFW != 0
+		item.NSFWKnown = true
 		item.CoverURL = CoverEndpointURL(item.SubjectID)
 		out = append(out, item)
 	}

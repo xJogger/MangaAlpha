@@ -7,12 +7,12 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/xJogger/fake-komga-115/internal/database"
+	"github.com/xJogger/fake-komga-115/internal/extmeta"
 )
 
 func (s *Server) patchSeriesOneShot(w http.ResponseWriter, r *http.Request) {
@@ -82,13 +82,18 @@ func (s *Server) putBookCustomCover(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rawURL := strings.TrimSpace(req.URL)
-		coverURL, parseErr := url.Parse(rawURL)
-		if parseErr != nil || coverURL.Hostname() == "" || coverURL.User != nil ||
-			(coverURL.Scheme != "http" && coverURL.Scheme != "https") {
-			writeError(w, http.StatusBadRequest, "INVALID_COVER_URL", "A valid HTTP or HTTPS cover URL is required.")
+		if err := extmeta.ValidateExternalURL(rawURL); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_COVER_URL", "A valid public HTTP or HTTPS cover URL is required.")
 			return
 		}
+		prev, _, _ := s.store.BookMetadataByID(ctx, book.ID)
+		if prev.CustomCoverPath != "" {
+			_ = s.thumbs.DeleteBookCustomCover(ctx, book.ID)
+		}
 		err = s.store.SetBookCustomCover(ctx, book.ID, "", rawURL)
+		if err == nil && prev.CoverSource == "custom" {
+			err = s.store.SetBookCoverSource(ctx, book.ID, "custom")
+		}
 	default:
 		writeError(w, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "Use multipart/form-data or application/json.")
 		return

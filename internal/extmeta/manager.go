@@ -30,11 +30,8 @@ var (
 	ErrRemoteMetadata = errors.New("could not fetch metadata repository manifest")
 )
 
-type ArchiveMetaReader func(context.Context, database.Book) (*EmbeddedMeta, error)
-
 type ManagerOptions struct {
-	ProxyURLProvider  func(context.Context) string
-	ArchiveMetaReader ArchiveMetaReader
+	ProxyURLProvider func(context.Context) string
 	// HTTPClient, when supplied, replaces the default SSRF-protected client.
 	HTTPClient *http.Client
 }
@@ -318,7 +315,7 @@ func checkedLocalFile(path string) (os.FileInfo, error) {
 	return info, nil
 }
 
-const walWarningMessage = "检测到同目录存在未 Checkpoint 的 -wal 日志，可能缺少最新增量数据；请先停止 Komga 或执行 Checkpoint 后再同步"
+const walWarningMessage = "检测到同目录存在非空 -wal 日志，可能缺少最新数据。请先停止 Komga 或在 Komga 端执行 WAL Checkpoint，再复制或同步。"
 
 // SourceView enriches a MetadataSource record with resolved SQLite schema format
 // and un-checkpointed WAL status for API responses.

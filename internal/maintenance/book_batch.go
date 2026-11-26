@@ -185,6 +185,10 @@ func (m *Manager) batchBookCover(ctx context.Context, book database.Book, meta d
 	if err != nil || (hasUserCover && !options.Force) {
 		return false, err
 	}
+	// A Live relation without a confirmed rating cannot replace an existing binding.
+	if match != nil && !match.NSFWKnown && meta.BgmSubjectID > 0 {
+		match = nil
+	}
 	cover, generated, coverErr := m.thumbs.CacheBookBangumiCover(ctx, book.ID, meta, match, options.Force)
 	if coverErr == nil && len(cover.Bytes) > 0 {
 		return generated, nil

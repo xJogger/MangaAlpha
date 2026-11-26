@@ -109,7 +109,7 @@ func TestClientSettingsBooksViewHTTPAndMultiUserIsolation(t *testing.T) {
 		t.Fatalf("admin patch valid list: status=%d body=%s", w.Code, w.Body.String())
 	}
 	if w := doJSON(http.MethodPatch, "/api/v1/client-settings/user", "reader-alpha", "ReaderPass123!", map[string]any{
-		"webui.series.booksView": map[string]any{"value": "cover"},
+		"webui.series.booksView": map[string]any{"value": " cover "},
 	}); w.Code != http.StatusNoContent {
 		t.Fatalf("alpha patch valid cover: status=%d body=%s", w.Code, w.Body.String())
 	}
