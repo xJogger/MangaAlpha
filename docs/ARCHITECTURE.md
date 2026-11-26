@@ -22,7 +22,7 @@ internal/httpserver (authMiddleware + UserScope RBAC + SPA + /reader + /admin/ap
        └── Android 原生封装（gomobile bind + SAF + 可选局域网服务） ────── mobile + android
 ```
 
-核心原则保持不变：**启动和扫描阶段绝不下载或打开漫画压缩包内容**；只有用户打开某一卷的页表或翻到具体某页时，才按需读取对应字节区间。
+核心铁律（所有后续开发必须严格遵守）：**扫库只读目录与文件名，初始元数据与封面只从离线数据库与已缓存数据获取；严禁在启动、扫库、离线元数据刮削或书架/详情浏览过程中隐式打开或读取任何漫画归档内部字节（包括本地与 SMB 挂载书库）**。一切必须读取归档内部字节才能获得的信息（页表索引、`ComicInfo.xml`、归档第 1 页封面等），只在用户真正打开/阅读该文件时顺带按需读取并缓存，或由管理员显式触发批量任务 / 主动开启可选定时选项时才执行，以保障超大型网络书库的入库与浏览速度。
 
 ## 2. 鉴权、多用户分权与会话安全
 
@@ -59,10 +59,10 @@ internal/httpserver (authMiddleware + UserScope RBAC + SPA + /reader + /admin/ap
    - `api.bgm.tv/v0` 客户端支持按关键词或 Subject ID 实时搜索绑定；当当前用户（或回退借用主管理员）已绑定 Bangumi OAuth / PAT 且满足 `EffectiveShowNSFW()` 时，携带授权检索 NSFW 条目并拉取封面（落实 5 道防泄露防线）；每用户独立 Bangumi 单向进度追踪器支持 OAuth 2.0 自动续期。
    - 独立网络代理配置统一作用于 Bangumi、元数据市场/离线源/封面抓取与 GitHub 更新检测，不影响 115 / WebDAV 直连流量。
 3. **多源扩展元数据引擎（`internal/extmeta`）与存储模型**：
-   - **声明式元数据市场与只读 Sidecar**：支持订阅 `mangaalpha-repo-v1`（`repo.json`）或接入本地/远程 SQLite（纯 Go 流式解压 `.zst`/`.gz`/`.zip`），以只读模式打开 `mangaalpha_meta_v1` 单表或 `gallery_v1` 四表上游库并在旁构建 FTS5 + 封面 SHA-1 Sidecar 索引；支持标签翻译词典（`tag_translation_text_v1`，`zh` / `bilingual` / `raw`）、归档内嵌元数据（`ComicInfo.xml` / `galleryinfo.txt`）与社区脱敏映射包（`mangaalpha_mapping_v1`，兼容空包零报错同步）。
+   - **声明式元数据市场与只读 Sidecar**：支持订阅 `mangaalpha-repo-v1`（`repo.json`）或接入本地/远程 SQLite（纯 Go 流式解压 `.zst`/`.gz`/`.zip`），以只读模式打开 `mangaalpha_meta_v1` 单表或 `gallery_v1` 四表上游库并在旁构建 FTS5 + 封面 SHA-1 Sidecar 索引；支持标签翻译词典（`tag_translation_text_v1`，`zh` / `bilingual` / `raw`）、已缓存的归档内嵌元数据线索（`ComicInfo.xml`，严禁刮削阶段隐式拆包读取归档）与社区脱敏映射包（`mangaalpha_mapping_v1`，兼容空包零报错同步）。
    - **三张配置表与统一任务历史**：`metadata_repos`、`metadata_sources`、`library_metadata_sources`（按顶层书库配置 `#1 → #2 → ...` 顺延链，跳过联合子库）；所有离线源未命中时由已启用映射包兜底，默认纯离线极速匹配，显式开启后才允许单线程限速防封熔断在线补全；批量刮削与任务记录统一持久化在 `bangumi_scrape_runs`（扩展多源运行以 `ext_` 前缀标识），无已就绪离线源时预检拦截。
    - **`series_metadata` 扩展字段与 `match_origin` 保护**：记录 `ext_source_id`、`ext_entry_id`、`ext_cover_url`、`ext_cover_path` 与 `match_origin`（`auto` / `mapping` / `manual` / `agent`），所有自动批量刮削与增量同步（含 `force`）均严格保护 `manual`、`agent`、升级存量绑定及 `*Lock` 锁定字段。
-   - **防 SSRF 网络客户端与脱敏诊断（v3.2.1）**：统一拦截字面量私网/回环/链路本地/CGNAT/Fake-IP URL 及内网主机名；直连模式下对合法公网域名的本地 DNS 解析跳过 `0.0.0.0`/`::` 占位，放行标准透明代理 Fake-IP（`198.18.0.0/15`、`fc00::/18`，双栈优先拨号非 Fake-IPv6），并拒绝混合真实私网 DNS 防 Rebinding；外部封面具备限速、并发上限 2、魔数校验、URL 版本化缓存、指数退避熔断与失败自动回退首卷第 1 页；仓库订阅、源同步与封面异常均记录脱敏 `diagnostics` 事件并返回清晰中文分类提示。详见 [docs/METADATA_SOURCES.md](METADATA_SOURCES.md)。
+   - **防 SSRF 网络客户端与脱敏诊断（v3.2.1）**：统一拦截字面量私网/回环/链路本地/CGNAT/Fake-IP URL 及内网主机名；直连模式下对合法公网域名的本地 DNS 解析跳过 `0.0.0.0`/`::` 占位，放行标准透明代理 Fake-IP（`198.18.0.0/15`、`fc00::/18`，双栈优先拨号非 Fake-IPv6），并拒绝混合真实私网 DNS 防 Rebinding；外部封面具备限速、并发上限 2、魔数校验、URL 版本化缓存、指数退避熔断与失败自动回退已缓存首卷缩略图或占位图（绝不在封面请求中隐式拆包）；仓库订阅、源同步与封面异常均记录脱敏 `diagnostics` 事件并返回清晰中文分类提示。详见 [docs/METADATA_SOURCES.md](METADATA_SOURCES.md)。
 4. **NSFW 分级规则与按账号控制**：
    - Bangumi 命中条目严格依据官方 `nsfw == true` 标记；`gallery_v1` 仅当 `category`（忽略大小写）严格等于 `"Non-H"` 时判为非 NSFW；未匹配条目通过 `InferPathNSFW` 辅助识别显式成人目录词；支持 `nsfwLock` 手动锁定。
 
