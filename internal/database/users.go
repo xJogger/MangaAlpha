@@ -5,8 +5,11 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"maps"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -30,6 +33,7 @@ type User struct {
 	Enabled           bool     `json:"enabled"`
 	AllLibraries      bool     `json:"allLibraries"`
 	AllowedLibraryIDs []string `json:"allowedLibraryIds"`
+	HiddenLibraryIDs  []string `json:"hiddenLibraryIds"`
 	AllowNSFW         bool     `json:"allowNsfw"`
 	ShowNSFW          bool     `json:"showNsfw"`
 	CreatedAt         string   `json:"createdAt"`
@@ -53,6 +57,10 @@ func (u User) Scope() UserScope {
 	for _, id := range libs {
 		allowedSet[id] = true
 	}
+	hiddenSet := make(map[string]struct{}, len(u.HiddenLibraryIDs))
+	for _, id := range u.HiddenLibraryIDs {
+		hiddenSet[id] = struct{}{}
+	}
 	return UserScope{
 		UserID:            u.ID,
 		Username:          u.Username,
@@ -61,6 +69,7 @@ func (u User) Scope() UserScope {
 		ShowNSFW:          u.ShowNSFW,
 		AllLibraries:      u.AllLibraries || u.IsAdmin(),
 		AllowedLibraryIDs: libs,
+		HiddenLibraries:   hiddenSet,
 		allowedSet:        allowedSet,
 	}
 }
@@ -73,6 +82,7 @@ type UserScope struct {
 	ShowNSFW          bool
 	AllLibraries      bool
 	AllowedLibraryIDs []string
+	HiddenLibraries   map[string]struct{}
 	allowedSet        map[string]bool
 }
 
@@ -90,18 +100,35 @@ func (sc UserScope) AllowsLibrary(libraryID string) bool {
 	return slices.Contains(sc.AllowedLibraryIDs, libraryID)
 }
 
+func (sc UserScope) DisplaysLibrary(libraryID string) bool {
+	_, hidden := sc.HiddenLibraries[libraryID]
+	return sc.AllowsLibrary(libraryID) && !hidden
+}
+
 func (sc UserScope) VisibilityKey() string {
 	nsfwFlag := "0"
 	if sc.EffectiveShowNSFW() {
 		nsfwFlag = "1"
 	}
-	if sc.AllLibraries || sc.IsAdmin {
-		return "all:" + nsfwFlag
+	authorized := "all"
+	if !sc.AllLibraries && !sc.IsAdmin {
+		authorized = "none"
+		if len(sc.AllowedLibraryIDs) > 0 {
+			allowed := cleanStringSliceCaseSensitive(sc.AllowedLibraryIDs)
+			slices.Sort(allowed)
+			authorized = "libs:" + libraryIDsCacheHash(allowed)
+		}
 	}
-	if len(sc.AllowedLibraryIDs) == 0 {
-		return "none:" + nsfwFlag
+	key := authorized + ":" + nsfwFlag
+	if len(sc.HiddenLibraries) > 0 {
+		key += ":hidden:" + libraryIDsCacheHash(slices.Sorted(maps.Keys(sc.HiddenLibraries)))
 	}
-	return "libs:" + sha256Hex(strings.Join(sc.AllowedLibraryIDs, ","))[:16] + ":" + nsfwFlag
+	return key
+}
+
+func libraryIDsCacheHash(ids []string) string {
+	encoded, _ := json.Marshal(ids)
+	return sha256Hex(string(encoded))
 }
 
 type userScopeContextKey struct{}
@@ -196,6 +223,26 @@ SELECT library_id FROM user_library_access WHERE user_id=? ORDER BY library_id A
 	return out, rows.Err()
 }
 
+func loadUserHiddenLibraryIDs(ctx context.Context, db interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, userID string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT library_id FROM user_hidden_libraries WHERE user_id=? ORDER BY library_id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) UserByID(ctx context.Context, id string) (User, error) {
 	var (
 		u            User
@@ -224,6 +271,10 @@ FROM users WHERE id=?`, strings.TrimSpace(id)).Scan(
 			return User{}, err
 		}
 		u.AllowedLibraryIDs = libs
+	}
+	u.HiddenLibraryIDs, err = loadUserHiddenLibraryIDs(ctx, s.db, u.ID)
+	if err != nil {
+		return User{}, err
 	}
 	return u, nil
 }
@@ -257,6 +308,10 @@ FROM users WHERE username=? COLLATE NOCASE`, strings.TrimSpace(username)).Scan(
 			return User{}, "", err
 		}
 		u.AllowedLibraryIDs = libs
+	}
+	u.HiddenLibraryIDs, err = loadUserHiddenLibraryIDs(ctx, s.db, u.ID)
+	if err != nil {
+		return User{}, "", err
 	}
 	return u, passwordHash, nil
 }
@@ -293,24 +348,34 @@ ORDER BY CASE WHEN u.role='admin' THEN 0 ELSE 1 END, u.created_at ASC, u.id ASC`
 		u.AllowNSFW = allowNSFWInt != 0 || u.IsAdmin()
 		u.ShowNSFW = showNSFWInt != 0 && u.AllowNSFW
 		u.AllowedLibraryIDs = []string{}
+		u.HiddenLibraryIDs = []string{}
 		byID[u.ID] = len(out)
 		out = append(out, u)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	aRows, err := s.db.QueryContext(ctx, `SELECT user_id, library_id FROM user_library_access ORDER BY user_id, library_id`)
+	aRows, err := s.db.QueryContext(ctx, `
+SELECT user_id, library_id, 0 AS hidden FROM user_library_access
+UNION ALL
+SELECT user_id, library_id, 1 FROM user_hidden_libraries
+ORDER BY user_id, library_id`)
 	if err != nil {
 		return nil, err
 	}
 	defer aRows.Close()
 	for aRows.Next() {
 		var uid, lid string
-		if err := aRows.Scan(&uid, &lid); err != nil {
+		var hidden bool
+		if err := aRows.Scan(&uid, &lid, &hidden); err != nil {
 			return nil, err
 		}
-		if idx, ok := byID[uid]; ok && !out[idx].AllLibraries {
-			out[idx].AllowedLibraryIDs = append(out[idx].AllowedLibraryIDs, lid)
+		if idx, ok := byID[uid]; ok {
+			if hidden {
+				out[idx].HiddenLibraryIDs = append(out[idx].HiddenLibraryIDs, lid)
+			} else if !out[idx].AllLibraries {
+				out[idx].AllowedLibraryIDs = append(out[idx].AllowedLibraryIDs, lid)
+			}
 		}
 	}
 	return out, aRows.Err()
@@ -480,6 +545,13 @@ UPDATE users SET username=?,enabled=?,all_libraries=?,allow_nsfw=?,show_nsfw=?,u
 			return User{}, err
 		}
 	}
+	if !nextAllLibs && !cur.IsAdmin() {
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM user_hidden_libraries
+WHERE user_id=? AND library_id NOT IN (SELECT library_id FROM user_library_access WHERE user_id=?)`, userID, userID); err != nil {
+			return User{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return User{}, err
 	}
@@ -530,26 +602,94 @@ func (s *Store) ResetUserPassword(ctx context.Context, userID, newPassword strin
 }
 
 func (s *Store) SetUserShowNSFW(ctx context.Context, userID string, show bool) (bool, error) {
+	prefs, err := s.SetUserPreferences(ctx, userID, &show, nil)
+	return prefs.ShowNSFW, err
+}
+
+func (s *Store) SetUserHiddenLibraries(ctx context.Context, userID string, hiddenIDs []string) ([]string, error) {
+	prefs, err := s.SetUserPreferences(ctx, userID, nil, &hiddenIDs)
+	return prefs.HiddenLibraryIDs, err
+}
+
+type UserPreferences struct {
+	AllowNSFW        bool     `json:"allowNsfw"`
+	ShowNSFW         bool     `json:"showNsfw"`
+	HiddenLibraryIDs []string `json:"hiddenLibraryIds"`
+}
+
+// SetUserPreferences applies the supplied preferences together and returns their effective values.
+func (s *Store) SetUserPreferences(ctx context.Context, userID string, show *bool, hiddenIDs *[]string) (UserPreferences, error) {
 	userID = normalizeUserID(userID)
-	u, err := s.UserByID(ctx, userID)
+	if show == nil && hiddenIDs == nil {
+		u, err := s.UserByID(ctx, userID)
+		return UserPreferences{u.AllowNSFW, u.ShowNSFW, u.HiddenLibraryIDs}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return UserPreferences{}, err
 	}
-	if show && !u.AllowNSFW {
-		return false, ErrNSFWNotAllowed
+	defer tx.Rollback()
+
+	var prefs UserPreferences
+	if err := tx.QueryRowContext(ctx, `
+SELECT (allow_nsfw<>0 OR role=? COLLATE NOCASE), show_nsfw FROM users WHERE id=?`, RoleAdmin, userID).
+		Scan(&prefs.AllowNSFW, &prefs.ShowNSFW); err != nil {
+		return UserPreferences{}, err
 	}
+	prefs.ShowNSFW = prefs.AllowNSFW && prefs.ShowNSFW
 	now := nowText()
-	if _, err := s.db.ExecContext(ctx, `UPDATE users SET show_nsfw=?,updated_at=? WHERE id=?`, boolInt(show), now, userID); err != nil {
-		return false, err
+	if show != nil {
+		if *show && !prefs.AllowNSFW {
+			return UserPreferences{}, ErrNSFWNotAllowed
+		}
+		if err := setUserShowNSFWTx(ctx, tx, userID, *show, now); err != nil {
+			return UserPreferences{}, err
+		}
+		prefs.ShowNSFW = *show
+	}
+	if hiddenIDs != nil {
+		if err := replaceUserHiddenLibrariesTx(ctx, tx, userID, *hiddenIDs, now); err != nil {
+			return UserPreferences{}, err
+		}
+	}
+	prefs.HiddenLibraryIDs, err = loadUserHiddenLibraryIDs(ctx, tx, userID)
+	if err != nil {
+		return UserPreferences{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return UserPreferences{}, err
+	}
+	return prefs, nil
+}
+
+func setUserShowNSFWTx(ctx context.Context, tx *sql.Tx, userID string, show bool, now string) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET show_nsfw=?,updated_at=? WHERE id=?`, boolInt(show), now, userID); err != nil {
+		return err
 	}
 	if userID == PrimaryAdminUserID {
-		val := "false"
-		if show {
-			val = "true"
-		}
-		_ = s.SetSetting(ctx, "show_nsfw", val)
+		return upsertSetting(ctx, tx, "show_nsfw", strconv.FormatBool(show), now)
 	}
-	return show, nil
+	return nil
+}
+
+func replaceUserHiddenLibrariesTx(ctx context.Context, tx *sql.Tx, userID string, hiddenIDs []string, now string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_hidden_libraries WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	ids, _ := json.Marshal(cleanStringSliceCaseSensitive(hiddenIDs))
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO user_hidden_libraries(user_id, library_id, created_at)
+SELECT u.id, l.id, ?
+FROM users u
+CROSS JOIN json_each(?) ids
+CROSS JOIN libraries l ON l.id=ids.value
+WHERE u.id=? AND (u.role=? COLLATE NOCASE OR u.all_libraries<>0 OR EXISTS (
+  SELECT 1 FROM user_library_access a WHERE a.user_id=u.id AND a.library_id=l.id
+))`, now, string(ids), userID, RoleAdmin); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE shelf_revision SET catalog=catalog+1 WHERE id=1`)
+	return err
 }
 
 func (s *Store) KickUserSessions(ctx context.Context, userID string) (int64, error) {

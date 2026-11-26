@@ -167,7 +167,7 @@ func (s *Server) komgaSeries(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) bookshelfSeries(w http.ResponseWriter, r *http.Request) {
-	s.serveSeriesList(w, r, r.URL.Query().Get("merge_bangumi") == "1")
+	s.serveSeriesList(w, r, bookshelfMergeBangumi(r))
 }
 
 func (s *Server) serveSeriesList(w http.ResponseWriter, r *http.Request, group bool) {
@@ -376,19 +376,20 @@ func (s *Server) komgaBookPage(w http.ResponseWriter, r *http.Request, seriesID 
 	unpaged := r.URL.Query().Get("unpaged") == "true"
 	filters := legacyKomgaFilters(r, "books")
 	items, total, err := s.store.BooksPage(r.Context(), database.BookQuery{
-		Search:      filters.Search,
-		LibraryIDs:  filters.LibraryIDs,
-		ReadListIDs: filters.ReadListIDs,
-		ReadStatus:  filters.ReadStatuses,
-		Tags:        filters.Tags,
-		Authors:     filters.Authors,
-		SeriesID:    seriesID,
-		OneShot:     filters.OneShot,
-		Empty:       filters.Empty,
-		Page:        page,
-		Size:        size,
-		Unpaged:     unpaged,
-		Sort:        r.URL.Query().Get("sort"),
+		Search:             filters.Search,
+		LibraryIDs:         filters.LibraryIDs,
+		ReadListIDs:        filters.ReadListIDs,
+		ReadStatus:         filters.ReadStatuses,
+		Tags:               filters.Tags,
+		Authors:            filters.Authors,
+		SeriesID:           seriesID,
+		DirectSeriesAccess: seriesID != "",
+		OneShot:            filters.OneShot,
+		Empty:              filters.Empty,
+		Page:               page,
+		Size:               size,
+		Unpaged:            unpaged,
+		Sort:               r.URL.Query().Get("sort"),
 	})
 	if err != nil {
 		s.writeDBError(w, r, err)
@@ -572,7 +573,8 @@ func (s *Server) deleteKomgaBookReadProgress(w http.ResponseWriter, r *http.Requ
 }
 
 func (s *Server) patchKomgaBookReadProgress(w http.ResponseWriter, r *http.Request) {
-	book, err := s.store.BookByID(r.Context(), chi.URLParam(r, "bookID"))
+	ctx := r.Context()
+	book, err := s.store.BookByID(ctx, chi.URLParam(r, "bookID"))
 	if err != nil {
 		writeError(w, 404, "NOT_FOUND", "Book not found.")
 		return
@@ -595,18 +597,17 @@ func (s *Server) patchKomgaBookReadProgress(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "INVALID_PROGRESS", "page must be greater than zero.")
 		return
 	}
-	if err := s.store.UpdateBookReadProgress(
-		r.Context(), book, request.Completed, request.Page,
-	); err != nil {
+	// Keep omitted fields distinct so the store can infer progress from the saved page count.
+	if err := s.store.UpdateBookReadProgress(ctx, book, request.Completed, request.Page); err != nil {
 		s.writeDBError(w, r, err)
 		return
 	}
-	userID := database.UserIDFromContext(r.Context())
+	userID := database.UserIDFromContext(ctx)
 	s.sse.PublishForUser(userID, "ReadProgressChanged", map[string]any{
 		"bookId": book.ID,
 		"userId": userID,
 	})
-	s.notifyBangumiTracker(r.Context(), book.SeriesID)
+	s.notifyBangumiTracker(ctx, book.SeriesID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -693,7 +694,7 @@ func (s *Server) komgaBookPlaceholderThumbnail(w http.ResponseWriter, r *http.Re
 		s.writeDBError(w, r, err)
 		return
 	}
-	s.writePlaceholder(w)
+	s.writeUncachedPlaceholder(w)
 }
 
 func (s *Server) komgaSeriesThumbnail(w http.ResponseWriter, r *http.Request) {

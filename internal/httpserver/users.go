@@ -3,6 +3,7 @@ package httpserver
 import (
 	"database/sql"
 	"errors"
+	"maps"
 	"net/http"
 	"strings"
 
@@ -168,19 +169,31 @@ func (s *Server) getMyAccount(w http.ResponseWriter, r *http.Request) {
 		s.writeDBError(w, r, err)
 		return
 	}
-	libs, err := s.store.LibrariesBasic(r.Context(), true)
+	scope := user.Scope()
+	libs, err := s.store.AuthorizedVisibleLibrariesBasic(database.WithUserScope(r.Context(), scope))
 	if err != nil {
 		s.writeDBError(w, r, err)
 		return
 	}
+	authorizedLibs := make([]map[string]any, 0, len(libs))
 	visibleLibs := make([]map[string]any, 0, len(libs))
+	hiddenLibIDs := make([]string, 0)
 	for _, lib := range libs {
-		visibleLibs = append(visibleLibs, map[string]any{
+		info := map[string]any{
 			"id":                lib.ID,
 			"name":              lib.Name,
 			"providerType":      lib.ProviderType,
 			"webdavAccountName": lib.WebDAVAccountName,
-		})
+		}
+		_, hidden := scope.HiddenLibraries[lib.ID]
+		if hidden {
+			hiddenLibIDs = append(hiddenLibIDs, lib.ID)
+		} else {
+			visibleLibs = append(visibleLibs, info)
+		}
+		entry := maps.Clone(info)
+		entry["hidden"] = hidden
+		authorizedLibs = append(authorizedLibs, entry)
 	}
 	origin := s.requestOrigin(r)
 	localURL := localServiceURL(s.runtime.Host, s.runtime.Port)
@@ -190,10 +203,12 @@ func (s *Server) getMyAccount(w http.ResponseWriter, r *http.Request) {
 		baseURL = localURL
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"user":             user,
-		"isAdmin":          user.IsAdmin(),
-		"effectiveNsfw":    user.EffectiveShowNSFW(),
-		"visibleLibraries": visibleLibs,
+		"user":                user,
+		"isAdmin":             user.IsAdmin(),
+		"effectiveNsfw":       user.EffectiveShowNSFW(),
+		"visibleLibraries":    visibleLibs,
+		"authorizedLibraries": authorizedLibs,
+		"hiddenLibraryIds":    hiddenLibIDs,
 		"clients": map[string]any{
 			"origin":          origin,
 			"localUrl":        localURL,
@@ -208,29 +223,20 @@ func (s *Server) getMyAccount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) putMyPreferences(w http.ResponseWriter, r *http.Request) {
 	principal, _ := s.currentPrincipal(r)
 	var req struct {
-		ShowNSFW *bool `json:"showNsfw"`
+		ShowNSFW         *bool     `json:"showNsfw"`
+		HiddenLibraryIDs *[]string `json:"hiddenLibraryIds"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.ShowNSFW != nil {
-		show, err := s.store.SetUserShowNSFW(r.Context(), principal.UserID, *req.ShowNSFW)
-		if err != nil {
-			if errors.Is(err, database.ErrNSFWNotAllowed) {
-				writeError(w, http.StatusForbidden, "NSFW_NOT_ALLOWED", "管理员未向当前账号授予 NSFW 访问权限")
-				return
-			}
-			s.writeDBError(w, r, err)
+	prefs, err := s.store.SetUserPreferences(r.Context(), principal.UserID, req.ShowNSFW, req.HiddenLibraryIDs)
+	if err != nil {
+		if errors.Is(err, database.ErrNSFWNotAllowed) {
+			writeError(w, http.StatusForbidden, "NSFW_NOT_ALLOWED", "管理员未向当前账号授予 NSFW 访问权限")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"allowNsfw": principal.AllowNSFW,
-			"showNsfw":  show,
-		})
+		s.writeDBError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"allowNsfw": principal.AllowNSFW,
-		"showNsfw":  principal.AllowNSFW && principal.ShowNSFW,
-	})
+	writeJSON(w, http.StatusOK, prefs)
 }

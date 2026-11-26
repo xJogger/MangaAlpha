@@ -1200,6 +1200,10 @@ func (s *Server) opdsSuwayomiSeriesChapters(w http.ResponseWriter, r *http.Reque
 		s.writeDBError(w, r, err)
 		return
 	}
+	if !s.store.IsLibraryVisible(r.Context(), series.LibraryID) {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Series not found.")
+		return
+	}
 	meta, _ := s.store.SeriesMetadataByID(r.Context(), series)
 	title := opdsSeriesDisplayTitle(series, meta)
 
@@ -2039,6 +2043,10 @@ func (s *Server) opdsKomgaSeriesBooks(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.writeDBError(w, r, err)
+		return
+	}
+	if !s.store.IsLibraryVisible(r.Context(), series.LibraryID) {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Series not found.")
 		return
 	}
 	meta, _ := s.store.SeriesMetadataByID(r.Context(), series)

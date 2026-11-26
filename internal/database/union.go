@@ -1925,7 +1925,7 @@ ORDER BY s.books_count DESC,
 		); err != nil {
 			return nil, err
 		}
-		if hasScope && !scope.AllowsLibrary(item.LibraryID) {
+		if hasScope && !scope.DisplaysLibrary(item.LibraryID) {
 			continue
 		}
 		item.OneShot = oneShotInt != 0

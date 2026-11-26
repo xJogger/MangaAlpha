@@ -85,11 +85,6 @@ func (s *Store) ClaimAdmin(ctx context.Context, username, password string) (Admi
 		return AdminUser{}, err
 	}
 	now := nowText()
-	showNSFW := 0
-	if s.BoolSetting(ctx, "show_nsfw", false) {
-		showNSFW = 1
-	}
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return AdminUser{}, err
@@ -105,7 +100,9 @@ func (s *Store) ClaimAdmin(ctx context.Context, username, password string) (Admi
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO users(id,username,password_hash,role,enabled,all_libraries,allow_nsfw,show_nsfw,created_at,updated_at)
-VALUES(?,?,?,'admin',1,1,1,?,?,?)`, PrimaryAdminUserID, username, hash, showNSFW, now, now); err != nil {
+VALUES(?,?,?,'admin',1,1,1,
+  coalesce((SELECT value IN ('1','t','T','TRUE','true','True') FROM settings WHERE key='show_nsfw'),0),?,?)`,
+		PrimaryAdminUserID, username, hash, now, now); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") ||
 			strings.Contains(strings.ToLower(err.Error()), "constraint") {
 			return AdminUser{}, ErrAlreadyClaimed

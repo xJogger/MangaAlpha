@@ -75,6 +75,8 @@
       allowNsfw: false,
       showNsfw: false,
       allLibraries: false,
+      authorizedLibrariesCount: 0,
+      hasHiddenLibraries: false,
       version: '',
       codename: '',
       codenameQuote: '',
@@ -906,7 +908,7 @@
     };
     document.getElementById('logout-btn').onclick = async () => {
       try { await api('/admin/api/auth/logout', { method: 'POST', allow401: true }); } catch (_) {}
-      state.auth = { claimed: true, authenticated: false, userId: '', username: '', role: '', isAdmin: false, allowNsfw: false, showNsfw: false, allLibraries: false, version: '', codename: '', codenameQuote: '' };
+      state.auth = { claimed: true, authenticated: false, userId: '', username: '', role: '', isAdmin: false, allowNsfw: false, showNsfw: false, allLibraries: false, authorizedLibrariesCount: 0, hasHiddenLibraries: false, version: '', codename: '', codenameQuote: '' };
       state.libraries = [];
       state.taxonomies = { loaded: false, genres: [], tags: [], publishers: [] };
       state.updateStatus = null;
@@ -1189,22 +1191,36 @@
     }, (libs) => {
       state.libraries = libs || [];
       let html = '';
+      const allAuthorizedHidden = state.libraries.length === 0 && Boolean(
+        state.auth && (state.auth.hasHiddenLibraries || Number(state.auth.authorizedLibrariesCount || 0) > 0),
+      );
       if (state.libraries.length === 0) {
-        html += isAdminUser() ? `
-          <div class="card" style="text-align:center;padding:38px 20px">
-            <h2>欢迎来到 MangaAlpha 书架</h2>
-            <p style="color:var(--text-secondary);max-width:540px;margin:8px auto 18px">
-              当前暂无可展示的书库（尚未创建书库，或所有书库均已设为隐藏）。支持挂载 <strong>115 网盘目录</strong>、<strong>本地 / SMB 挂载目录</strong> 与 <strong>WebDAV 远程目录（CloudDrive2 / OpenList / NAS）</strong>，并支持 Bangumi 中文元数据刮削与内置简体中文双页阅读器。
-            </p>
-            <a href="/admin?tab=libraries" data-nav class="btn btn-primary btn-lg">前往管理后台管理书库</a>
-          </div>` : `
-          <div class="card" style="text-align:center;padding:38px 20px">
-            <h2>欢迎来到 MangaAlpha 书架</h2>
-            <p style="color:var(--text-secondary);max-width:540px;margin:8px auto 18px">
-              当前账号暂无可访问的书库。请联系管理员在「用户管理」中为你分配书库访问权限。
-            </p>
-            <a href="/account" data-nav class="btn btn-primary">查看账号设置</a>
-          </div>`;
+        if (allAuthorizedHidden) {
+          html += `
+            <div class="card" style="text-align:center;padding:38px 20px">
+              <h2>当前已隐藏全部已授权书库</h2>
+              <p style="color:var(--text-secondary);max-width:540px;margin:8px auto 18px">
+                你在「账号设置」中已将全部已授权书库设为隐藏，因此书架、历史与外部客户端暂不展示任何书库。可前往账号设置恢复显示。
+              </p>
+              <a href="/account" data-nav class="btn btn-primary">前往账号设置恢复显示</a>
+            </div>`;
+        } else {
+          html += isAdminUser() ? `
+            <div class="card" style="text-align:center;padding:38px 20px">
+              <h2>欢迎来到 MangaAlpha 书架</h2>
+              <p style="color:var(--text-secondary);max-width:540px;margin:8px auto 18px">
+                当前暂无可展示的书库（尚未创建书库，或所有书库均已设为隐藏）。支持挂载 <strong>115 网盘目录</strong>、<strong>本地 / SMB 挂载目录</strong> 与 <strong>WebDAV 远程目录（CloudDrive2 / OpenList / NAS）</strong>，并支持 Bangumi 中文元数据刮削与内置简体中文双页阅读器。
+              </p>
+              <a href="/admin?tab=libraries" data-nav class="btn btn-primary btn-lg">前往管理后台管理书库</a>
+            </div>` : `
+            <div class="card" style="text-align:center;padding:38px 20px">
+              <h2>欢迎来到 MangaAlpha 书架</h2>
+              <p style="color:var(--text-secondary);max-width:540px;margin:8px auto 18px">
+                当前账号暂无可访问的书库。请联系管理员在「用户管理」中为你分配书库访问权限。
+              </p>
+              <a href="/account" data-nav class="btn btn-primary">查看账号设置</a>
+            </div>`;
+        }
       } else {
         html += `
           <section class="section-block">
@@ -1227,29 +1243,38 @@
 
       return html;
     });
-    load('home-continue', () => api('/api/v1/books?read_status=IN_PROGRESS&sort=readProgress.readDate,desc&size=' + displayPref('homeContinueSize')), (res) => {
-      const contBooks = res?.content || [];
+    load('home-continue', () => api(`/admin/api/bookshelf/continue-reading?size=${displayPref('homeContinueSize')}&merge_bangumi=${mergedWorks() ? '1' : '0'}`), (res) => {
+      const contGroups = res?.content || [];
       let html = '';
-      if (contBooks.length > 0) {
+      if (contGroups.length > 0) {
         html += `
           <section class="section-block">
             <div class="section-head">
               <h2>继续阅读</h2>
             </div>
             <div class="continue-grid">
-              ${contBooks.map((b) => {
+              ${contGroups.map((g) => {
+                const b = (g && g.primary) || g;
+                if (!b || !b.id) return '';
                 const pg = (b.readProgress && b.readProgress.page) || 1;
                 const totalPg = (b.media && b.media.pagesCount) || 0;
                 const readerURL = `/reader/series/${encodeURIComponent(b.seriesId)}/book/${encodeURIComponent(b.id)}?page=${pg}`;
+                const seriesURL = `/series/${encodeURIComponent(b.seriesId)}${g && g.mergedByBangumi && g.bgmSubjectId ? '?versions=1' : ''}`;
+                const seriesTitle = b.seriesTitle || b.name || '未命名';
+                const bookTitle = (b.metadata && b.metadata.title) ? b.metadata.title : b.name;
+                const otherInProgress = Number((g && g.otherInProgressCount) || 0);
                 return `
                   <div class="continue-card">
-                    <a href="/series/${encodeURIComponent(b.seriesId)}" data-nav>
+                    <a href="${seriesURL}" data-nav>
                       <img loading="lazy" src="/api/v1/series/${encodeURIComponent(b.seriesId)}/thumbnail?v=${state.coverVer}" alt="">
                     </a>
                     <div class="continue-info">
-                      <a href="/series/${encodeURIComponent(b.seriesId)}" data-nav class="continue-series" title="${esc(b.seriesTitle)}">${esc(b.seriesTitle || b.name)}</a>
-                      <div class="continue-book" title="${esc(b.name)}">${esc(b.metadata && b.metadata.title ? b.metadata.title : b.name)}</div>
-                      <div><span class="badge badge-accent">第 ${pg}${totalPg > 0 ? ` / ${totalPg}` : ''} 页</span></div>
+                      <a href="${seriesURL}" data-nav class="continue-series" title="${esc(seriesTitle)}">${esc(seriesTitle)}</a>
+                      <div class="continue-book" title="${esc(bookTitle)}">${esc(bookTitle)}</div>
+                      <div class="continue-badges">
+                        <span class="badge badge-accent">第 ${pg}${totalPg > 0 ? ` / ${totalPg}` : ''} 页</span>
+                        ${otherInProgress > 0 ? `<span class="badge" title="同作品还有 ${otherInProgress} 卷正在阅读，点击系列名查看全部卷">另有 ${otherInProgress} 卷在读</span>` : ''}
+                      </div>
                     </div>
                     <a href="${readerURL}" class="btn btn-primary btn-sm">继续读</a>
                   </div>`;
@@ -1412,6 +1437,9 @@
       const content = document.getElementById('page-content');
       if (!content) return;
       const activeLib = state.libraries.find((l) => l.id === libraryID);
+      const allAuthorizedHidden = state.libraries.length === 0 && Boolean(
+        state.auth && (state.auth.hasHiddenLibraries || Number(state.auth.authorizedLibrariesCount || 0) > 0),
+      );
       const chipsHTML = filterChipsHTML(sp);
       const outOfRangePage = !infinite && items.length === 0 && totalElements > 0 && page > 0;
       const libraryTitle = activeLib ? activeLib.name : '浏览书库';
@@ -1551,16 +1579,27 @@
                     <span class="pagination-info">第 <strong>${page + 1}</strong> / ${totalPages} 页</span>
                     <button type="button" class="btn" id="pg-next" ${page + 1 >= totalPages ? 'disabled' : ''}>下一页 →</button>
                   </nav>` : '')}`
-          : `<div class="empty-box shelf-empty-box">
-              <p>${outOfRangePage
-                ? '当前页码超出范围，可返回第一页查看作品。'
-                : chipsHTML
-                  ? '没有找到符合筛选条件的漫画作品，试试放宽筛选条件。'
-                  : (activeLib ? `「${esc(activeLib.name)}」暂无可展示的漫画作品。` : '当前书架暂无可展示的漫画作品。')}</p>
-              ${outOfRangePage
-                ? '<button type="button" class="btn btn-sm btn-primary" id="empty-reset">返回第一页</button>'
-                : (chipsHTML ? '<button type="button" class="btn btn-sm" id="empty-reset">清除筛选条件</button>' : '')}
-            </div>`}
+          : (allAuthorizedHidden && !outOfRangePage
+              ? `<div class="card" style="text-align:center;padding:38px 20px">
+                  <h2>当前已隐藏全部已授权书库</h2>
+                  <p style="color:var(--text-secondary);max-width:540px;margin:8px auto 18px">
+                    你在「账号设置」中已将全部已授权书库设为隐藏，因此书架暂不展示任何作品。可前往账号设置恢复显示。
+                  </p>
+                  <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+                    <a href="/account" data-nav class="btn btn-primary">前往账号设置恢复显示</a>
+                    ${chipsHTML ? '<button type="button" class="btn" id="empty-reset">清除筛选条件</button>' : ''}
+                  </div>
+                </div>`
+              : `<div class="empty-box shelf-empty-box">
+                  <p>${outOfRangePage
+                    ? '当前页码超出范围，可返回第一页查看作品。'
+                    : chipsHTML
+                      ? '没有找到符合筛选条件的漫画作品，试试放宽筛选条件。'
+                      : (activeLib ? `「${esc(activeLib.name)}」暂无可展示的漫画作品。` : '当前书架暂无可展示的漫画作品。')}</p>
+                  ${outOfRangePage
+                    ? '<button type="button" class="btn btn-sm btn-primary" id="empty-reset">返回第一页</button>'
+                    : (chipsHTML ? '<button type="button" class="btn btn-sm" id="empty-reset">清除筛选条件</button>' : '')}
+                </div>`)}
       `;
 
       const applyFilters = () => {
@@ -4944,18 +4983,18 @@
         </div>
       </details>
 
-      <div class="card">
+      <div class="card" id="bgm-nsfw-info-card">
         <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
           <div>
-            <h3 style="margin:0 0 4px">NSFW 作品前台显示开关</h3>
+            <h3 style="margin:0 0 4px">NSFW 分级识别与按账号隔离</h3>
             <div style="font-size:12.5px;color:var(--text-secondary)">
-              系统正常匹配 Bangumi <code>nsfw: true</code> 条目、扩展源 NSFW 条目及含成人目录特征的作品（非 <code>nsfw: true</code> 的普通受限标签作品不受影响）。默认关闭以在前台书架与 Komga 客户端中自动隐藏 NSFW 作品（当前未隐藏书库中共识别 <strong>${Number(st.nsfwCount || 0).toLocaleString()}</strong> 部 NSFW 作品）。
+              系统自动识别 Bangumi <code>nsfw: true</code> 条目、扩展源 NSFW 条目及含成人目录特征的作品（非 <code>nsfw: true</code> 的普通受限标签作品不受影响），当前未隐藏书库中共识别 <strong>${Number(st.nsfwCount || 0).toLocaleString()}</strong> 部 NSFW 作品。默认对前台书架、Komga 客户端与 OPDS 隐藏；账号授权在「<a href="/admin?tab=users" data-nav style="color:var(--accent)">用户管理</a>」配置，个人显示开关在「<a href="/account" data-nav style="color:var(--accent)">账号设置</a>」调整。
             </div>
           </div>
-          <label class="check-row" style="font-weight:600;color:var(--text)">
-            <input type="checkbox" id="bgm-show-nsfw" ${st.showNsfw ? 'checked' : ''}>
-            <span>显示 NSFW 作品</span>
-          </label>
+          <div style="display:flex;flex-wrap:wrap;gap:8px">
+            <a href="/admin?tab=users" data-nav class="btn btn-sm">前往用户管理</a>
+            <a href="/account" data-nav class="btn btn-sm">前往账号设置</a>
+          </div>
         </div>
       </div>
 
@@ -5683,19 +5722,6 @@
       };
     }
 
-    document.getElementById('bgm-show-nsfw').onchange = async (e) => {
-      const showNsfw = e.target.checked;
-      try {
-        await api('/admin/api/bangumi/config', { method: 'PUT', body: { showNsfw } });
-        state.taxonomies.loaded = false;
-        toast(showNsfw ? '已开启显示 NSFW 作品' : '已隐藏 NSFW 作品');
-        renderAdminBangumi(body);
-      } catch (err) {
-        e.target.checked = !showNsfw;
-        toast(err.message, 'error');
-      }
-    };
-
     document.getElementById('bgm-proxy-save').onclick = async () => {
       const proxyUrl = document.getElementById('bgm-proxy-url').value.trim();
       try {
@@ -6154,10 +6180,10 @@
           <div class="field"><label>下一卷索引预热阈值（剩余页数 1-100）</label><input type="number" name="volume_index_prefetch_remaining_pages" value="${esc(settings.volume_index_prefetch_remaining_pages || '10')}"></div>
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:18px;margin:10px 0 16px">
-          <label class="check-row"><input type="checkbox" name="show_nsfw" ${settings.show_nsfw === 'true' ? 'checked' : ''}><span>显示 NSFW 作品（全局默认；各账号独立开关请在个人「账号设置」调整）</span></label>
           <label class="check-row"><input type="checkbox" name="volume_index_prefetch_enabled" ${settings.volume_index_prefetch_enabled === 'true' ? 'checked' : ''}><span>启用下一卷目录索引自动预热</span></label>
         </div>
-        <p style="margin:0 0 14px;font-size:12px;color:var(--text-muted)">定时扫库、元数据刮削与自动补封面已迁移至「书库管理」中的单库/联合库「定时…」流水线配置。</p>
+        <p style="margin:0 0 8px;font-size:12px;color:var(--text-muted)">定时扫库、元数据刮削与自动补封面已迁移至「书库管理」中的单库/联合库「定时…」流水线配置。</p>
+        <p style="margin:0 0 14px;font-size:12px;color:var(--text-muted)">NSFW 访问权限请在「<a href="/admin?tab=users" data-nav style="color:var(--accent)">用户管理</a>」授予，个人前台显示开关请在「<a href="/account" data-nav style="color:var(--accent)">账号设置</a>」调整。</p>
         <button type="submit" class="btn btn-primary">保存系统设置</button>
       </form>
 
@@ -6325,7 +6351,7 @@
         }
         payload[byteKey] = converted;
       }
-      ['show_nsfw', 'volume_index_prefetch_enabled']
+      ['volume_index_prefetch_enabled']
         .forEach((k) => { payload[k] = e.target.elements[k].checked ? 'true' : 'false'; });
       try {
         await api('/admin/api/settings', { method: 'PUT', body: payload });
@@ -7504,44 +7530,38 @@
     }
   }
 
-  function groupHistoryTimeline(books) {
+  function groupHistoryDays(groups) {
     const dayOrder = [];
     const dayMap = new Map();
-    for (const b of books) {
-      const ms = historyTimestampMs(b);
-      const dayKey = historyDayKey(ms);
+    for (const g of groups) {
+      if (!g || !g.primary) continue;
+      const dayKey = g.dayKey || historyDayKey(historyTimestampMs(g.primary));
       if (!dayMap.has(dayKey)) {
-        const dayObj = { dayKey, label: historyDayLabel(dayKey), seriesOrder: [], seriesMap: new Map() };
+        const dayObj = { dayKey, label: historyDayLabel(dayKey), entries: [] };
         dayMap.set(dayKey, dayObj);
         dayOrder.push(dayObj);
       }
-      const dayObj = dayMap.get(dayKey);
-      const sid = b.seriesId || b.id;
-      if (!dayObj.seriesMap.has(sid)) {
-        const entry = { key: `${dayKey}::${sid}`, seriesId: sid, primary: b, others: [] };
-        dayObj.seriesMap.set(sid, entry);
-        dayObj.seriesOrder.push(entry);
-      } else {
-        dayObj.seriesMap.get(sid).others.push(b);
-      }
+      dayMap.get(dayKey).entries.push(g);
     }
-    return dayOrder.map((d) => ({
-      dayKey: d.dayKey,
-      label: d.label,
-      entries: d.seriesOrder,
-    }));
+    return dayOrder;
   }
 
   function renderHistoryEntryHTML(entry) {
     const b = entry.primary;
+    const others = Array.isArray(entry.others) ? entry.others : [];
+    const entryKey = entry.groupKey
+      ? `${entry.dayKey || 'unknown'}::${entry.groupKey}`
+      : (entry.key || `${entry.dayKey || 'unknown'}::${b.seriesId || b.id}`);
     const rp = b.readProgress || {};
     const pg = Number(rp.page) || 1;
     const totalPg = Number((b.media && b.media.pagesCount) || 0);
     const completed = Boolean(rp.completed);
     const readerPage = completed ? 1 : pg;
     const readerURL = `/reader/series/${encodeURIComponent(b.seriesId)}/book/${encodeURIComponent(b.id)}?page=${readerPage}`;
-    const seriesURL = `/series/${encodeURIComponent(b.seriesId)}`;
-    const seriesTitle = b.seriesTitle || b.name || '未命名';
+    const seriesURL = (entry.mergedByBangumi && entry.bgmSubjectId)
+      ? seriesVersionURL(b.seriesId)
+      : `/series/${encodeURIComponent(b.seriesId)}`;
+    const seriesTitle = entry.seriesTitle || b.seriesTitle || b.name || '未命名';
     const bookLabel = (b.metadata && b.metadata.title) ? b.metadata.title : b.name;
     const timeStr = historyTimeText(historyTimestampMs(b));
     const sourceText = librarySourceText(b.libraryId);
@@ -7549,15 +7569,15 @@
       ? `<span class="badge badge-success">已读完</span>`
       : `<span class="badge badge-accent">第 ${pg}${totalPg > 0 ? ` / ${totalPg}` : ''} 页</span>`;
 
-    const subHTML = entry.others.length > 0 ? `
+    const subHTML = others.length > 0 ? `
       <div class="history-entry-footer">
-        <button type="button" class="history-more-btn" data-hist-toggle="${esc(entry.key)}" data-hist-count="${entry.others.length}" aria-expanded="false">
-          ▸ 当天另有 ${entry.others.length} 卷
+        <button type="button" class="history-more-btn" data-hist-toggle="${esc(entryKey)}" data-hist-count="${others.length}" aria-expanded="false">
+          ▸ 当天另有 ${others.length} 卷
         </button>
         <a href="${seriesURL}" data-nav style="font-size:12px;color:var(--text-muted)">作品详情 →</a>
       </div>
-      <div class="history-sub-list" data-hist-children="${esc(entry.key)}" hidden>
-        ${entry.others.map((ob) => {
+      <div class="history-sub-list" data-hist-children="${esc(entryKey)}" hidden>
+        ${others.map((ob) => {
           const orp = ob.readProgress || {};
           const opg = Number(orp.page) || 1;
           const ototal = Number((ob.media && ob.media.pagesCount) || 0);
@@ -7565,10 +7585,16 @@
           const oUrl = `/reader/series/${encodeURIComponent(ob.seriesId)}/book/${encodeURIComponent(ob.id)}?page=${odone ? 1 : opg}`;
           const oName = (ob.metadata && ob.metadata.title) ? ob.metadata.title : ob.name;
           const oTime = historyTimeText(historyTimestampMs(ob));
+          const isDiffVersion = Boolean(entry.mergedByBangumi) && (
+            (ob.seriesId && b.seriesId && ob.seriesId !== b.seriesId) ||
+            (ob.libraryId && b.libraryId && ob.libraryId !== b.libraryId)
+          );
+          const oSource = isDiffVersion ? librarySourceText(ob.libraryId) : '';
           return `
             <a class="history-sub-item" href="${oUrl}">
               <span class="history-sub-name" title="${esc(oName)}">${esc(oName)}</span>
               <span class="history-sub-meta">
+                ${oSource ? `<span class="history-sub-source" title="${esc(oSource)}">${esc(oSource)}</span>` : ''}
                 ${odone ? `<span class="badge badge-success">已读完</span>` : `<span class="badge badge-accent">第 ${opg}${ototal > 0 ? ` / ${ototal}` : ''} 页</span>`}
                 ${oTime ? `<span>${esc(oTime)}</span>` : ''}
               </span>
@@ -7596,65 +7622,70 @@
       </article>`;
   }
 
+  let historyRenderSeq = 0;
+
   async function renderHistory() {
     const seq = routeSeq;
+    const hSeq = ++historyRenderSeq;
     document.title = '阅读历史 · MangaAlpha';
     const sp = new URLSearchParams(location.search);
     const search = (sp.get('search') || '').trim();
     renderShell('history', `<div class="boot-splash" style="min-height:40vh"><div class="spinner"></div><p>正在加载阅读历史…</p></div>`);
 
-    const PAGE_SIZE = 80;
-    const loadedBooks = [];
-    const seenBookIDs = new Set();
+    const PAGE_SIZE = 30;
+    const loadedGroups = [];
+    const seenGroupKeys = new Set();
     let nextPage = 0;
     let totalPages = 1;
-    let totalElements = 0;
+    let totalBooks = 0;
     let loadingMore = false;
 
-    const fetchBatch = async (minAdditionalGroups = 15) => {
-      let loops = 0;
-      const beforeGroups = groupHistoryTimeline(loadedBooks).reduce((acc, g) => acc + g.entries.length, 0);
-      while (nextPage < totalPages && loops < 4) {
-        loops++;
-        const qs = new URLSearchParams();
-        qs.append('read_status', 'IN_PROGRESS');
-        qs.append('read_status', 'READ');
-        qs.set('sort', 'readProgress.readDate,desc');
-        qs.set('page', String(nextPage));
-        qs.set('size', String(PAGE_SIZE));
-        if (search) qs.set('search', search);
-        const page = await api(`/api/v1/books?${qs.toString()}`);
-        if (seq !== routeSeq) return false;
-        const rows = (page && page.content) || [];
-        totalElements = Number((page && page.totalElements) || 0);
-        totalPages = Number((page && page.totalPages) || 0);
-        nextPage++;
-        for (const r of rows) {
-          if (!r || !r.id || seenBookIDs.has(r.id)) continue;
-          seenBookIDs.add(r.id);
-          loadedBooks.push(r);
-        }
-        const curGroups = groupHistoryTimeline(loadedBooks).reduce((acc, g) => acc + g.entries.length, 0);
-        if (curGroups - beforeGroups >= minAdditionalGroups || rows.length === 0) break;
+    const fetchBatch = async () => {
+      if (nextPage >= totalPages) return true;
+      const tzOffset = -new Date().getTimezoneOffset();
+      const url = `/admin/api/bookshelf/history?page=${nextPage}&size=${PAGE_SIZE}&tz_offset=${tzOffset}&merge_bangumi=${mergedWorks() ? '1' : '0'}${search ? '&search=' + encodeURIComponent(search) : ''}`;
+      const page = await api(url);
+      if (seq !== routeSeq || hSeq !== historyRenderSeq) return false;
+      const rows = (page && Array.isArray(page.content)) ? page.content : [];
+      totalBooks = Number((page && (page.totalBooks ?? page.totalElements)) || 0);
+      totalPages = Number((page && page.totalPages) || 0);
+      nextPage += 1;
+      for (const g of rows) {
+        if (!g || !g.primary) continue;
+        const dk = g.dayKey || historyDayKey(historyTimestampMs(g.primary));
+        const gk = g.groupKey || g.primary.seriesId || g.primary.id;
+        const dedupKey = `${dk}::${gk}`;
+        if (seenGroupKeys.has(dedupKey)) continue;
+        seenGroupKeys.add(dedupKey);
+        loadedGroups.push(g);
       }
       return true;
     };
 
     const paint = () => {
       const content = document.getElementById('page-content');
-      if (!content || seq !== routeSeq) return;
-      const days = groupHistoryTimeline(loadedBooks);
+      if (!content || seq !== routeSeq || hSeq !== historyRenderSeq) return;
+      const days = groupHistoryDays(loadedGroups);
       const hasMore = nextPage < totalPages;
       content.innerHTML = `
         <section class="section">
           <div class="section-head">
-            <h2>历史${totalElements > 0 ? `（${totalElements.toLocaleString()} 卷记录）` : ''}</h2>
+            <h2>历史${totalBooks > 0 ? `（共 ${totalBooks.toLocaleString()} 卷记录）` : ''}</h2>
             <div class="org-toolbar history-toolbar">
               <form id="history-filter-form" class="org-search-form">
                 <input type="text" id="history-search-input" value="${esc(search)}" placeholder="搜索历史漫画或卷名…">
                 <button type="submit" class="btn btn-sm">搜索</button>
                 <button type="button" class="btn btn-sm" id="btn-history-refresh">刷新</button>
               </form>
+              <label class="pref-toggle pref-toggle-inline history-merge-toggle" for="history-merge-bgm" title="与书架联动：仅网页端合并显示，第三方客户端仍独立展示">
+                <span class="pref-toggle-text">
+                  <strong>合并相同 Bangumi ID</strong>
+                </span>
+                <span class="switch">
+                  <input type="checkbox" id="history-merge-bgm" ${mergedWorks() ? 'checked' : ''}>
+                  <span class="switch-track" aria-hidden="true"></span>
+                </span>
+              </label>
             </div>
           </div>
           ${days.length ? `
@@ -7686,6 +7717,13 @@
         navigate(val ? `/history?search=${encodeURIComponent(val)}` : '/history');
       };
       document.getElementById('btn-history-refresh').onclick = () => renderHistory();
+      const historyMergeToggle = document.getElementById('history-merge-bgm');
+      if (historyMergeToggle) {
+        historyMergeToggle.onchange = (e) => {
+          localStorage.setItem('fk115_merge_bangumi', e.target.checked ? '1' : '0');
+          renderHistory();
+        };
+      }
       content.querySelectorAll('button[data-hist-toggle]').forEach((btn) => {
         btn.onclick = () => {
           const key = btn.getAttribute('data-hist-toggle');
@@ -7707,8 +7745,8 @@
           moreBtn.disabled = true;
           moreBtn.textContent = '加载中…';
           try {
-            const ok = await fetchBatch(15);
-            if (!ok || seq !== routeSeq) return;
+            const ok = await fetchBatch();
+            if (!ok || seq !== routeSeq || hSeq !== historyRenderSeq) return;
             loadingMore = false;
             paint();
           } catch (err) {
@@ -7721,11 +7759,11 @@
     };
 
     try {
-      await Promise.all([ensureLibrariesLoaded(), fetchBatch(15)]);
-      if (seq !== routeSeq) return;
+      await Promise.all([ensureLibrariesLoaded(), fetchBatch()]);
+      if (seq !== routeSeq || hSeq !== historyRenderSeq) return;
       paint();
     } catch (err) {
-      if (seq !== routeSeq) return;
+      if (seq !== routeSeq || hSeq !== historyRenderSeq) return;
       toast(err.message, 'error');
     }
   }
@@ -7750,6 +7788,17 @@
 
       const user = (me && me.user) || {};
       const visibleLibs = (me && Array.isArray(me.visibleLibraries)) ? me.visibleLibraries : [];
+      const authorizedLibs = (me && Array.isArray(me.authorizedLibraries))
+        ? me.authorizedLibraries
+        : visibleLibs.map((l) => Object.assign({}, l, { hidden: false }));
+      const hiddenLibIds = (me && Array.isArray(me.hiddenLibraryIds))
+        ? me.hiddenLibraryIds
+        : authorizedLibs.filter((l) => l && l.hidden).map((l) => l.id);
+      const initialHiddenSet = new Set(hiddenLibIds);
+      if (state.auth) {
+        state.auth.authorizedLibrariesCount = authorizedLibs.length;
+        state.auth.hasHiddenLibraries = initialHiddenSet.size > 0;
+      }
       const clients = (me && me.clients) || {};
       const komgaURL = clients.komgaUrl || location.origin;
       const koreaderURL = clients.koreaderOpdsUrl || `${location.origin}/api/opds/v1.2`;
@@ -7775,11 +7824,11 @@
               <div>用户名：<strong style="color:var(--text)">${esc(user.username || state.auth.username)}</strong>
                 <span class="badge ${isAdmin ? 'badge-accent' : ''}" style="margin-left:6px">${isAdmin ? '管理员' : '普通用户'}</span>
               </div>
-              <div>可访问书库：
+              <div>可访问书库：<span id="acc-visible-libs">
                 ${visibleLibs.length === 0
-                  ? `<span class="badge">暂无可见书库</span>`
+                  ? `<span class="badge">${authorizedLibs.length > 0 ? '已全部隐藏' : '暂无可见书库'}</span>`
                   : visibleLibs.map((l) => `<a href="/libraries/${encodeURIComponent(l.id)}" data-nav class="badge">${esc(l.name)}</a>`).join(' ')}
-              </div>
+              </span></div>
               ${user.allowNsfw ? `
                 <div style="margin-top:6px;padding:10px 12px;border-radius:8px;background:var(--bg-input);border:1px solid var(--border)">
                   <label class="check-row" style="font-size:13px;font-weight:600;color:var(--text)">
@@ -7787,6 +7836,27 @@
                     <span>在书架、Komga 客户端与 OPDS 中显示 NSFW 作品</span>
                   </label>
                   <div style="font-size:12px;color:var(--text-muted);margin-top:4px">此开关仅影响当前账号视图，不会影响其他用户。</div>
+                </div>` : ''}
+              ${authorizedLibs.length > 0 ? `
+                <div class="acc-lib-filter-box" id="acc-lib-filter-box">
+                  <div class="acc-lib-filter-head">
+                    <div>
+                      <div class="acc-lib-filter-title">选择显示的书库</div>
+                      <div class="acc-lib-filter-hint">隐藏后在网页书架、历史、Komga 客户端与 OPDS 目录中不再展示，管理员新增授权书库默认显示；已收藏直链仍可打开</div>
+                    </div>
+                    <button type="button" class="btn btn-sm" id="acc-libs-show-all">全部显示</button>
+                  </div>
+                  <div class="acc-lib-list" id="acc-lib-list">
+                    ${authorizedLibs.map((l) => {
+                      const shown = !initialHiddenSet.has(l.id);
+                      return `
+                        <label class="acc-lib-item">
+                          <input type="checkbox" class="acc-lib-check" data-acc-lib-id="${esc(l.id)}" ${shown ? 'checked' : ''}>
+                          <span class="acc-lib-name" title="${esc(l.name)}">${esc(l.name)}</span>
+                          <span class="badge">${esc(providerLabel(l.providerType, l.webdavAccountName))}</span>
+                        </label>`;
+                    }).join('')}
+                  </div>
                 </div>` : ''}
             </div>
           </div>
@@ -8026,6 +8096,106 @@
             nsfwToggle.disabled = false;
           }
         };
+      }
+
+      const libFilterBox = document.getElementById('acc-lib-filter-box');
+      if (libFilterBox && authorizedLibs.length > 0) {
+        const showAllBtn = document.getElementById('acc-libs-show-all');
+        const getLibCheckboxes = () => Array.from(content.querySelectorAll('input[data-acc-lib-id]'));
+        let savingLibPrefs = false;
+        let lastHiddenIds = Array.from(initialHiddenSet);
+
+        const syncLibFilterUI = (hiddenIds) => {
+          const hiddenSet = new Set(hiddenIds);
+          getLibCheckboxes().forEach((cb) => {
+            const lid = cb.getAttribute('data-acc-lib-id');
+            cb.checked = !hiddenSet.has(lid);
+          });
+          if (showAllBtn) {
+            showAllBtn.disabled = savingLibPrefs || hiddenSet.size === 0;
+          }
+          const visibleBox = document.getElementById('acc-visible-libs');
+          if (visibleBox) {
+            const nextVisible = authorizedLibs.filter((l) => !hiddenSet.has(l.id));
+            visibleBox.innerHTML = nextVisible.length === 0
+              ? `<span class="badge">${authorizedLibs.length > 0 ? '已全部隐藏' : '暂无可见书库'}</span>`
+              : nextVisible.map((l) => `<a href="/libraries/${encodeURIComponent(l.id)}" data-nav class="badge">${esc(l.name)}</a>`).join(' ');
+          }
+        };
+
+        const setLibControlsDisabled = (disabled) => {
+          getLibCheckboxes().forEach((cb) => { cb.disabled = disabled; });
+          if (showAllBtn) {
+            showAllBtn.disabled = disabled || lastHiddenIds.length === 0;
+          }
+        };
+
+        const saveHiddenLibraries = async (nextHiddenIds) => {
+          if (savingLibPrefs) return;
+          const startUser = state.auth.userId || '';
+          const startSeq = routeSeq;
+          savingLibPrefs = true;
+          setLibControlsDisabled(true);
+          try {
+            const res = await api('/admin/api/me/preferences', {
+              method: 'PUT',
+              body: { hiddenLibraryIds: nextHiddenIds },
+            });
+            if (startSeq !== routeSeq || (state.auth.userId || '') !== startUser) return;
+            const persistedHidden = (res && Array.isArray(res.hiddenLibraryIds)) ? res.hiddenLibraryIds : nextHiddenIds;
+            lastHiddenIds = persistedHidden.slice();
+            state.auth.hasHiddenLibraries = persistedHidden.length > 0;
+            state.auth.authorizedLibrariesCount = authorizedLibs.length;
+            state.taxonomies.loaded = false;
+            try {
+              const latestLibs = await api('/api/v1/libraries');
+              if (startSeq === routeSeq && (state.auth.userId || '') === startUser) {
+                state.libraries = latestLibs || [];
+              }
+            } catch (_) {}
+            toast(
+              persistedHidden.length === 0
+                ? '已设为显示全部已授权书库'
+                : (persistedHidden.length >= authorizedLibs.length
+                  ? '已隐藏全部已授权书库'
+                  : `已保存书库显示设置（已隐藏 ${persistedHidden.length} 个）`),
+            );
+          } catch (err) {
+            if (startSeq === routeSeq && (state.auth.userId || '') === startUser) {
+              toast(err.message, 'error');
+            }
+          } finally {
+            savingLibPrefs = false;
+            if (startSeq === routeSeq && (state.auth.userId || '') === startUser) {
+              syncLibFilterUI(lastHiddenIds);
+              setLibControlsDisabled(false);
+            }
+          }
+        };
+
+        syncLibFilterUI(lastHiddenIds);
+
+        getLibCheckboxes().forEach((cb) => {
+          cb.onchange = () => {
+            if (savingLibPrefs) {
+              syncLibFilterUI(lastHiddenIds);
+              return;
+            }
+            const nextHidden = getLibCheckboxes()
+              .filter((el) => !el.checked)
+              .map((el) => el.getAttribute('data-acc-lib-id'))
+              .filter(Boolean);
+            saveHiddenLibraries(nextHidden);
+          };
+        });
+
+        if (showAllBtn) {
+          showAllBtn.onclick = () => {
+            if (savingLibPrefs) return;
+            syncLibFilterUI([]);
+            saveHiddenLibraries([]);
+          };
+        }
       }
 
       bindDisplayPrefControls(content);
@@ -8477,6 +8647,8 @@
     const seq = ++routeSeq;
     teardownShelfObserver();
     closeConfirmModal(false);
+    const prevUserId = (state.auth && state.auth.userId) || '';
+    const prevAuthenticated = Boolean(state.auth && state.auth.authenticated);
     try {
       const st = await api('/admin/api/auth/status', { allow401: true });
       if (seq !== routeSeq) return;
@@ -8485,6 +8657,16 @@
 
     if (seq !== routeSeq) return;
     closeConfirmModal(false);
+    const nextUserId = (state.auth && state.auth.userId) || '';
+    if ((prevUserId || prevAuthenticated) && nextUserId !== prevUserId) {
+      state.libraries = [];
+      state.taxonomies = { loaded: false, genres: [], tags: [], publishers: [] };
+      resetDisplayPrefs();
+      const appEl = document.getElementById('app');
+      if (appEl && appEl.innerHTML) {
+        appEl.innerHTML = '';
+      }
+    }
     updateFooterVersion(state.auth);
     const p = location.pathname;
     if (!state.auth.claimed) {

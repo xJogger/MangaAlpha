@@ -190,7 +190,7 @@ func (s *Store) populateCollectionMembers(ctx context.Context, items []Collectio
 			args[i] = id
 		}
 		query := `
-SELECT cs.collection_id, cs.series_id, s.library_id, l.enabled, COALESCE(sm.is_nsfw, 0)
+SELECT cs.collection_id, cs.series_id, s.library_id, l.enabled AND NOT EXISTS (SELECT 1 FROM union_layers ul WHERE ul.member_library_id=l.id), COALESCE(sm.is_nsfw, 0)
 FROM collection_series cs
 JOIN series s ON s.id=cs.series_id
 JOIN libraries l ON l.id=s.library_id
@@ -209,7 +209,7 @@ ORDER BY cs.collection_id ASC, cs.position ASC`
 				return err
 			}
 			idx := idxByID[cid]
-			if enabled == 0 || (hasScope && !scope.AllowsLibrary(lid)) || (excludeNSFW && isNSFW != 0) {
+			if enabled == 0 || (hasScope && !scope.DisplaysLibrary(lid)) || (excludeNSFW && isNSFW != 0) {
 				items[idx].Filtered = true
 				continue
 			}
@@ -645,7 +645,7 @@ func (s *Store) populateReadListMembers(ctx context.Context, items []ReadList) e
 			args[i] = id
 		}
 		query := `
-SELECT rb.readlist_id, rb.book_id, b.library_id, l.enabled, COALESCE(sm.is_nsfw, 0)
+SELECT rb.readlist_id, rb.book_id, b.library_id, l.enabled AND NOT EXISTS (SELECT 1 FROM union_layers ul WHERE ul.member_library_id=l.id), COALESCE(sm.is_nsfw, 0)
 FROM readlist_books rb
 JOIN books b ON b.id=rb.book_id
 JOIN libraries l ON l.id=b.library_id
@@ -664,7 +664,7 @@ ORDER BY rb.readlist_id ASC, rb.position ASC`
 				return err
 			}
 			idx := idxByID[rid]
-			if enabled == 0 || (hasScope && !scope.AllowsLibrary(lid)) || (excludeNSFW && isNSFW != 0) {
+			if enabled == 0 || (hasScope && !scope.DisplaysLibrary(lid)) || (excludeNSFW && isNSFW != 0) {
 				items[idx].Filtered = true
 				continue
 			}

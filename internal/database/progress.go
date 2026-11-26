@@ -3,7 +3,12 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
+
+	"github.com/xJogger/fake-komga-115/internal/cjk"
 )
 
 func (s *Store) SeriesReadProgress(ctx context.Context, seriesID string) (SeriesReadProgress, error) {
@@ -394,27 +399,37 @@ func (s *Store) UpdateBookReadProgress(
 ) error {
 	userID := UserIDFromContext(ctx)
 	now := nowText()
-	completedValue := false
-	if completed != nil {
-		completedValue = *completed
-	}
-	completedInt := 0
-	if completedValue {
-		completedInt = 1
-	}
-	var completedAt any
-	if completedValue {
-		completedAt = now
-	}
-	var pageValue any
-	if page != nil && *page > 0 {
-		pageValue = *page
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	// Use only persisted index metadata and read it in the progress write transaction.
+	var pageCount int
+	if err := tx.QueryRowContext(ctx, `SELECT coalesce((SELECT page_count FROM zip_indexes WHERE book_id=?),0)`, book.ID).Scan(&pageCount); err != nil {
+		return err
+	}
+	var pageValue any
+	completedValue := false
+	if page != nil && *page > 0 {
+		currentPage := *page
+		if pageCount > 0 {
+			currentPage = min(currentPage, pageCount)
+			completedValue = currentPage == pageCount
+		}
+		pageValue = currentPage
+	}
+	if completed != nil {
+		completedValue = *completed
+		if page == nil && completedValue && pageCount > 0 {
+			pageValue = pageCount
+		}
+	}
+	completedInt := boolInt(completedValue)
+	var completedAt any
+	if completedValue {
+		completedAt = now
+	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO book_read_progress(
  user_id,book_id,series_id,completed,page,read_date,completed_at,updated_at
@@ -615,4 +630,170 @@ LIMIT 1`, userID, seriesID).Scan(
 	}
 	progress.UpdatedAt = parseTime(updated)
 	return progress, true, nil
+}
+
+type ReadingActivityQuery struct {
+	InProgressOnly bool
+	MergeBangumi   bool
+	Search         string
+	TZOffset       int // Minutes east of UTC.
+	Page           int
+	Size           int
+}
+
+type ReadingActivityBook struct {
+	Book     Book
+	Series   Series
+	Metadata SeriesMetadata
+	Progress BookReadProgress
+}
+
+type ReadingActivityGroup struct {
+	DayKey          string
+	GroupKey        string
+	MergedByBangumi bool
+	Books           []ReadingActivityBook
+}
+
+type ReadingActivityPage struct {
+	Groups        []ReadingActivityGroup
+	TotalElements int64
+	TotalBooks    int64
+}
+
+// ReadingActivity returns complete groups for the requested page and counts all matching activity.
+// The query starts from the current user's progress and fetches book details only for selected groups.
+func (s *Store) ReadingActivity(ctx context.Context, q ReadingActivityQuery) (ReadingActivityPage, error) {
+	out := ReadingActivityPage{Groups: []ReadingActivityGroup{}}
+	libraries, err := s.enabledLibraryIDs(ctx)
+	if err != nil || len(libraries) == 0 {
+		return out, err
+	}
+
+	ids, _ := json.Marshal(libraries)
+	userID := UserIDFromContext(ctx)
+	args := []any{q.MergeBangumi, userID, string(ids)}
+	filter := ""
+	if q.InProgressOnly {
+		filter += " AND p.completed=0"
+	}
+	if !s.ShowNSFW(ctx) {
+		filter += " AND coalesce(sm.is_nsfw,0)=0"
+	}
+	if search := strings.TrimSpace(q.Search); search != "" {
+		key := cjk.SearchKey(search)
+		if key == "" {
+			return out, nil
+		}
+		filter += ` AND (cjk_contains(s.name, ?) OR cjk_contains(sm.title, ?) OR cjk_contains(b.name, ?)
+ OR EXISTS (
+   SELECT 1 FROM json_each(CASE WHEN json_valid(sm.alternate_titles_json) THEN sm.alternate_titles_json ELSE '[]' END) AS alt
+   WHERE cjk_contains(CASE WHEN alt.type='object' THEN alt.value ->> 'title' END, ?)
+ ))`
+		args = append(args, key, key, key, key)
+	}
+
+	dayKey := "''"
+	if !q.InProgressOnly {
+		dayKey = "coalesce(date(substr(sort_at,1,19), ?), '1970-01-01')"
+		args = append(args, fmt.Sprintf("%+d minutes", min(840, max(-720, q.TZOffset))))
+	}
+
+	size := int64(min(100, max(1, q.Size)))
+	offset := min(int64(max(0, q.Page)), (1<<63-1)/size) * size
+	args = append(args, size, offset, userID)
+	// Progress writes use UTC RFC3339Nano. Split off the fraction before converting
+	// offsets or days so SQLite's millisecond rounding cannot move a record across midnight.
+	// The fixed-width UTC seconds plus the normalized fraction also sort exact-second ties.
+	query := `
+WITH matching AS (
+ SELECT b.id AS book_id,
+   CASE WHEN ? AND s.one_shot=0 AND sm.bgm_subject_id>0
+     THEN 'bgm:' || sm.bgm_subject_id ELSE 'series:' || s.id END AS group_key,
+   CASE WHEN substr(p.updated_at,-1)='Z' THEN substr(p.updated_at,1,19)
+     ELSE coalesce(strftime('%Y-%m-%dT%H:%M:%S', substr(p.updated_at,1,19) || substr(p.updated_at,-6)), '1970-01-01T00:00:00')
+   END || CASE WHEN substr(p.updated_at,20,1)='.'
+     THEN rtrim(substr(p.updated_at,21,length(p.updated_at)-20-
+       CASE WHEN substr(p.updated_at,-1)='Z' THEN 1 ELSE 6 END), '0') ELSE '' END AS sort_at
+ FROM book_read_progress p
+ CROSS JOIN books b ON b.id=p.book_id
+ CROSS JOIN series s ON s.id=b.series_id
+ LEFT JOIN series_metadata sm ON sm.series_id=s.id
+ WHERE p.user_id=? AND b.library_id IN (SELECT value FROM json_each(?))` + filter + `
+),
+activity AS MATERIALIZED (
+ SELECT book_id,group_key,sort_at,` + dayKey + ` AS day_key FROM matching
+),
+groups AS MATERIALIZED (
+ SELECT day_key,group_key,max(sort_at) AS latest,count(*) AS book_count
+ FROM activity GROUP BY day_key,group_key
+),
+selected AS (
+ SELECT day_key,group_key,latest FROM groups
+ ORDER BY day_key DESC,latest DESC,group_key LIMIT ? OFFSET ?
+)
+SELECT totals.group_count,totals.book_count,g.day_key,g.group_key,b.id,
+ coalesce(b.series_id,''),coalesce(b.library_id,''),coalesce(b.name,''),coalesce(b.size,0),coalesce(b.sha1,''),
+ b.file_created_at,b.file_modified_at,coalesce(b.number_sort,0),coalesce(b.created_at,''),coalesce(b.updated_at,''),
+ coalesce(z.page_count,0),coalesce(s.name,''),coalesce(s.one_shot,0),coalesce(sm.title,''),sm.authors_json,sm.bgm_subject_id,
+ coalesce(p.completed,0),p.page,p.read_date,p.completed_at,coalesce(p.updated_at,'')
+FROM (SELECT count(*) AS group_count,coalesce(sum(book_count),0) AS book_count FROM groups) totals
+LEFT JOIN selected g ON true
+LEFT JOIN activity a ON a.group_key=g.group_key AND a.day_key=g.day_key
+LEFT JOIN books b ON b.id=a.book_id
+LEFT JOIN series s ON s.id=b.series_id
+LEFT JOIN series_metadata sm ON sm.series_id=s.id
+LEFT JOIN zip_indexes z ON z.book_id=b.id
+LEFT JOIN book_read_progress p ON p.user_id=? AND p.book_id=b.id
+ORDER BY g.day_key DESC,g.latest DESC,g.group_key,a.sort_at DESC,a.book_id ASC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item ReadingActivityBook
+		b, sr, meta, progress := &item.Book, &item.Series, &item.Metadata, &item.Progress
+		var day, key, id, fileCreated, fileModified, authors, readDate, completedAt sql.NullString
+		var subject, page sql.NullInt64
+		var created, updated, progressUpdated string
+		if err := rows.Scan(&out.TotalElements, &out.TotalBooks, &day, &key, &id,
+			&b.SeriesID, &b.LibraryID, &b.Name, &b.Size, &b.SHA1,
+			&fileCreated, &fileModified, &b.NumberSort, &created, &updated,
+			&b.PageCount, &sr.Name, &sr.OneShot, &meta.Title, &authors, &subject,
+			&progress.Completed, &page, &readDate, &completedAt, &progressUpdated); err != nil {
+			return out, err
+		}
+		if !id.Valid { // Totals are still returned when the requested page is empty.
+			continue
+		}
+		b.ID = id.String
+		b.CreatedAt, b.UpdatedAt = parseTime(created), parseTime(updated)
+		b.FileCreatedAt, b.FileModifiedAt = parseNullableTime(fileCreated), parseNullableTime(fileModified)
+		sr.ID, sr.LibraryID = b.SeriesID, b.LibraryID
+		if subject.Valid && subject.Int64 > 0 {
+			meta.BgmSubjectID = &subject.Int64
+		}
+		if authors.Valid {
+			_ = json.Unmarshal([]byte(authors.String), &meta.Authors)
+		}
+		progress.BookID, progress.SeriesID = b.ID, b.SeriesID
+		progress.ReadDate, progress.CompletedAt = parseNullableTime(readDate), parseNullableTime(completedAt)
+		progress.UpdatedAt = parseTime(progressUpdated)
+		if page.Valid {
+			value := int(page.Int64)
+			progress.Page = &value
+		}
+
+		n := len(out.Groups)
+		if n == 0 || out.Groups[n-1].DayKey != day.String || out.Groups[n-1].GroupKey != key.String {
+			out.Groups = append(out.Groups, ReadingActivityGroup{
+				DayKey: day.String, GroupKey: key.String, MergedByBangumi: strings.HasPrefix(key.String, "bgm:"),
+			})
+			n++
+		}
+		out.Groups[n-1].Books = append(out.Groups[n-1].Books, item)
+	}
+	return out, rows.Err()
 }

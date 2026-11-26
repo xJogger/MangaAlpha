@@ -50,6 +50,9 @@ func (s *Server) adminRoutes(r chi.Router) {
 	// Built-in bookshelf & reader endpoints available to any authorized user (library & NSFW visibility enforced per user)
 	r.Get("/bookshelf/series", s.bookshelfSeries)
 	r.Get("/bookshelf/versions/{seriesID}", s.bookshelfVersions)
+	r.Get("/bookshelf/series/{seriesID}/versions", s.bookshelfVersions)
+	r.Get("/bookshelf/continue-reading", s.bookshelfContinueReading)
+	r.Get("/bookshelf/history", s.bookshelfHistory)
 	r.Get("/series/{seriesID}/detail", s.seriesRichDetail)
 	r.Get("/books/{bookID}/detail", s.bookRichDetail)
 	r.Post("/books/{bookID}/unlock", s.unlockBookArchiveHandler)
@@ -168,7 +171,7 @@ func (s *Server) adminRoutes(r chi.Router) {
 func (s *Server) adminStatus(w http.ResponseWriter, r *http.Request) {
 	account, _ := s.store.Account(r.Context())
 	webdavAccounts, _ := s.store.WebDAVAccounts(r.Context())
-	libraries, series, books, comicBytes, err := s.store.Counts(r.Context())
+	libraries, series, books, comicBytes, err := s.store.Counts(adminCatalogContext(r.Context()))
 	if err != nil {
 		s.writeDBError(w, r, err)
 		return
@@ -961,9 +964,23 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
-	var request map[string]string
-	if !decodeJSON(w, r, &request) {
+	var raw map[string]json.RawMessage
+	if !decodeJSON(w, r, &raw) {
 		return
+	}
+	normalizeShowNSFWSettingAlias(raw)
+	request := make(map[string]string, len(raw))
+	for key, value := range raw {
+		var text string
+		if err := json.Unmarshal(value, &text); err != nil {
+			var flag bool
+			if key != "show_nsfw" || json.Unmarshal(value, &flag) != nil {
+				writeError(w, http.StatusBadRequest, "INVALID_SETTING", "Invalid value for "+key)
+				return
+			}
+			text = strconv.FormatBool(flag)
+		}
+		request[key] = text
 	}
 	allowed := map[string]bool{
 		"api_rate_per_second":                   true,
@@ -1042,6 +1059,15 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	s.client.Reload(r.Context())
 	s.getSettings(w, r)
+}
+
+func normalizeShowNSFWSettingAlias[T any](settings map[string]T) {
+	if value, ok := settings["showNsfw"]; ok {
+		if _, canonical := settings["show_nsfw"]; !canonical {
+			settings["show_nsfw"] = value
+		}
+		delete(settings, "showNsfw")
+	}
 }
 
 func (s *Server) listScans(w http.ResponseWriter, r *http.Request) {
@@ -1303,7 +1329,7 @@ func (s *Server) seriesRichDetail(w http.ResponseWriter, r *http.Request) {
 	library, _ := s.store.LibraryBasic(r.Context(), series.LibraryID)
 	meta, _ := s.store.SeriesMetadataByID(r.Context(), series)
 	progress, _ := s.store.SeriesReadProgress(r.Context(), series.ID)
-	books, _, err := s.store.BooksPage(r.Context(), database.BookQuery{SeriesID: series.ID, Unpaged: true})
+	books, _, err := s.store.BooksPage(r.Context(), database.BookQuery{SeriesID: series.ID, DirectSeriesAccess: true, Unpaged: true})
 	if err != nil {
 		s.writeDBError(w, r, err)
 		return
@@ -1528,6 +1554,7 @@ func (s *Server) putBangumiConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ProxyURL         *string `json:"proxyUrl"`
 		ShowNSFW         *bool   `json:"showNsfw"`
+		LegacyShowNSFW   *bool   `json:"show_nsfw"`
 		ArchiveSource    *string `json:"archiveSource"`
 		ArchiveCustomURL *string `json:"archiveCustomUrl"`
 	}
@@ -1557,15 +1584,21 @@ func (s *Server) putBangumiConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	showNSFW := s.store.ShowNSFW(r.Context())
+	if req.ShowNSFW == nil && req.LegacyShowNSFW != nil {
+		req.ShowNSFW = req.LegacyShowNSFW
+	}
 	if req.ShowNSFW != nil {
-		if err := s.store.SetSetting(r.Context(), "show_nsfw", strconv.FormatBool(*req.ShowNSFW)); err != nil {
+		var err error
+		showNSFW, err = s.store.SetUserShowNSFW(r.Context(), database.PrimaryAdminUserID, *req.ShowNSFW)
+		if err != nil {
 			s.writeDBError(w, r, err)
 			return
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"proxyUrl":      redacted,
-		"showNsfw":      s.store.ShowNSFW(r.Context()),
+		"showNsfw":      showNSFW,
 		"archiveSource": s.bangumi.ArchiveSource(r.Context()),
 	})
 }

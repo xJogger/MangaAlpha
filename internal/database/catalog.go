@@ -40,19 +40,20 @@ type SeriesQuery struct {
 }
 
 type BookQuery struct {
-	Search      string
-	LibraryIDs  []string
-	ReadListIDs []string
-	SeriesID    string
-	ReadStatus  []string
-	Tags        []string
-	Authors     []string
-	OneShot     *bool
-	Empty       bool
-	Page        int
-	Size        int
-	Unpaged     bool
-	Sort        string
+	Search             string
+	LibraryIDs         []string
+	ReadListIDs        []string
+	SeriesID           string
+	DirectSeriesAccess bool // Opening a known series uses authorization without the personal display filter.
+	ReadStatus         []string
+	Tags               []string
+	Authors            []string
+	OneShot            *bool
+	Empty              bool
+	Page               int
+	Size               int
+	Unpaged            bool
+	Sort               string
 }
 
 func (s *Store) largeUnpagedThreshold() int64 {
@@ -82,7 +83,7 @@ func (s *Store) querySeriesPage(ctx context.Context, q SeriesQuery) ([]Series, i
 	var enabledLibs []string
 	if !q.IncludeHidden {
 		var err error
-		enabledLibs, err = s.enabledLibraryIDs(ctx)
+		enabledLibs, err = s.catalogLibraryIDs(ctx, q.LibraryIDs)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -579,16 +580,28 @@ func (s *Store) queryBooksPage(ctx context.Context, q BookQuery) ([]Book, int64,
 	if q.Empty {
 		return nil, 0, nil
 	}
-	enabledLibs, err := s.enabledLibraryIDs(ctx)
-	if err != nil {
-		return nil, 0, err
-	}
-	if len(enabledLibs) == 0 {
-		return []Book{}, 0, nil
-	}
+	var enabledLibs []string
 	if q.SeriesID != "" {
-		if resolved, ok := s.resolveUnionSeriesID(ctx, q.SeriesID); ok {
-			q.SeriesID = resolved
+		series, err := s.SeriesByID(ctx, q.SeriesID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return []Book{}, 0, nil
+		}
+		if err != nil {
+			return nil, 0, err
+		}
+		if scope, ok := UserScopeFromContext(ctx); ok && !q.DirectSeriesAccess && !scope.DisplaysLibrary(series.LibraryID) {
+			return []Book{}, 0, nil
+		}
+		q.SeriesID = series.ID
+		enabledLibs = []string{series.LibraryID}
+	} else {
+		var err error
+		enabledLibs, err = s.catalogLibraryIDs(ctx, q.LibraryIDs)
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(enabledLibs) == 0 {
+			return []Book{}, 0, nil
 		}
 	}
 

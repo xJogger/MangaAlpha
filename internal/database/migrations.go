@@ -9,6 +9,30 @@ import (
 
 const createSeriesMetadataExtIndex = `CREATE INDEX IF NOT EXISTS idx_series_metadata_ext ON series_metadata(ext_source_id, ext_entry_id) WHERE ext_source_id <> ''`
 
+const userHiddenLibrariesSchema = `
+CREATE TABLE IF NOT EXISTS user_hidden_libraries (
+  user_id TEXT NOT NULL,
+  library_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(user_id, library_id),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY(library_id) REFERENCES libraries(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_user_hidden_libraries_lib ON user_hidden_libraries(library_id);
+`
+
+func ensureUserHiddenLibraries(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(userHiddenLibrariesSchema); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func applyMigrations(db *sql.DB) error {
 	if err := ensureClientSettingsTable(db); err != nil {
 		return err
@@ -47,6 +71,9 @@ func applyMigrations(db *sql.DB) error {
 		return err
 	}
 	if err := ensureMultiUserMigration(db); err != nil {
+		return err
+	}
+	if err := ensureUserHiddenLibraries(db); err != nil {
 		return err
 	}
 	migrations := []struct {

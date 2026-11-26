@@ -325,29 +325,56 @@ export class SubpathUtil {
         "    shouldCropBorders: false,",
         "    shouldCropBorders: typeof window !== 'undefined' && window.innerWidth < 900,",
     )
-    replace_exact(
-        reader_consts,
-        "    shouldUseAutoWebtoonMode: true,",
-        "    shouldUseAutoWebtoonMode: false,",
-    )
 
-    # 8a0. Fix upstream multi-locale tag table misclassifying Chinese "xx漫画" genres (e.g. 青年漫画) as long-strip MANHUA
+    # 8a0. Narrow tag table so generic Manhwa/Manhua/韩漫/国漫/만화/漫画 tags don't trigger webtoon mode
     manga_consts = root / "src" / "features" / "manga" / "Manga.constants.ts"
     replace_exact(
         manga_consts,
-        """    [MangaType.MANHWA]: [
+        """export const MANGA_TAGS_BY_MANGA_TYPE: Record<MangaType, string[]> = {
+    [MangaType.MANGA]: ['Manga', 'מנגה', '만화', '漫画', 'مانجا', 'مانگا', 'Mangá', 'Манга', 'மங்கா-', 'Truyện Nhật'],
+    [MangaType.COMIC]: ['Còmic', 'Comic', 'BD', 'קומיקס', 'Komik', '코믹', 'Quadrinho', '美漫'],
+    [MangaType.WEBTOON]: [
+        'Webtoon',
+        'וובטון',
+        '웹툰',
+        '网漫',
+        '網路漫畫',
+        'Tira llarga',
+        'Long Strip',
+        'Long strip',
+        'רצועה ארוכה',
+        '롱스트립',
+        '条漫',
+        'ويب تون (Webtoon)',
+        'وبتون',
+        'Webtoon‏',
+        'ウェブトゥーン',
+        'Веб-комикс',
+        'வெப்டூன்-',
+        'Вебтун',
+        'Cuộn dọc',
+        '條漫',
+    ],
+    [MangaType.MANHWA]: [
         'Manhwa',
         'מנהווה',
         '만화',
-        '韩漫',""",
-        """    [MangaType.MANHWA]: [
-        'Manhwa',
-        'מנהווה',
-        '韩漫',""",
-    )
-    replace_exact(
-        manga_consts,
-        """    [MangaType.MANHUA]: [
+        '韩漫',
+        'Tira llarga',
+        'Long Strip',
+        'Long strip',
+        'רצועה ארוכה',
+        '롱스트립',
+        '条漫',
+        'مانهوا',
+        'מנגה קוראנית (Manhwa)',
+        '韓国マンガ',
+        'Манхва',
+        'மன்அ்வா',
+        'Truyện Hàn',
+        '韓漫',
+    ],
+    [MangaType.MANHUA]: [
         'Manhua',
         'מנהואה',
         '만화',
@@ -361,20 +388,183 @@ export class SubpathUtil {
         'مانها',
         'מנגה סינית (Manhua)',
         '漫画',
-        'Маньхуа',""",
-        """    [MangaType.MANHUA]: [
-        'Manhua',
-        'מנהואה',
-        '国漫',
+        'Маньхуа',
+        'மன்உவா',
+        'Truyện Trung',
+        '國漫',
+    ],
+};""",
+        """export const MANGA_TAGS_BY_MANGA_TYPE: Record<MangaType, string[]> = {
+    [MangaType.MANGA]: ['Manga', 'מנגה', '만화', '漫画', 'مانجا', 'مانگا', 'Mangá', 'Манга', 'மங்கா-', 'Truyện Nhật'],
+    [MangaType.COMIC]: ['Còmic', 'Comic', 'BD', 'קומיקס', 'Komik', '코믹', 'Quadrinho', '美漫'],
+    [MangaType.WEBTOON]: [
+        'Webtoon',
+        'webtoon',
+        'Webtoons',
+        'וובטון',
+        '웹툰',
         'Tira llarga',
         'Long Strip',
         'Long strip',
+        'long strip',
+        'LongStrip',
         'רצועה ארוכה',
         '롱스트립',
         '条漫',
-        'مانها',
-        'מנגה סינית (Manhua)',
-        'Маньхуа',""",
+        '條漫',
+        '长图',
+        '長圖',
+        '竖屏',
+        '豎屏',
+        '竖版',
+        '豎版',
+        'Vertical',
+        'ويب تون (Webtoon)',
+        'وبتون',
+        'Webtoon‏',
+        'ウェブトゥーン',
+        'Веб-комикс',
+        'வெப்டூன்-',
+        'Вебтун',
+        'Cuộn dọc',
+    ],
+    [MangaType.MANHWA]: [
+        'Tira llarga',
+        'Long Strip',
+        'Long strip',
+        'long strip',
+        'רצועה ארוכה',
+        '롱스트립',
+        '条漫',
+        '條漫',
+    ],
+    [MangaType.MANHUA]: [
+        'Tira llarga',
+        'Long Strip',
+        'Long strip',
+        'long strip',
+        'רצועה ארוכה',
+        '롱스트립',
+        '条漫',
+        '條漫',
+    ],
+};""",
+    )
+
+    # 8a0b. Respect readingDirection / readingDirectionLock and persisted auto-webtoon detection in isAutoWebtoonMode
+    reader_settings_utils = root / "src" / "features" / "reader" / "settings" / "ReaderSettings.utils.tsx"
+    replace_exact(
+        reader_settings_utils,
+        "import type { MangaGenreInfo, MangaSourceNameInfo } from '@/features/manga/Manga.types.ts';\nimport { Mangas } from '@/features/manga/services/Mangas.ts';",
+        "import type { MangaGenreInfo, MangaIdInfo, MangaMetaInfo, MangaSourceNameInfo } from '@/features/manga/Manga.types.ts';\nimport { Mangas } from '@/features/manga/services/Mangas.ts';\nimport { KomgaHostBridge } from '@/host/KomgaHostBridge.ts';",
+    )
+    replace_exact(
+        reader_settings_utils,
+        """export const isAutoWebtoonMode = (
+    manga: MangaGenreInfo & MangaSourceNameInfo,
+    shouldUseAutoWebtoonMode: IReaderSettings['shouldUseAutoWebtoonMode'],
+    readingMode: IReaderSettingsWithDefaultFlag['readingMode'],
+): boolean => shouldUseAutoWebtoonMode && readingMode.isDefault && Mangas.isLongStripType(manga);""",
+        """export const isAutoWebtoonMode = (
+    manga: MangaIdInfo & MangaGenreInfo & MangaSourceNameInfo & MangaMetaInfo,
+    shouldUseAutoWebtoonMode: IReaderSettings['shouldUseAutoWebtoonMode'],
+    readingMode: IReaderSettingsWithDefaultFlag['readingMode'],
+): boolean => {
+    if (!readingMode.isDefault) {
+        return false;
+    }
+    const policy = KomgaHostBridge.getSeriesAutoWebtoonPolicy(manga.id);
+    if (policy.suppressAutoWebtoon) {
+        return false;
+    }
+    if (policy.forceWebtoon) {
+        return true;
+    }
+    if (!shouldUseAutoWebtoonMode) {
+        return false;
+    }
+    const detectedByRatio =
+        KomgaHostBridge.isAutoWebtoonDetected(manga.id) ||
+        Boolean(manga.meta?.some((meta) => meta.key === 'fk115_autoWebtoonDetected' && meta.value === '1'));
+    return detectedByRatio || Mangas.isLongStripType(manga);
+};""",
+    )
+
+    # 8a0b2. Avoid crushing tall Webtoon strips into 100dvh SCREEN height on desktop when user hasn't overridden pageScaleMode
+    set_settings_hook = root / "src" / "features" / "reader" / "hooks" / "useReaderSetSettingsState.ts"
+    replace_exact(
+        set_settings_hook,
+        "import { ReadingMode } from '@/features/reader/Reader.types.ts';",
+        "import { ReaderPageScaleMode, ReadingMode } from '@/features/reader/Reader.types.ts';\nimport { extractOriginalKey } from '@/features/metadata/Metadata.utils.ts';",
+    )
+    replace_exact(
+        set_settings_hook,
+        """        const defaultSettingsWithAutoReadingMode = {
+            ...defaultSettings,
+            readingMode: shouldUseWebtoonMode ? ReadingMode.WEBTOON : defaultSettings.readingMode,
+        };
+
+        const profile = shouldUseWebtoonMode
+            ? ReadingMode.WEBTOON
+            : settingsWithDefaultProfileFallback.readingMode.value;""",
+        """        const profile = shouldUseWebtoonMode
+            ? ReadingMode.WEBTOON
+            : settingsWithDefaultProfileFallback.readingMode.value;
+        const hasExplicitGlobalPageScaleMode = Boolean(
+            defaultSettingsMetadata &&
+                Object.keys(defaultSettingsMetadata).some((key) => extractOriginalKey(key) === 'pageScaleMode'),
+        );
+        const defaultSettingsWithAutoReadingMode = {
+            ...defaultSettings,
+            readingMode: shouldUseWebtoonMode ? ReadingMode.WEBTOON : defaultSettings.readingMode,
+            ...(profile === ReadingMode.WEBTOON && !hasExplicitGlobalPageScaleMode
+                ? { pageScaleMode: ReaderPageScaleMode.WIDTH }
+                : {}),
+        };""",
+    )
+
+    # 8a0c. Expose naturalWidth/naturalHeight callback on page image load for aspect-ratio webtoon detection
+    reader_utils = root / "src" / "features" / "reader" / "Reader.utils.ts"
+    replace_exact(
+        reader_utils,
+        """export const createUpdateReaderPageLoadState =
+    (
+        actualPages: ReaderStatePages['pages'],
+        setPagesToSpreadState: React.Dispatch<React.SetStateAction<ReaderPageSpreadState[]>>,
+        setPageLoadStates: ReaderStatePages['setPageLoadStates'],
+        setPageBackgroundColors: ReaderStatePages['setPageBackgroundColor'],
+        readingMode: ReadingMode,
+    ) =>
+    (pagesIndex: number, url: string, isPrimary: boolean = true) => {
+        if (pagesIndex > actualPages.length - 1) {
+            return;
+        }
+
+        const page = actualPages[pagesIndex];
+        const { index } = isPrimary ? page.primary : page.secondary!;
+
+        const img = new Image();
+        img.onload = () => {""",
+        """export const createUpdateReaderPageLoadState =
+    (
+        actualPages: ReaderStatePages['pages'],
+        setPagesToSpreadState: React.Dispatch<React.SetStateAction<ReaderPageSpreadState[]>>,
+        setPageLoadStates: ReaderStatePages['setPageLoadStates'],
+        setPageBackgroundColors: ReaderStatePages['setPageBackgroundColor'],
+        readingMode: ReadingMode,
+        onPageImageLoad?: (pageIndex: number, naturalWidth: number, naturalHeight: number) => void,
+    ) =>
+    (pagesIndex: number, url: string, isPrimary: boolean = true) => {
+        if (pagesIndex > actualPages.length - 1) {
+            return;
+        }
+
+        const page = actualPages[pagesIndex];
+        const { index } = isPrimary ? page.primary : page.secondary!;
+
+        const img = new Image();
+        img.onload = () => {
+            onPageImageLoad?.(index, img.naturalWidth, img.naturalHeight);""",
     )
 
     # 8a. Fill missing Simplified Chinese translation for upstream auto-crop setting
@@ -471,12 +661,154 @@ export class SubpathUtil {
     }""",
     )
 
-    # 10. Streaming loading progress indicators for remote archive indexing & page loading
+    # 10. Streaming loading progress indicators & auto-webtoon front-5-page aspect-ratio probe
     chapter_viewer = root / "src" / "features" / "reader" / "viewer" / "ReaderChapterViewer.tsx"
     replace_exact(
         chapter_viewer,
         "import { LoadingPlaceholder } from '@/base/components/feedback/LoadingPlaceholder.tsx';",
-        "import { KomgaHostBridge } from '@/host/KomgaHostBridge.ts';\nimport { BookIndexProgress } from '@/host/StreamingLoadStatus.tsx';",
+        "import { MANGA_META_FIELDS } from '@/lib/graphql/manga/MangaFragments.ts';\nimport { KomgaHostBridge, isAutoWebtoonRatioTriggered, shouldRecordAutoWebtoonSample } from '@/host/KomgaHostBridge.ts';\nimport { BookIndexProgress } from '@/host/StreamingLoadStatus.tsx';",
+    )
+    replace_exact(
+        chapter_viewer,
+        "import { getReaderChaptersStore, getReaderPagesStore } from '@/features/reader/stores/ReaderStore.ts';",
+        "import { getReaderChaptersStore, getReaderPagesStore, getReaderSettingsStore, getReaderStore } from '@/features/reader/stores/ReaderStore.ts';",
+    )
+    replace_exact(
+        chapter_viewer,
+        """    const onLoad = useMemo(
+        () =>
+            createUpdateReaderPageLoadState(
+                actualPages,
+                (value) => {
+                    if (isCurrentChapterRef.current) {
+                        getReaderPagesStore().setPageSpreadStates(value);
+                    }
+
+                    setPagesToSpreadState(value);
+                },
+                (value) => {
+                    if (isCurrentChapterRef.current) {
+                        getReaderPagesStore().setPageLoadStates(value);
+                    }
+
+                    setPageLoadStates(value);
+                },
+                (value) => {
+                    if (isCurrentChapterRef.current) {
+                        getReaderPagesStore().setPageBackgroundColor(value);
+                    }
+
+                    setPageBackgroundColors(value);
+                },
+                readingMode,
+            ),
+        [actualPages, readingMode],
+    );""",
+        """    const sampledWebtoonRatiosRef = useRef<Map<number, number>>(new Map());
+    const autoWebtoonAppliedRef = useRef<boolean>(false);
+
+    useEffect(() => {
+        sampledWebtoonRatiosRef.current.clear();
+        autoWebtoonAppliedRef.current = false;
+    }, [chapterId]);
+
+    const handlePageImageLoad = useCallback(
+        (pageIndex: number, naturalWidth: number, naturalHeight: number) => {
+            if (!isCurrentChapterRef.current || autoWebtoonAppliedRef.current) {
+                return;
+            }
+            const { manga } = getReaderStore();
+            const settings = getReaderSettingsStore();
+            if (!manga || !settings.shouldUseAutoWebtoonMode || !settings.readingMode.isDefault) {
+                return;
+            }
+            if (settings.readingMode.value === ReadingMode.WEBTOON) {
+                return;
+            }
+            if (KomgaHostBridge.getSeriesAutoWebtoonPolicy(manga.id).suppressAutoWebtoon) {
+                return;
+            }
+            const ratio = shouldRecordAutoWebtoonSample({
+                pageIndex,
+                naturalWidth,
+                naturalHeight,
+                totalPages,
+            });
+            if (ratio === null) {
+                return;
+            }
+            sampledWebtoonRatiosRef.current.set(pageIndex, ratio);
+            if (!isAutoWebtoonRatioTriggered(sampledWebtoonRatiosRef.current)) {
+                return;
+            }
+            autoWebtoonAppliedRef.current = true;
+            KomgaHostBridge.markAutoWebtoonDetected(manga.id);
+            const { cache } = requestManager.graphQLClient.client;
+            const cacheId = cache.identify({ __typename: 'MangaType', id: manga.id });
+            if (cacheId) {
+                const existingMeta = manga.meta ?? [];
+                const nextMeta = [
+                    ...existingMeta.filter((meta) => meta.key !== 'fk115_autoWebtoonDetected'),
+                    {
+                        __typename: 'MangaMetaType' as const,
+                        mangaId: manga.id,
+                        key: 'fk115_autoWebtoonDetected',
+                        value: '1',
+                    },
+                ];
+                cache.modify({
+                    id: cacheId,
+                    fields: {
+                        meta() {
+                            return nextMeta.map((meta) =>
+                                cache.writeFragment({
+                                    fragment: MANGA_META_FIELDS,
+                                    data: {
+                                        __typename: 'MangaMetaType',
+                                        mangaId: manga.id,
+                                        key: meta.key,
+                                        value: meta.value,
+                                    },
+                                }),
+                            );
+                        },
+                    },
+                });
+            }
+        },
+        [totalPages],
+    );
+
+    const onLoad = useMemo(
+        () =>
+            createUpdateReaderPageLoadState(
+                actualPages,
+                (value) => {
+                    if (isCurrentChapterRef.current) {
+                        getReaderPagesStore().setPageSpreadStates(value);
+                    }
+
+                    setPagesToSpreadState(value);
+                },
+                (value) => {
+                    if (isCurrentChapterRef.current) {
+                        getReaderPagesStore().setPageLoadStates(value);
+                    }
+
+                    setPageLoadStates(value);
+                },
+                (value) => {
+                    if (isCurrentChapterRef.current) {
+                        getReaderPagesStore().setPageBackgroundColor(value);
+                    }
+
+                    setPageBackgroundColors(value);
+                },
+                readingMode,
+                handlePageImageLoad,
+            ),
+        [actualPages, readingMode, handlePageImageLoad],
+    );""",
     )
     replace_exact(
         chapter_viewer,

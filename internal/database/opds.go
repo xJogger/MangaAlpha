@@ -99,7 +99,7 @@ func (s *Store) LibraryByRowID(ctx context.Context, rowID int64) (Library, error
 	if !lib.Enabled || lib.UnionParentID != "" {
 		return Library{}, sql.ErrNoRows
 	}
-	if scope, ok := UserScopeFromContext(ctx); ok && !scope.AllowsLibrary(lib.ID) {
+	if scope, ok := UserScopeFromContext(ctx); ok && !scope.DisplaysLibrary(lib.ID) {
 		return Library{}, sql.ErrNoRows
 	}
 	return lib, nil

@@ -83,6 +83,7 @@
 ## 尚不支持
 
 - 固实（Solid）RAR、分卷 RAR、7z（非固实加密 ZIP / RAR4 / RAR5 已支持在网页阅读器输入并记住解压密码，同文件夹自动复用并在后台集中查看或清空）
+- PDF 以及 `epub`、`mobi` 等流式排版电子书格式（当前主动排除以保持纯 Go 按需流式读取边界清晰；扫描图片打包型 PDF 仅待后续评估远程 `Range` 按页解析可行性）
 - 对远程网盘或本地磁盘上的原始文件执行上传、删除、移动或重命名（书库始终只读访问你的漫画源文件）
 - 公开自助注册（普通用户均由管理员在后台统一创建与授权）
 - 上游 `downurl` 或 WebDAV 服务端不支持 HTTP `Range` 时静默整包下载（会明确返回 `501 RANGE_NOT_SUPPORTED`）
@@ -95,7 +96,7 @@
 
 ### 方式一：Windows 下载即用
 
-1. 从 [Releases](https://github.com/xJogger/MangaAlpha/releases/latest) 下载 `_windows_amd64.zip` 压缩包（例如 `mangaalpha_v3.2.3_windows_amd64.zip`）并解压。
+1. 从 [Releases](https://github.com/xJogger/MangaAlpha/releases/latest) 下载 `_windows_amd64.zip` 压缩包（例如 `mangaalpha_v3.3.0_windows_amd64.zip`）并解压。
 2. 双击运行 `mangaalpha.exe`（无控制台黑窗，自动常驻系统托盘）后，默认浏览器会自动打开 `http://127.0.0.1:25600/` 并引导完成首次管理员用户名与密码设置；点击托盘小鱼图标可随时打开书架，右键菜单可打开管理后台、数据目录、运行日志（`mangaalpha.log`）或安全退出服务。如需以无托盘命令行/Windows 服务模式运行，可附加 `--no-tray` 参数。
 3. 数据默认存储在 `%LOCALAPPDATA%\fake-komga-115\data`（保持兼容，原地升级无需迁移目录）。
 
@@ -120,7 +121,7 @@ docker run -d \
   -v fake-komga-115-data:/data \
   -v /share/manga:/manga:ro \
   -e TZ=Asia/Shanghai \
-  blacktal/fake-komga-115:v3.2.3
+  blacktal/fake-komga-115:v3.3.0
 ```
 
 > 从 `v2.3.0` 起，GitHub Release 桌面/服务端压缩包与本地构建产物名统一为 `mangaalpha`；Docker 镜像名 `blacktal/fake-komga-115`、容器入口、`FK115_*` 环境变量与既有默认数据路径保持不变。已有容器升级时请保留 `/data` 数据卷，建议固定版本标签升级。

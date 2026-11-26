@@ -205,7 +205,7 @@ func (s *Store) SeriesPage(ctx context.Context, q SeriesQuery) ([]Series, int64,
 		!q.IncludeHidden && q.NSFWMode == "" && q.Search == "" && !q.Empty &&
 		len(q.LibraryIDs) <= 1 && len(q.CollectionIDs)+len(q.ReadStatus)+len(q.Tags)+len(q.Genres)+len(q.Statuses)+
 		len(q.Publishers)+len(q.Authors)+len(q.Languages) == 0 && q.OneShot == nil && q.ScrapeStatus == ""
-	if common && len(q.LibraryIDs) == 1 && !s.IsLibraryVisible(ctx, q.LibraryIDs[0]) {
+	if common && len(q.LibraryIDs) == 1 && !s.IsLibraryAccessible(ctx, q.LibraryIDs[0]) {
 		common = false
 	}
 	var r seriesPageResult

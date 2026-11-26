@@ -285,7 +285,7 @@ func (s *Server) serveSPA(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) serveLibraryPageOrSPA(w http.ResponseWriter, r *http.Request) {
 	libraryID := chi.URLParam(r, "libraryID")
-	if !s.store.IsLibraryVisible(r.Context(), libraryID) {
+	if !s.store.IsLibraryAccessible(r.Context(), libraryID) {
 		s.renderNotFound(w)
 		return
 	}
@@ -680,17 +680,9 @@ func makePlaceholder() []byte {
 	return buffer.Bytes()
 }
 
-func (s *Server) writePlaceholder(w http.ResponseWriter) {
-	s.writePlaceholderWithCache(w, "public, max-age=86400")
-}
-
 func (s *Server) writeUncachedPlaceholder(w http.ResponseWriter) {
-	s.writePlaceholderWithCache(w, "no-store")
-}
-
-func (s *Server) writePlaceholderWithCache(w http.ResponseWriter, cacheControl string) {
 	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Cache-Control", cacheControl)
+	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("Content-Length", fmt.Sprint(len(s.placeholder)))
 	_, _ = w.Write(s.placeholder)
 }

@@ -1123,7 +1123,7 @@ test('copy unification removes engine-one and Mihon-style phrasing and orders sc
   // Strict card order
   const posStats = html.indexOf('总系列数');
   const posGuide = html.indexOf('id="extmeta-guide-details"');
-  const posNsfw = html.indexOf('NSFW 作品前台显示开关');
+  const posNsfw = html.indexOf('id="bgm-nsfw-info-card"');
   const posProxy = html.indexOf('网络代理设置');
   const posBgmArch = html.indexOf('<h3>Bangumi 离线索引库</h3>');
   const posBatch = html.indexOf('id="extmeta-batch-card"');
@@ -1135,6 +1135,9 @@ test('copy unification removes engine-one and Mihon-style phrasing and orders sc
   const posTracker = html.indexOf('id="bgm-oauth-app-box"');
 
   assert.ok(posStats >= 0 && posGuide > posStats && posNsfw > posGuide && posProxy > posNsfw);
+  assert.ok(html.includes('NSFW 分级识别与按账号隔离'));
+  assert.ok(html.includes('/admin?tab=users') && html.includes('/account'));
+  assert.equal(h.doc.getElementById('bgm-show-nsfw'), null);
   assert.ok(posBgmArch > posProxy && posBatch > posBgmArch && posMarket > posBatch);
   assert.ok(posChains > posMarket && posRuns > posChains && posExport > posRuns);
   assert.ok(posAgent > posExport && posTracker > posAgent);

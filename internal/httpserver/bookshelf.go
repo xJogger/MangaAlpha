@@ -101,3 +101,90 @@ func (s *Server) bookshelfVersions(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, result)
 }
+
+func (s *Server) bookshelfContinueReading(w http.ResponseWriter, r *http.Request) {
+	size := min(50, max(1, intQuery(r, "size", 8)))
+	result, err := s.store.ReadingActivity(r.Context(), database.ReadingActivityQuery{
+		InProgressOnly: true,
+		MergeBangumi:   bookshelfMergeBangumi(r),
+		Size:           size,
+	})
+	if err != nil {
+		s.writeDBError(w, r, err)
+		return
+	}
+	type entry struct {
+		bookshelfActivityGroup
+		OtherInProgressCount int `json:"otherInProgressCount"`
+	}
+	content := make([]entry, 0, len(result.Groups))
+	for _, group := range result.Groups {
+		content = append(content, entry{bookshelfActivityGroupDTO(group), len(group.Books) - 1})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"content": content, "totalElements": result.TotalElements,
+	})
+}
+
+func (s *Server) bookshelfHistory(w http.ResponseWriter, r *http.Request) {
+	page := max(0, intQuery(r, "page", 0))
+	size := min(100, max(1, intQuery(r, "size", 30)))
+	result, err := s.store.ReadingActivity(r.Context(), database.ReadingActivityQuery{
+		MergeBangumi: bookshelfMergeBangumi(r),
+		Search:       r.URL.Query().Get("search"),
+		TZOffset:     intQuery(r, "tz_offset", 0),
+		Page:         page,
+		Size:         size,
+	})
+	if err != nil {
+		s.writeDBError(w, r, err)
+		return
+	}
+	type entry struct {
+		bookshelfActivityGroup
+		DayKey      string `json:"dayKey"`
+		SeriesTitle any    `json:"seriesTitle"`
+	}
+	content := make([]entry, 0, len(result.Groups))
+	for _, group := range result.Groups {
+		dto := bookshelfActivityGroupDTO(group)
+		content = append(content, entry{dto, group.DayKey, dto.Primary["seriesTitle"]})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"content": content, "page": page, "size": size,
+		"totalElements": result.TotalElements, "totalBooks": result.TotalBooks,
+		"totalPages": (result.TotalElements + int64(size) - 1) / int64(size),
+	})
+}
+
+func bookshelfMergeBangumi(r *http.Request) bool {
+	value := r.URL.Query().Get("merge_bangumi")
+	return value == "1" || strings.EqualFold(value, "true")
+}
+
+type bookshelfActivityGroup struct {
+	GroupKey        string           `json:"groupKey"`
+	MergedByBangumi bool             `json:"mergedByBangumi"`
+	BgmSubjectID    *int64           `json:"bgmSubjectId"`
+	Primary         map[string]any   `json:"primary"`
+	Others          []map[string]any `json:"others"`
+}
+
+func bookshelfActivityGroupDTO(group database.ReadingActivityGroup) bookshelfActivityGroup {
+	bookDTO := func(item database.ReadingActivityBook) map[string]any {
+		dto := bookDTOWithProgressAndMeta(item.Book, item.Series, item.Metadata, item.Progress, true)
+		if item.Metadata.BgmSubjectID != nil {
+			dto["bgmSubjectId"] = *item.Metadata.BgmSubjectID
+		}
+		return dto
+	}
+	others := make([]map[string]any, 0, len(group.Books)-1)
+	for _, book := range group.Books[1:] {
+		others = append(others, bookDTO(book))
+	}
+	return bookshelfActivityGroup{
+		GroupKey: group.GroupKey, MergedByBangumi: group.MergedByBangumi,
+		BgmSubjectID: group.Books[0].Metadata.BgmSubjectID,
+		Primary:      bookDTO(group.Books[0]), Others: others,
+	}
+}

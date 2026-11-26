@@ -122,7 +122,7 @@ func (s *Server) agentManifest(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) agentOverview(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := adminCatalogContext(r.Context())
 	libraries, series, books, comicBytes, err := s.store.Counts(ctx)
 	if err != nil {
 		s.writeDBError(w, r, err)
@@ -159,7 +159,7 @@ func (s *Server) agentOverview(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) agentListLibraries(w http.ResponseWriter, r *http.Request) {
 	enabledOnly := r.URL.Query().Get("include_hidden") == "false"
-	items, err := s.store.Libraries(r.Context(), enabledOnly)
+	items, err := s.store.Libraries(adminCatalogContext(r.Context()), enabledOnly)
 	if err != nil {
 		s.writeDBError(w, r, err)
 		return
@@ -286,7 +286,7 @@ func (s *Server) agentListSeries(w http.ResponseWriter, r *http.Request) {
 	if searchTerm == "" {
 		searchTerm = strings.TrimSpace(q.Get("q"))
 	}
-	items, total, err := s.store.SeriesPage(r.Context(), database.SeriesQuery{
+	items, total, err := s.store.SeriesPage(adminCatalogContext(r.Context()), database.SeriesQuery{
 		LibraryIDs:    listQuery(r, "library_id"),
 		Search:        searchTerm,
 		Publishers:    listQuery(r, "publisher"),
@@ -634,11 +634,9 @@ func (s *Server) agentPatchSettings(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &raw) {
 		return
 	}
+	normalizeShowNSFWSettingAlias(raw)
 	converted := make(map[string]string, len(raw))
 	for k, v := range raw {
-		if k == "showNsfw" {
-			k = "show_nsfw"
-		}
 		switch typed := v.(type) {
 		case string:
 			converted[k] = typed

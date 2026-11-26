@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS user_library_access (
 );
 CREATE INDEX IF NOT EXISTS idx_ula_library ON user_library_access(library_id);
 
+` + userHiddenLibrariesSchema + `
+
 CREATE TABLE IF NOT EXISTS user_bangumi_trackers (
   user_id TEXT PRIMARY KEY,
   enabled INTEGER NOT NULL DEFAULT 0,

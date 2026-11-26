@@ -35,6 +35,7 @@ type authPrincipal struct {
 	ShowNSFW          bool
 	AllLibraries      bool
 	AllowedLibraryIDs []string
+	HiddenLibraryIDs  []string
 	Method            string // "session", "apikey", "basic"
 	RawSession        string
 	Refreshed         bool
@@ -54,6 +55,7 @@ func principalFromUser(u database.User, method, rawSession string, refreshed boo
 		ShowNSFW:          u.ShowNSFW,
 		AllLibraries:      u.AllLibraries || u.IsAdmin(),
 		AllowedLibraryIDs: allowed,
+		HiddenLibraryIDs:  u.HiddenLibraryIDs,
 		Method:            method,
 		RawSession:        rawSession,
 		Refreshed:         refreshed,
@@ -61,20 +63,31 @@ func principalFromUser(u database.User, method, rawSession string, refreshed boo
 }
 
 func (p authPrincipal) userScope() database.UserScope {
-	return database.UserScope{
-		UserID:            p.UserID,
+	return database.User{
+		ID:                p.UserID,
 		Username:          p.Username,
-		IsAdmin:           p.IsAdmin,
+		Role:              p.Role,
 		AllowNSFW:         p.AllowNSFW,
 		ShowNSFW:          p.ShowNSFW,
 		AllLibraries:      p.AllLibraries,
 		AllowedLibraryIDs: p.AllowedLibraryIDs,
-	}
+		HiddenLibraryIDs:  p.HiddenLibraryIDs,
+	}.Scope()
 }
 
 func withPrincipalContext(ctx context.Context, p authPrincipal) context.Context {
 	ctx = context.WithValue(ctx, authContextKey{}, p)
 	return database.WithUserScope(ctx, p.userScope())
+}
+
+// adminCatalogContext keeps the administrator's global catalog independent of personal display preferences.
+func adminCatalogContext(ctx context.Context) context.Context {
+	scope, ok := database.UserScopeFromContext(ctx)
+	if !ok || !scope.IsAdmin {
+		return ctx
+	}
+	scope.HiddenLibraries = nil
+	return database.WithUserScope(ctx, scope)
 }
 
 func (s *Server) currentPrincipal(r *http.Request) (authPrincipal, bool) {
@@ -410,6 +423,21 @@ func (s *Server) authStatusHandler(w http.ResponseWriter, r *http.Request) {
 		"method":        principal.Method,
 	}
 	if authed {
+		libraries, err := s.store.AuthorizedVisibleLibrariesBasic(r.Context())
+		if err != nil {
+			s.writeDBError(w, r, err)
+			return
+		}
+		scope := principal.userScope()
+		hasHidden := false
+		for _, lib := range libraries {
+			if !scope.DisplaysLibrary(lib.ID) {
+				hasHidden = true
+				break
+			}
+		}
+		resp["authorizedLibrariesCount"] = len(libraries)
+		resp["hasHiddenLibraries"] = hasHidden
 		resp["version"] = buildinfo.Version
 		if codename, quote := buildinfo.CodenameForVersion(buildinfo.Version); codename != "" {
 			resp["codename"] = codename

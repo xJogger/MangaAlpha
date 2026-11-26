@@ -122,17 +122,31 @@ func (s *Store) GetSetting(ctx context.Context, key string) (string, error) {
 
 func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 	now := nowText()
-	_, err := s.db.ExecContext(ctx, `
+	if key != "show_nsfw" {
+		return upsertSetting(ctx, s.db, key, value, now)
+	}
+	show, err := strconv.ParseBool(strings.TrimSpace(value))
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := setUserShowNSFWTx(ctx, tx, PrimaryAdminUserID, show, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func upsertSetting(ctx context.Context, db interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, key, value, now string) error {
+	_, err := db.ExecContext(ctx, `
 INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
 ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
 		key, value, now)
-	if err == nil && key == "show_nsfw" {
-		show := 0
-		if strings.EqualFold(strings.TrimSpace(value), "true") {
-			show = 1
-		}
-		_, _ = s.db.ExecContext(ctx, `UPDATE users SET show_nsfw=?,updated_at=? WHERE id=?`, show, now, PrimaryAdminUserID)
-	}
 	return err
 }
 
@@ -222,6 +236,15 @@ ON CONFLICT(provider) DO UPDATE SET
 // When enabledOnly is true, returns only libraries visible to Bookshelf/Komga clients
 // (enabled=1 AND not enrolled as a physical sub-library inside a union library).
 func (s *Store) LibrariesBasic(ctx context.Context, enabledOnly bool) ([]Library, error) {
+	return s.librariesBasic(ctx, enabledOnly, true)
+}
+
+// AuthorizedVisibleLibrariesBasic returns enabled top-level libraries allowed by the account's permissions.
+func (s *Store) AuthorizedVisibleLibrariesBasic(ctx context.Context) ([]Library, error) {
+	return s.librariesBasic(ctx, true, false)
+}
+
+func (s *Store) librariesBasic(ctx context.Context, enabledOnly, applyPersonalHidden bool) ([]Library, error) {
 	query := `
 SELECT l.id,l.name,l.provider_type,l.root_cid,l.webdav_account_id,coalesce(w.name,''),l.root_path,
  l.enabled,l.one_shot,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
@@ -241,6 +264,10 @@ LEFT JOIN libraries up ON up.id=ul.union_library_id`
 	}
 	defer rows.Close()
 	scope, hasScope := UserScopeFromContext(ctx)
+	include := scope.AllowsLibrary
+	if applyPersonalHidden {
+		include = scope.DisplaysLibrary
+	}
 	out := make([]Library, 0)
 	for rows.Next() {
 		var item Library
@@ -253,7 +280,7 @@ LEFT JOIN libraries up ON up.id=ul.union_library_id`
 		); err != nil {
 			return nil, err
 		}
-		if enabledOnly && hasScope && !scope.AllowsLibrary(item.ID) {
+		if enabledOnly && hasScope && !include(item.ID) {
 			continue
 		}
 		item.ProviderType = item.EffectiveProvider()
@@ -306,7 +333,7 @@ LEFT JOIN (SELECT library_id, count(*) AS cnt, coalesce(sum(size),0) AS bytes FR
 		); err != nil {
 			return nil, err
 		}
-		if enabledOnly && hasScope && !scope.AllowsLibrary(item.ID) {
+		if enabledOnly && hasScope && !scope.DisplaysLibrary(item.ID) {
 			continue
 		}
 		item.ProviderType = item.EffectiveProvider()
@@ -369,8 +396,14 @@ ORDER BY ul.union_library_id,ul.priority ASC,ul.member_library_id ASC`, args...)
 }
 
 // enabledLibraryIDs returns all library IDs visible to Bookshelf/Komga clients
-// (enabled=1 AND not enrolled as a union sub-library, intersected with current UserScope).
+// (enabled top-level libraries that the current UserScope displays).
 func (s *Store) enabledLibraryIDs(ctx context.Context) ([]string, error) {
+	return s.catalogLibraryIDs(ctx, nil)
+}
+
+// catalogLibraryIDs applies personal display preferences to unscoped browsing.
+// Explicit library filters select from the authorized top-level libraries.
+func (s *Store) catalogLibraryIDs(ctx context.Context, requested []string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT l.id FROM libraries l
 LEFT JOIN union_layers ul ON ul.member_library_id=l.id
@@ -381,13 +414,17 @@ ORDER BY l.id`)
 	}
 	defer rows.Close()
 	scope, hasScope := UserScopeFromContext(ctx)
+	include := scope.DisplaysLibrary
+	if len(requested) > 0 {
+		include = scope.AllowsLibrary
+	}
 	out := make([]string, 0, 8)
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			return nil, err
 		}
-		if hasScope && !scope.AllowsLibrary(id) {
+		if hasScope && !include(id) {
 			continue
 		}
 		out = append(out, id)
@@ -604,9 +641,17 @@ func (s *Store) IsLibraryEnabled(ctx context.Context, id string) bool {
 	return enabled != 0
 }
 
-// IsLibraryVisible reports whether the library is exposed on the Bookshelf and Komga APIs
-// (enabled=1 AND not enrolled as a union sub-library AND allowed by UserScope).
+// IsLibraryVisible reports whether the enabled, authorized top-level library appears in discovery lists.
 func (s *Store) IsLibraryVisible(ctx context.Context, id string) bool {
+	if scope, ok := UserScopeFromContext(ctx); ok && !scope.DisplaysLibrary(id) {
+		return false
+	}
+	return s.IsLibraryAccessible(ctx, id)
+}
+
+// IsLibraryAccessible reports whether the enabled, authorized top-level library can be opened directly.
+// Personal display preferences do not affect direct access.
+func (s *Store) IsLibraryAccessible(ctx context.Context, id string) bool {
 	if scope, ok := UserScopeFromContext(ctx); ok && !scope.AllowsLibrary(id) {
 		return false
 	}

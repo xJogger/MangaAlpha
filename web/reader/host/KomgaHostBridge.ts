@@ -20,12 +20,49 @@ interface KomgaSeriesDTO {
         summary?: string;
         status?: string;
         readingDirection?: string;
+        readingDirectionLock?: boolean;
         genres?: string[];
+        tags?: string[];
         publisher?: string;
     };
     booksMetadata?: {
         authors?: { name: string; role: string }[];
     };
+}
+
+export interface SeriesAutoWebtoonPolicy {
+    forceWebtoon: boolean;
+    suppressAutoWebtoon: boolean;
+}
+
+export interface AutoWebtoonPageSample {
+    pageIndex: number;
+    naturalWidth: number;
+    naturalHeight: number;
+    totalPages: number;
+}
+
+export function shouldRecordAutoWebtoonSample(sample: AutoWebtoonPageSample): number | null {
+    const { pageIndex, naturalWidth, naturalHeight, totalPages } = sample;
+    if (pageIndex < 0 || pageIndex >= 5) return null;
+    if (!Number.isFinite(naturalWidth) || !Number.isFinite(naturalHeight)) return null;
+    if (naturalWidth < 200 || naturalHeight <= 0) return null;
+    const ratio = naturalHeight / naturalWidth;
+    if (ratio < 1) return null;
+    if (pageIndex === 0 && totalPages >= 4 && ratio < 2.2) return null;
+    return ratio;
+}
+
+export function isAutoWebtoonRatioTriggered(sampledRatios: ReadonlyMap<number, number>): boolean {
+    let tallCount = 0;
+    for (const ratio of sampledRatios.values()) {
+        if (ratio >= 3.5) return true;
+        if (ratio >= 2.5) {
+            tallCount += 1;
+            if (tallCount >= 2) return true;
+        }
+    }
+    return false;
 }
 
 interface KomgaBookDTO {
@@ -174,6 +211,8 @@ class KomgaBridgeImpl {
     private pendingProgressPayloads = new Map<string, { page: number; completed: boolean }>();
 
     private clientSettingsLoaded = false;
+
+    private clientSettingsSyncPromise: Promise<void> | null = null;
 
     private currentUserId: string | null = null;
 
@@ -364,27 +403,90 @@ class KomgaBridgeImpl {
         return this.chaptersById.get(chapterId)?.bookId;
     }
 
+    public getSeriesAutoWebtoonPolicy(mangaId: number): SeriesAutoWebtoonPolicy {
+        const series = this.bundles.get(mangaId)?.series;
+        const dir = String(series?.metadata?.readingDirection ?? '').trim().toUpperCase();
+        const locked = Boolean(series?.metadata?.readingDirectionLock);
+        return {
+            forceWebtoon: dir === 'VERTICAL' || dir === 'WEBTOON',
+            suppressAutoWebtoon: locked && (dir === 'RIGHT_TO_LEFT' || dir === 'LEFT_TO_RIGHT'),
+        };
+    }
+
+    public isAutoWebtoonDetected(mangaId: number): boolean {
+        const seriesId = this.mangaIdToSeries.get(mangaId);
+        if (!seriesId) return false;
+        const storageKey = this.seriesMetaKey(seriesId);
+        if (!storageKey) return false;
+        const metaMap = readJSONStorageWithLegacy<Record<string, string>>(
+            storageKey,
+            this.isPrimaryAdmin() ? `${LEGACY_SERIES_META_PREFIX}${seriesId}` : null,
+            {},
+        );
+        return metaMap.fk115_autoWebtoonDetected === '1';
+    }
+
+    public markAutoWebtoonDetected(mangaId: number): void {
+        if (this.identityMismatch || !this.currentUserId) return;
+        const seriesId = this.mangaIdToSeries.get(mangaId);
+        if (!seriesId) return;
+        const storageKey = this.seriesMetaKey(seriesId);
+        if (!storageKey) return;
+        const metaMap = readJSONStorageWithLegacy<Record<string, string>>(
+            storageKey,
+            this.isPrimaryAdmin() ? `${LEGACY_SERIES_META_PREFIX}${seriesId}` : null,
+            {},
+        );
+        if (metaMap.fk115_autoWebtoonDetected === '1') return;
+        metaMap.fk115_autoWebtoonDetected = '1';
+        writeJSONStorage(storageKey, metaMap);
+        this.syncClientSetting(`webui.reader.series.${seriesId}`, metaMap);
+    }
+
     private async ensureClientSettingsSynced(): Promise<void> {
         const uid = await this.ensureUserContext();
         if (!uid) return;
         if (this.clientSettingsLoaded) return;
-        this.clientSettingsLoaded = true;
-        try {
-            const remote = await komgaFetch<Record<string, { value?: string }>>('/api/v1/client-settings/user/list');
-            const globalEntry = remote?.['webui.reader.globalMeta']?.value;
-            const key = this.globalMetaKey();
-            if (globalEntry && key) {
-                const parsed = JSON.parse(globalEntry) as Record<string, string>;
-                const local = readJSONStorageWithLegacy<Record<string, string>>(
-                    key,
-                    this.isPrimaryAdmin() ? LEGACY_GLOBAL_META_KEY : null,
-                    {},
-                );
-                writeJSONStorage(key, { ...parsed, ...local });
-            }
-        } catch {
-            // Non-fatal
+        if (!this.clientSettingsSyncPromise) {
+            this.clientSettingsSyncPromise = (async () => {
+                try {
+                    const remote = await komgaFetch<Record<string, { value?: string }>>('/api/v1/client-settings/user/list');
+                    const globalEntry = remote?.['webui.reader.globalMeta']?.value;
+                    const key = this.globalMetaKey();
+                    if (globalEntry && key) {
+                        const parsed = JSON.parse(globalEntry) as Record<string, string>;
+                        const local = readJSONStorageWithLegacy<Record<string, string>>(
+                            key,
+                            this.isPrimaryAdmin() ? LEGACY_GLOBAL_META_KEY : null,
+                            {},
+                        );
+                        writeJSONStorage(key, { ...parsed, ...local });
+                    }
+                    Object.entries(remote ?? {}).forEach(([settingKey, entry]) => {
+                        if (!settingKey.startsWith('webui.reader.series.') || !entry?.value) return;
+                        const sid = settingKey.slice('webui.reader.series.'.length);
+                        const sKey = sid ? this.seriesMetaKey(sid) : '';
+                        if (!sKey) return;
+                        try {
+                            const parsed = JSON.parse(entry.value) as Record<string, string>;
+                            const local = readJSONStorageWithLegacy<Record<string, string>>(
+                                sKey,
+                                this.isPrimaryAdmin() ? `${LEGACY_SERIES_META_PREFIX}${sid}` : null,
+                                {},
+                            );
+                            writeJSONStorage(sKey, { ...parsed, ...local });
+                        } catch {
+                            // Ignore malformed series meta entry
+                        }
+                    });
+                    this.clientSettingsLoaded = true;
+                } catch {
+                    // Non-fatal; allow future retry
+                    this.clientSettingsSyncPromise = null;
+                }
+            })();
         }
+        await this.clientSettingsSyncPromise;
     }
 
     private syncClientSetting(key: string, metaMap: Record<string, string>): void {
@@ -408,7 +510,7 @@ class KomgaBridgeImpl {
         bookId: string,
         pageOneBased?: number,
     ): Promise<{ mangaId: number; sourceOrder: number }> {
-        await this.ensureUserContext();
+        await this.ensureClientSettingsSynced();
         const bundle = await this.loadSeriesBundle(seriesId, true);
         const found = bundle.chaptersDesc.find((c) => c.bookId === bookId) ?? bundle.chaptersDesc[bundle.chaptersDesc.length - 1];
         if (!found) {
@@ -562,6 +664,12 @@ class KomgaBridgeImpl {
         }));
         const authors = (s.booksMetadata?.authors ?? []).map((a) => a.name).join(', ');
         const unreadCount = bundle.chaptersDesc.filter((c) => !c.isRead).length;
+        const genreSet = new Set<string>();
+        [...(s.metadata?.genres ?? []), ...(s.metadata?.tags ?? [])].forEach((tag) => {
+            const trimmed = typeof tag === 'string' ? tag.trim() : '';
+            if (trimmed) genreSet.add(trimmed);
+        });
+        const mergedGenres = Array.from(genreSet);
         return {
             __typename: 'MangaType',
             id: bundle.mangaId,
@@ -571,7 +679,7 @@ class KomgaBridgeImpl {
             inLibrary: true,
             initialized: true,
             sourceId: 'komga-local',
-            genre: s.metadata?.genres ?? [],
+            genre: mergedGenres,
             status: s.metadata?.status || 'ONGOING',
             author: authors,
             artist: authors,
@@ -821,6 +929,7 @@ class KomgaBridgeImpl {
             case 'GET_MANGA_READER':
             case 'GET_MANGA_SCREEN':
             case 'GET_MANGA_META': {
+                await this.ensureClientSettingsSynced();
                 const mangaId = Number(variables?.id);
                 const bundle = await this.ensureBundleByMangaId(mangaId);
                 return {
@@ -829,50 +938,99 @@ class KomgaBridgeImpl {
             }
 
             case 'UPDATE_MANGA_METADATA': {
-                const firstMangaId =
-                    variables?.updateInput?.metas?.[0]?.mangaId ??
-                    variables?.preUpdateDeleteInput?.mangaId ??
-                    variables?.postUpdateDeleteInput?.mangaId;
-                const mangaId = Number(firstMangaId);
-                const seriesId = this.mangaIdToSeries.get(mangaId) ?? String(mangaId);
-                const storageKey = this.seriesMetaKey(seriesId);
-                const metaMap = storageKey
-                    ? readJSONStorageWithLegacy<Record<string, string>>(
-                          storageKey,
-                          this.isPrimaryAdmin() ? `${LEGACY_SERIES_META_PREFIX}${seriesId}` : null,
-                          {},
-                      )
-                    : {};
-                const applyDeletes = (keys?: string[]) => {
+                const updatedByManga = new Map<number, Record<string, string>>();
+                const getMap = (mangaId: number): Record<string, string> => {
+                    let map = updatedByManga.get(mangaId);
+                    if (map) return map;
+                    const seriesId = this.mangaIdToSeries.get(mangaId) ?? String(mangaId);
+                    const storageKey = this.seriesMetaKey(seriesId);
+                    map = storageKey
+                        ? readJSONStorageWithLegacy<Record<string, string>>(
+                              storageKey,
+                              this.isPrimaryAdmin() ? `${LEGACY_SERIES_META_PREFIX}${seriesId}` : null,
+                              {},
+                          )
+                        : {};
+                    updatedByManga.set(mangaId, map);
+                    return map;
+                };
+                const applyDeletes = (mangaId: number, keys?: string[]) => {
+                    const map = getMap(mangaId);
                     (keys ?? []).forEach((k) => {
-                        delete metaMap[k];
+                        delete map[k];
                     });
                 };
-                const applySets = (metas?: { key: string; value: string }[]) => {
+                const applySets = (mangaId: number, metas?: { key: string; value: string }[]) => {
+                    const map = getMap(mangaId);
                     (metas ?? []).forEach((m) => {
-                        metaMap[m.key] = m.value;
+                        map[m.key] = m.value;
                     });
                 };
-                if (variables?.hasPreUpdateDeletions) applyDeletes(variables.preUpdateDeleteInput?.keys);
-                if (variables?.hasUpdates) applySets(variables.updateInput?.metas);
-                if (variables?.hasPostUpdateDeletions) applyDeletes(variables.postUpdateDeleteInput?.keys);
-                if (variables?.isMigration) applySets(variables.migrateInput?.metas);
-                if (storageKey) {
-                    writeJSONStorage(storageKey, metaMap);
-                    this.syncClientSetting(`webui.reader.series.${seriesId}`, metaMap);
-                }
+                const collectNodes = (mangaId: number) => {
+                    const map = getMap(mangaId);
+                    return Object.entries(map).map(([key, value]) => ({
+                        __typename: 'MangaMetaType',
+                        mangaId,
+                        key,
+                        value,
+                    }));
+                };
 
-                const nodes = Object.entries(metaMap).map(([key, value]) => ({
-                    __typename: 'MangaMetaType',
-                    mangaId,
-                    key,
-                    value,
-                }));
+                const handleDeleteInput = (input: any): any[] => {
+                    const nodes: any[] = [];
+                    if (Array.isArray(input?.items)) {
+                        input.items.forEach((item: { mangaIds?: number[]; keys?: string[] }) => {
+                            (item.mangaIds ?? []).forEach((mid) => {
+                                const id = Number(mid);
+                                applyDeletes(id, item.keys);
+                                nodes.push(...collectNodes(id));
+                            });
+                        });
+                    } else if (input?.mangaId !== undefined) {
+                        const id = Number(input.mangaId);
+                        applyDeletes(id, input.keys);
+                        nodes.push(...collectNodes(id));
+                    }
+                    return nodes;
+                };
+
+                const handleSetInput = (input: any): any[] => {
+                    const nodes: any[] = [];
+                    if (Array.isArray(input?.items)) {
+                        input.items.forEach((item: { mangaIds?: number[]; metas?: { key: string; value: string }[] }) => {
+                            (item.mangaIds ?? []).forEach((mid) => {
+                                const id = Number(mid);
+                                applySets(id, item.metas);
+                                nodes.push(...collectNodes(id));
+                            });
+                        });
+                    } else if (Array.isArray(input?.metas) && input.metas.length > 0) {
+                        const id = Number(input.metas[0].mangaId);
+                        applySets(id, input.metas);
+                        nodes.push(...collectNodes(id));
+                    }
+                    return nodes;
+                };
+
+                const preDeletedNodes = variables?.hasPreUpdateDeletions ? handleDeleteInput(variables.preUpdateDeleteInput) : [];
+                const updatedNodes = variables?.hasUpdates ? handleSetInput(variables.updateInput) : [];
+                const postDeletedNodes = variables?.hasPostUpdateDeletions ? handleDeleteInput(variables.postUpdateDeleteInput) : [];
+                const migrationNodes = variables?.isMigration ? handleSetInput(variables.migrateInput) : [];
+
+                updatedByManga.forEach((metaMap, mangaId) => {
+                    const seriesId = this.mangaIdToSeries.get(mangaId) ?? String(mangaId);
+                    const storageKey = this.seriesMetaKey(seriesId);
+                    if (storageKey) {
+                        writeJSONStorage(storageKey, metaMap);
+                        this.syncClientSetting(`webui.reader.series.${seriesId}`, metaMap);
+                    }
+                });
+
                 return {
-                    ...(variables?.hasPreUpdateDeletions ? { preUpdateDeletedMeta: { __typename: 'DeleteMangaMetasPayload', metas: nodes } } : {}),
-                    ...(variables?.hasUpdates ? { updatedMeta: { __typename: 'SetMangaMetasPayload', metas: nodes } } : {}),
-                    ...(variables?.hasPostUpdateDeletions ? { postUpdateDeletedMeta: { __typename: 'DeleteMangaMetasPayload', metas: nodes } } : {}),
-                    ...(variables?.isMigration ? { migrationMeta: { __typename: 'SetMangaMetasPayload', metas: nodes } } : {}),
+                    ...(variables?.hasPreUpdateDeletions ? { preUpdateDeletedMeta: { __typename: 'DeleteMangaMetasPayload', metas: preDeletedNodes } } : {}),
+                    ...(variables?.hasUpdates ? { updatedMeta: { __typename: 'SetMangaMetasPayload', metas: updatedNodes } } : {}),
+                    ...(variables?.hasPostUpdateDeletions ? { postUpdateDeletedMeta: { __typename: 'DeleteMangaMetasPayload', metas: postDeletedNodes } } : {}),
+                    ...(variables?.isMigration ? { migrationMeta: { __typename: 'SetMangaMetasPayload', metas: migrationNodes } } : {}),
                 };
             }
 
