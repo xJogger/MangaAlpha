@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"image"
 	"image/color"
@@ -18,6 +19,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"github.com/xJogger/fake-komga-115/internal/database"
 	"github.com/xJogger/fake-komga-115/internal/thumbnail"
@@ -238,7 +241,7 @@ func TestOfflineArchiveImportBatchScrapeAndNSFWVisibility(t *testing.T) {
 
 	// Build a synthetic Bangumi Archive dump zip containing:
 	// - 100: Main Manga Series "SLAM DUNK" (name_cn: "灌篮高手", platform: 1001, series: true, nsfw: false)
-	// - 101: Tankobon Vol.1 "SLAM DUNK (1)" linked via relation 1003 from 100 -> MUST be excluded!
+	// - 101: Tankobon Vol.1 "SLAM DUNK (1)" linked via relation 1003 from 100 -> MUST be stored in bgm_subjects & bgm_subject_relations, but excluded from bgm_terms!
 	// - 102: Artbook "灌篮高手 原画集" (platform: 1003) -> MUST score lower than 100!
 	// - 103: NSFW Manga (nsfw: true) -> MUST be imported & matched with IsNSFW=true, hidden by default!
 	// - 104: Restricted-tagged Manga (nsfw: false, user tag "R18") -> MUST be imported with IsNSFW=false!
@@ -249,8 +252,16 @@ func TestOfflineArchiveImportBatchScrapeAndNSFWVisibility(t *testing.T) {
 		t.Fatalf("ImportArchiveZip: %v", err)
 	}
 	st := svc.ArchiveStatus()
-	if !st.Ready || st.SubjectCount != 4 {
-		t.Fatalf("expected 4 indexed subjects (100, 102, 103, 104; excluding tankobon 101), got %+v", st)
+	if !st.Ready || st.SubjectCount != 5 {
+		t.Fatalf("expected 5 indexed subjects (100, 101 tankobon, 102, 103, 104), got %+v", st)
+	}
+	var tankobonTermCount int
+	if err := svc.archive.db.QueryRowContext(ctx, `SELECT count(*) FROM bgm_terms WHERE subject_id=101`).Scan(&tankobonTermCount); err != nil || tankobonTermCount != 0 {
+		t.Fatalf("expected tankobon 101 excluded from bgm_terms, got count=%d err=%v", tankobonTermCount, err)
+	}
+	tankobons, foundTankobons, err := svc.OfflineTankobons(ctx, 100)
+	if err != nil || !foundTankobons || len(tankobons) != 1 || tankobons[0].SubjectID != 101 || tankobons[0].ISBN != "978-4088511283" || tankobons[0].Order != 1 {
+		t.Fatalf("expected offline tankobon 101 with ISBN, got found=%v items=%+v err=%v", foundTankobons, tankobons, err)
 	}
 
 	lib := database.Library{
@@ -450,7 +461,7 @@ func writeSyntheticBangumiZip(t *testing.T, path string) {
 
 	addFile("subject.jsonlines",
 		`{"id":100,"type":1,"platform":1001,"name":"SLAM DUNK","name_cn":"灌篮高手","infobox":"{{Infobox animanga/Manga\n|中文名= 灌篮高手\n|别名={\n[男儿当入樽]\n}\n|出版社= 集英社\n|册数= 31\n|开始= 1990-10-01\n|结束= 1996-06-17\n}}","summary":"篮球经典","nsfw":false,"tags":[{"name":"篮球","count":50},{"name":"热血","count":40}],"meta_tags":["运动","少年漫画"],"score":9.4,"rank":3,"date":"1990-10-01","series":true}`+"\n"+
-			`{"id":101,"type":1,"platform":1001,"name":"SLAM DUNK (1)","name_cn":"灌篮高手 (1)","infobox":"","summary":"","nsfw":false,"tags":[],"meta_tags":[],"score":8.5,"rank":0,"date":"1991-02-08","series":false}`+"\n"+
+			`{"id":101,"type":1,"platform":1001,"name":"SLAM DUNK (1)","name_cn":"灌篮高手 (1)","infobox":"{{Infobox animanga/Book\n|ISBN= 978-4088511283\n|作者= 井上雄彦\n}}","summary":"第一卷","nsfw":false,"tags":[],"meta_tags":[],"score":8.5,"rank":0,"date":"1991-02-08","series":false}`+"\n"+
 			`{"id":102,"type":1,"platform":1003,"name":"INOUE TAKEHIKO ILLUSTRATIONS","name_cn":"灌篮高手 原画集","infobox":"{{Infobox animanga/Book\n|作者= 井上雄彦\n}}","summary":"画集","nsfw":false,"tags":[],"meta_tags":["画集"],"score":9.1,"rank":50,"date":"1997-06-04","series":false}`+"\n"+
 			`{"id":103,"type":1,"platform":1001,"name":"禁忌成人漫画测试","name_cn":"禁忌成人漫画测试","infobox":"","summary":"","nsfw":true,"tags":[],"meta_tags":[],"score":7.0,"rank":0,"date":"2020-01-01","series":true}`+"\n"+
 			`{"id":104,"type":1,"platform":1001,"name":"边缘青年漫画测试","name_cn":"边缘青年漫画测试","infobox":"","summary":"","nsfw":false,"tags":[{"name":"R18","count":8}],"meta_tags":["青年漫画"],"score":7.5,"rank":0,"date":"2023-01-01","series":true}`+"\n",
@@ -598,5 +609,149 @@ func TestBangumiProxyValidationRedactionAndProbe(t *testing.T) {
 	}
 	if proxyHits.Load() < 2 {
 		t.Fatalf("expected both API and Archive probes to traverse proxy, hits=%d", proxyHits.Load())
+	}
+}
+
+func TestOfflineTankobonsLegacyFallbackAndLiveRelations(t *testing.T) {
+	ctx := t.Context()
+	tmp := t.TempDir()
+
+	// 1. Build an older v4-style read-only bangumi-archive.db lacking bgm_subject_relations and isbn.
+	bgmDir := filepath.Join(tmp, "bangumi")
+	if err := os.MkdirAll(bgmDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyDBPath := filepath.Join(bgmDir, "bangumi-archive.db")
+	legacyDB, err := sql.Open("sqlite", legacyDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacyDB.ExecContext(ctx, `
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO meta(key,value) VALUES('terms_schema_version','5'),('dump_name','legacy-v4');
+CREATE TABLE bgm_subjects (
+  id INTEGER PRIMARY KEY, platform INTEGER NOT NULL, is_series INTEGER NOT NULL,
+  is_nsfw INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL, name_cn TEXT NOT NULL,
+  summary TEXT NOT NULL, publisher TEXT NOT NULL, status TEXT NOT NULL,
+  release_date TEXT NOT NULL, total_volumes INTEGER, score REAL, rank INTEGER NOT NULL,
+  genres_json TEXT NOT NULL, tags_json TEXT NOT NULL, authors_json TEXT NOT NULL, aliases_json TEXT NOT NULL
+);
+CREATE TABLE bgm_terms (term_key TEXT NOT NULL, subject_id INTEGER NOT NULL, is_primary INTEGER NOT NULL, PRIMARY KEY(term_key, subject_id));
+INSERT INTO bgm_subjects VALUES(200,1001,1,0,'Legacy Series','旧版系列','','','','',NULL,NULL,0,'[]','[]','[]','[]');
+`); err != nil {
+		t.Fatal(err)
+	}
+	_ = legacyDB.Close()
+
+	// Make DB file read-only so upgrade cannot add bgm_subject_relations; OfflineTankobons must return empty without error!
+	if err := os.Chmod(legacyDBPath, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(legacyDBPath, 0o600) })
+
+	store, err := database.Open(filepath.Join(tmp, "main.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	svc, err := NewService(store, bgmDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	svc.live.limiter = rate.NewLimiter(rate.Inf, 1)
+
+	if items, found, err := svc.OfflineTankobons(ctx, 200); err != nil || found || len(items) != 0 {
+		t.Fatalf("expected graceful empty OfflineTankobons on legacy DB, got items=%+v found=%v err=%v", items, found, err)
+	}
+
+	var apiCalls atomic.Int32
+	var seenAuthHeader atomic.Value
+	svc.live.readToken = func(context.Context) string { return "fixture-secret-token" }
+	svc.SetAPITransportForTest(matchingTransport(func(r *http.Request) (*http.Response, error) {
+		apiCalls.Add(1)
+		seenAuthHeader.Store(r.Header.Get("Authorization"))
+		w := httptest.NewRecorder()
+		switch r.URL.Path {
+		case "/v0/subjects/200/subjects":
+			_, _ = io.WriteString(w, `[
+				{"id": 201, "type": 1, "name": "Vol.1", "name_cn": "第一卷", "relation": "单行本", "images": {"common": "https://lain.bgm.tv/pic/cover/c/201.jpg"}},
+				{"id": 202, "type": 1, "name": "Vol.2", "name_cn": "第二卷", "relation": "单行本", "images": {"large": "https://lain.bgm.tv/pic/cover/l/202.jpg"}},
+				{"id": 203, "type": 1, "name": "Vol.3", "name_cn": "第三卷", "relation": "单行本", "images": {}},
+				{"id": 204, "type": 1, "name": "Spin-off", "name_cn": "衍生作", "relation": "番外篇", "images": {}},
+				{"id": 205, "type": 1, "name": "Secret Vol", "name_cn": "成人番外", "relation": "单行本", "nsfw": true, "images": {}}
+			]`)
+		case "/v0/subjects/100/subjects":
+			_, _ = io.WriteString(w, `[]`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+		return w.Result(), nil
+	}))
+
+	// Without NSFW scope: no Bearer token sent, nsfw=true item 205 filtered out, non-单行本 item 204 filtered out.
+	items, err := svc.TankobonsForSubject(ctx, 200, false)
+	if err != nil || len(items) != 0 || apiCalls.Load() != 0 {
+		t.Fatalf("expected 0 live calls when allowLiveFallback=false, got items=%+v err=%v calls=%d", items, err, apiCalls.Load())
+	}
+
+	items, err = svc.TankobonsForSubject(ctx, 200, true)
+	if err != nil {
+		t.Fatalf("TankobonsForSubject fallback: %v", err)
+	}
+	if apiCalls.Load() != 1 || seenAuthHeader.Load() != "" {
+		t.Fatalf("expected 1 unauthenticated call without NSFW scope, calls=%d auth=%v", apiCalls.Load(), seenAuthHeader.Load())
+	}
+	if len(items) != 3 ||
+		items[0].SubjectID != 201 || items[0].Order != 1 || items[0].CoverURL != "https://lain.bgm.tv/pic/cover/c/201.jpg" ||
+		items[1].SubjectID != 202 || items[1].Order != 2 || items[1].CoverURL != "https://lain.bgm.tv/pic/cover/l/202.jpg" ||
+		items[2].SubjectID != 203 || items[2].Order != 3 || items[2].CoverURL != "https://api.bgm.tv/v0/subjects/203/image?type=common" {
+		t.Fatalf("unexpected fallback tankobons: %+v", items)
+	}
+
+	// With NSFW scope: Bearer token is sent and NSFW tankobon 205 is included.
+	nsfwCtx := database.WithUserScope(ctx, database.UserScope{AllowNSFW: true, ShowNSFW: true})
+	nsfwItems, err := svc.TankobonsForSubject(nsfwCtx, 200, true)
+	if err != nil || len(nsfwItems) != 4 || nsfwItems[3].SubjectID != 205 || !nsfwItems[3].NSFW {
+		t.Fatalf("expected 4 tankobons with NSFW scope, got %+v err=%v", nsfwItems, err)
+	}
+	if seenAuthHeader.Load() != "Bearer fixture-secret-token" {
+		t.Fatalf("expected Bearer token on api.bgm.tv with NSFW scope, got %v", seenAuthHeader.Load())
+	}
+
+	// Now import a fresh v5 archive zip with sorted tankobons and verify OfflineTankobons hits 0 network calls.
+	_ = os.Chmod(legacyDBPath, 0o600)
+	zipPath := filepath.Join(tmp, "v5.zip")
+	var zbuf bytes.Buffer
+	zw := zip.NewWriter(&zbuf)
+	writeZ := func(name, content string) {
+		w, _ := zw.Create(name)
+		_, _ = w.Write([]byte(content))
+	}
+	writeZ("subject.jsonlines",
+		`{"id":300,"type":1,"platform":1001,"name":"Series","name_cn":"系列","series":true}`+"\n"+
+			`{"id":302,"type":1,"platform":1001,"name":"Series (2)","name_cn":"系列 (2)","infobox":"{{Infobox\n|ISBN= 978-2\n}}","date":"2021-02-01","series":false}`+"\n"+
+			`{"id":301,"type":1,"platform":1001,"name":"Series (1)","name_cn":"系列 (1)","infobox":"{{Infobox\n|ISBN= 978-1\n}}","date":"2021-01-01","series":false}`+"\n",
+	)
+	writeZ("subject-relations.jsonlines",
+		`{"subject_id":300,"relation_type":1003,"related_subject_id":302,"order":2}`+"\n"+
+			`{"subject_id":300,"relation_type":1003,"related_subject_id":301,"order":1}`+"\n",
+	)
+	_ = zw.Close()
+	if err := os.WriteFile(zipPath, zbuf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ImportArchiveZip(ctx, zipPath, "v5.zip", "2026-11-26T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+
+	callsBefore := apiCalls.Load()
+	offlineItems, err := svc.TankobonsForSubject(ctx, 300, true)
+	if err != nil || apiCalls.Load() != callsBefore {
+		t.Fatalf("expected TankobonsForSubject to use offline archive without network calls, err=%v callsDelta=%d", err, apiCalls.Load()-callsBefore)
+	}
+	if len(offlineItems) != 2 || offlineItems[0].SubjectID != 301 || offlineItems[0].ISBN != "978-1" || offlineItems[1].SubjectID != 302 || offlineItems[1].Order != 2 {
+		t.Fatalf("unexpected sorted offline tankobons: %+v", offlineItems)
 	}
 }

@@ -37,8 +37,22 @@ const (
 	SettingArchiveSource        = "bangumi_archive_source"
 	SettingArchiveCustomMetaURL = "bangumi_archive_custom_url"
 	archiveUserAgent            = "xJogger/fake-komga-115/2.5 (https://github.com/xJogger/MangaAlpha)"
-	currentTermsSchemaVersion   = "4"
+	currentTermsSchemaVersion   = "5"
+	relationTypeTankobon        = 1003
 )
+
+// TankobonSubject describes a single-volume (tankobon) entry linked from a series subject.
+type TankobonSubject struct {
+	SubjectID int64  `json:"subjectId"`
+	Name      string `json:"name"`
+	NameCN    string `json:"nameCn"`
+	Date      string `json:"date"`
+	Summary   string `json:"summary"`
+	ISBN      string `json:"isbn"`
+	Order     int    `json:"order"`
+	NSFW      bool   `json:"nsfw"`
+	CoverURL  string `json:"coverUrl"`
+}
 
 type ArchiveSourceConfig struct {
 	Source    string `json:"source"`
@@ -106,12 +120,14 @@ type ArchiveIndex struct {
 	httpClient *http.Client
 	proxyRaw   string
 
-	mu           sync.RWMutex
-	db           *sql.DB
-	status       ArchiveStatus
-	cancel       context.CancelFunc
-	onImport     func()
-	onUpdateDone func(result, dumpName, errMsg string)
+	mu                sync.RWMutex
+	db                *sql.DB
+	hasRelationsTable bool
+	hasISBNCol        bool
+	status            ArchiveStatus
+	cancel            context.CancelFunc
+	onImport          func()
+	onUpdateDone      func(result, dumpName, errMsg string)
 }
 
 func NewArchiveIndex(dir string, logger *slog.Logger) (*ArchiveIndex, error) {
@@ -465,6 +481,7 @@ type archiveRelationLine struct {
 	SubjectID        int64 `json:"subject_id"`
 	RelationType     int   `json:"relation_type"`
 	RelatedSubjectID int64 `json:"related_subject_id"`
+	Order            int   `json:"order"`
 }
 
 type archiveSubjPersonLine struct {
@@ -524,18 +541,32 @@ func (a *ArchiveIndex) ImportFromZipFileWithDigest(
 		return err
 	}
 
-	// Pass 2: identify tankobon single volumes linked from a parent Series (relation_type == 1003).
+	// Pass 2: identify tankobon single volumes linked from a parent Series (relation_type == 1003)
+	// and collect all 1003 relations between valid book subjects.
+	type tankobonRel struct {
+		subjectID int64
+		relatedID int64
+		sortOrder int
+	}
 	childTankobons := make(map[int64]struct{}, 150000)
+	var tankobonRels []tankobonRel
 	if relFile, ok := files["subject-relations.jsonlines"]; ok {
 		if err := streamZipLines(ctx, relFile, func(line []byte) error {
 			var rel archiveRelationLine
 			if err := json.Unmarshal(line, &rel); err != nil {
 				return nil
 			}
-			if rel.RelationType == 1003 {
-				if isParentSeries, exists := bookIDs[rel.SubjectID]; exists && isParentSeries {
-					if isChildSeries, childExists := bookIDs[rel.RelatedSubjectID]; childExists && !isChildSeries {
-						childTankobons[rel.RelatedSubjectID] = struct{}{}
+			if rel.RelationType == relationTypeTankobon && rel.SubjectID > 0 && rel.RelatedSubjectID > 0 && rel.SubjectID != rel.RelatedSubjectID {
+				if isParentSeries, exists := bookIDs[rel.SubjectID]; exists {
+					if isChildSeries, childExists := bookIDs[rel.RelatedSubjectID]; childExists {
+						if isParentSeries && !isChildSeries {
+							childTankobons[rel.RelatedSubjectID] = struct{}{}
+						}
+						tankobonRels = append(tankobonRels, tankobonRel{
+							subjectID: rel.SubjectID,
+							relatedID: rel.RelatedSubjectID,
+							sortOrder: rel.Order,
+						})
 					}
 				}
 			}
@@ -545,7 +576,7 @@ func (a *ArchiveIndex) ImportFromZipFileWithDigest(
 		}
 	}
 
-	// Pass 3: collect staff links for target book subjects.
+	// Pass 3: collect staff links for target book subjects (including child tankobons).
 	type staffRef struct {
 		personID int64
 		role     string
@@ -559,9 +590,6 @@ func (a *ArchiveIndex) ImportFromZipFileWithDigest(
 				return nil
 			}
 			if _, ok := bookIDs[sp.SubjectID]; !ok {
-				return nil
-			}
-			if _, isTankobon := childTankobons[sp.SubjectID]; isTankobon {
 				return nil
 			}
 			role := mapStaffPosition(sp.Position)
@@ -628,13 +656,21 @@ CREATE TABLE bgm_subjects (
   genres_json TEXT NOT NULL,
   tags_json TEXT NOT NULL,
   authors_json TEXT NOT NULL,
-  aliases_json TEXT NOT NULL
+  aliases_json TEXT NOT NULL,
+  isbn TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE bgm_terms (
   term_key TEXT NOT NULL,
   subject_id INTEGER NOT NULL,
   is_primary INTEGER NOT NULL,
   PRIMARY KEY(term_key, subject_id)
+);
+CREATE TABLE IF NOT EXISTS bgm_subject_relations (
+  subject_id INTEGER NOT NULL,
+  relation_type INTEGER NOT NULL,
+  related_subject_id INTEGER NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (subject_id, relation_type, related_subject_id)
 );
 `); err != nil {
 		return err
@@ -647,8 +683,8 @@ CREATE TABLE bgm_terms (
 	subjStmt, err := tx.PrepareContext(ctx, `
 INSERT INTO bgm_subjects(
  id,platform,is_series,is_nsfw,name,name_cn,summary,publisher,status,release_date,
- total_volumes,score,rank,genres_json,tags_json,authors_json,aliases_json
-) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+ total_volumes,score,rank,genres_json,tags_json,authors_json,aliases_json,isbn
+) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -671,9 +707,7 @@ ON CONFLICT(term_key,subject_id) DO UPDATE SET is_primary=MAX(bgm_terms.is_prima
 		if s.Type != 1 || s.ID <= 0 {
 			return nil
 		}
-		if _, isChild := childTankobons[s.ID]; isChild {
-			return nil
-		}
+		_, isChild := childTankobons[s.ID]
 		wiki := ParseRawInfobox(s.Infobox)
 		nameCN := strings.TrimSpace(s.NameCN)
 		if nameCN == "" {
@@ -704,7 +738,7 @@ ON CONFLICT(term_key,subject_id) DO UPDATE SET is_primary=MAX(bgm_terms.is_prima
 		authorsJSON, _ := json.Marshal(authors)
 		aliasesJSON, _ := json.Marshal(wiki.Aliases)
 		isSeriesInt := 0
-		if s.Series {
+		if s.Series && !isChild {
 			isSeriesInt = 1
 		}
 		isNSFWInt := 0
@@ -715,13 +749,16 @@ ON CONFLICT(term_key,subject_id) DO UPDATE SET is_primary=MAX(bgm_terms.is_prima
 			s.ID, s.Platform, isSeriesInt, isNSFWInt, strings.TrimSpace(s.Name), nameCN,
 			strings.TrimSpace(s.Summary), wiki.Publisher, wiki.Status, relDate,
 			volsPtr, scorePtr, s.Rank,
-			string(genresJSON), string(tagsJSON), string(authorsJSON), string(aliasesJSON),
+			string(genresJSON), string(tagsJSON), string(authorsJSON), string(aliasesJSON), wiki.ISBN,
 		); err != nil {
 			return err
 		}
 
-		if err := insertSubjectTerms(ctx, termStmt, s.ID, nameCN, s.Name, wiki.Aliases); err != nil {
-			return err
+		// Child tankobon volumes must NEVER pollute series search dictionary bgm_terms.
+		if !isChild {
+			if err := insertSubjectTerms(ctx, termStmt, s.ID, nameCN, s.Name, wiki.Aliases); err != nil {
+				return err
+			}
 		}
 		importedCount++
 		return nil
@@ -731,6 +768,24 @@ ON CONFLICT(term_key,subject_id) DO UPDATE SET is_primary=MAX(bgm_terms.is_prima
 	if err != nil {
 		tx.Rollback()
 		return err
+	}
+	if len(tankobonRels) > 0 {
+		relStmt, err := tx.PrepareContext(ctx, `
+INSERT INTO bgm_subject_relations(subject_id,relation_type,related_subject_id,sort_order)
+VALUES(?,?,?,?)
+ON CONFLICT(subject_id,relation_type,related_subject_id) DO UPDATE SET sort_order=excluded.sort_order`)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		for _, rel := range tankobonRels {
+			if _, err := relStmt.ExecContext(ctx, rel.subjectID, relationTypeTankobon, rel.relatedID, rel.sortOrder); err != nil {
+				relStmt.Close()
+				tx.Rollback()
+				return err
+			}
+		}
+		relStmt.Close()
 	}
 	importedAt := time.Now().UTC().Format(time.RFC3339)
 	for k, v := range map[string]string{
@@ -752,6 +807,7 @@ ON CONFLICT(term_key,subject_id) DO UPDATE SET is_primary=MAX(bgm_terms.is_prima
 	}
 	if _, err := buildDB.ExecContext(ctx, `
 CREATE INDEX idx_bgm_terms_key ON bgm_terms(term_key);
+CREATE INDEX IF NOT EXISTS idx_bgm_subject_relations_src ON bgm_subject_relations(subject_id, relation_type, sort_order);
 PRAGMA journal_mode = DELETE;
 `); err != nil {
 		return err
@@ -841,21 +897,10 @@ func (a *ArchiveIndex) upgradeExistingIndexIfNeeded() {
 	}
 	var schemaVer string
 	_ = checkDB.QueryRow(`SELECT value FROM meta WHERE key='terms_schema_version'`).Scan(&schemaVer)
-	hasNSFWCol := false
-	if cRows, err := checkDB.Query(`PRAGMA table_info(bgm_subjects)`); err == nil {
-		for cRows.Next() {
-			var cid, notNull, pk int
-			var cName, cType string
-			var dflt sql.NullString
-			if cRows.Scan(&cid, &cName, &cType, &notNull, &dflt, &pk) == nil && cName == "is_nsfw" {
-				hasNSFWCol = true
-			}
-		}
-		cRows.Close()
-	}
+	hasNSFWCol, hasISBNCol, hasRelTable := inspectArchiveCapabilities(checkDB)
 	checkDB.Close()
 
-	if schemaVer == currentTermsSchemaVersion && hasNSFWCol {
+	if schemaVer == currentTermsSchemaVersion && hasNSFWCol && hasISBNCol && hasRelTable {
 		return
 	}
 
@@ -868,14 +913,77 @@ func (a *ArchiveIndex) upgradeExistingIndexIfNeeded() {
 	}
 	defer rwDB.Close()
 
-	count, err := upgradeArchiveTerms(context.Background(), rwDB, !hasNSFWCol, schemaVer != currentTermsSchemaVersion)
-	if a.logger != nil {
-		if err != nil {
-			a.logger.Warn("upgrade Bangumi offline index terms", "error", err)
-		} else {
-			a.logger.Info("Bangumi offline index terms upgraded locally", "subjects", count, "schema", currentTermsSchemaVersion)
+	if !hasISBNCol || !hasRelTable {
+		if uErr := upgradeArchiveRelationsSchema(context.Background(), rwDB, !hasISBNCol, !hasRelTable); uErr != nil {
+			if a.logger != nil {
+				a.logger.Warn("upgrade Bangumi archive relations schema", "error", uErr)
+			}
+			return
 		}
 	}
+
+	if !hasNSFWCol || schemaVer != currentTermsSchemaVersion {
+		count, err := upgradeArchiveTerms(context.Background(), rwDB, !hasNSFWCol, schemaVer != currentTermsSchemaVersion)
+		if a.logger != nil {
+			if err != nil {
+				a.logger.Warn("upgrade Bangumi offline index terms", "error", err)
+			} else {
+				a.logger.Info("Bangumi offline index terms upgraded locally", "subjects", count, "schema", currentTermsSchemaVersion)
+			}
+		}
+	}
+}
+
+func inspectArchiveCapabilities(db *sql.DB) (hasNSFWCol, hasISBNCol, hasRelTable bool) {
+	if cRows, err := db.Query(`PRAGMA table_info(bgm_subjects)`); err == nil {
+		for cRows.Next() {
+			var cid, notNull, pk int
+			var cName, cType string
+			var dflt sql.NullString
+			if cRows.Scan(&cid, &cName, &cType, &notNull, &dflt, &pk) == nil {
+				switch strings.ToLower(strings.TrimSpace(cName)) {
+				case "is_nsfw":
+					hasNSFWCol = true
+				case "isbn":
+					hasISBNCol = true
+				}
+			}
+		}
+		cRows.Close()
+	}
+	var relExists int
+	if err := db.QueryRow(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='bgm_subject_relations'`).Scan(&relExists); err == nil && relExists == 1 {
+		hasRelTable = true
+	}
+	return hasNSFWCol, hasISBNCol, hasRelTable
+}
+
+func upgradeArchiveRelationsSchema(ctx context.Context, db *sql.DB, addISBN, addRelTable bool) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if addISBN {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE bgm_subjects ADD COLUMN isbn TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if addRelTable {
+		if _, err := tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS bgm_subject_relations (
+  subject_id INTEGER NOT NULL,
+  relation_type INTEGER NOT NULL,
+  related_subject_id INTEGER NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (subject_id, relation_type, related_subject_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bgm_subject_relations_src
+  ON bgm_subject_relations(subject_id, relation_type, sort_order);`); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func upgradeArchiveTerms(ctx context.Context, db *sql.DB, addNSFW, rebuild bool) (int, error) {
@@ -896,7 +1004,20 @@ func upgradeArchiveTerms(ctx context.Context, db *sql.DB, addNSFW, rebuild bool)
 		id                        int64
 		name, nameCN, aliasesJSON string
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id,name,name_cn,aliases_json FROM bgm_subjects`)
+	termQuery := `SELECT id,name,name_cn,aliases_json FROM bgm_subjects`
+	var relExists int
+	if tx.QueryRowContext(ctx, `SELECT 1 FROM sqlite_master WHERE type='table' AND name='bgm_subject_relations'`).Scan(&relExists) == nil && relExists == 1 {
+		termQuery = `
+SELECT id,name,name_cn,aliases_json FROM bgm_subjects s
+WHERE NOT (
+  coalesce(s.is_series, 0) = 0 AND EXISTS (
+    SELECT 1 FROM bgm_subject_relations r
+    JOIN bgm_subjects p ON p.id = r.subject_id
+    WHERE r.relation_type = 1003 AND r.related_subject_id = s.id AND coalesce(p.is_series, 0) = 1
+  )
+)`
+	}
+	rows, err := tx.QueryContext(ctx, termQuery)
 	if err != nil {
 		return 0, err
 	}
@@ -973,12 +1094,15 @@ func (a *ArchiveIndex) openExistingIfPresent() {
 	rows.Close()
 	var count int64
 	_ = db.QueryRow(`SELECT count(*) FROM bgm_subjects`).Scan(&count)
+	_, hasISBNCol, hasRelTable := inspectArchiveCapabilities(db)
 
 	a.mu.Lock()
 	if a.db != nil {
 		_ = a.db.Close()
 	}
 	a.db = db
+	a.hasRelationsTable = hasRelTable
+	a.hasISBNCol = hasISBNCol
 	a.status.Ready = count > 0
 	a.status.DumpName = meta["dump_name"]
 	a.status.DumpCreatedAt = meta["dump_created_at"]
@@ -1161,6 +1285,75 @@ func (a *ArchiveIndex) SummaryByID(ctx context.Context, subjectID int64) (string
 		return "", false, nil
 	}
 	return summary, true, nil
+}
+
+// Tankobons returns linked tankobon single-volume subjects for parentSubjectID from the local archive DB.
+// On older archive databases lacking bgm_subject_relations, it gracefully returns (nil, false, nil).
+func (a *ArchiveIndex) Tankobons(ctx context.Context, parentSubjectID int64) ([]TankobonSubject, bool, error) {
+	if a == nil || parentSubjectID <= 0 {
+		return nil, false, nil
+	}
+	a.mu.RLock()
+	db := a.db
+	hasRel := a.hasRelationsTable
+	hasISBN := a.hasISBNCol
+	a.mu.RUnlock()
+	if db == nil || !hasRel {
+		return nil, false, nil
+	}
+
+	isbnExpr := "''"
+	if hasISBN {
+		isbnExpr = "coalesce(s.isbn, '')"
+	}
+	query := `
+SELECT r.related_subject_id, coalesce(s.name,''), coalesce(s.name_cn,''),
+       coalesce(s.release_date,''), coalesce(s.summary,''), ` + isbnExpr + `,
+       r.sort_order, coalesce(s.is_nsfw, 0)
+FROM bgm_subject_relations r
+JOIN bgm_subjects s ON s.id = r.related_subject_id
+WHERE r.subject_id = ? AND r.relation_type = ?
+ORDER BY r.sort_order ASC, r.related_subject_id ASC`
+
+	rows, err := db.QueryContext(ctx, query, parentSubjectID, relationTypeTankobon)
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "no such table") || strings.Contains(msg, "no such column") {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	defer rows.Close()
+
+	var out []TankobonSubject
+	for rows.Next() {
+		var (
+			item   TankobonSubject
+			isNSFW int
+		)
+		if err := rows.Scan(
+			&item.SubjectID, &item.Name, &item.NameCN,
+			&item.Date, &item.Summary, &item.ISBN,
+			&item.Order, &isNSFW,
+		); err != nil {
+			return nil, false, err
+		}
+		item.Name = strings.TrimSpace(item.Name)
+		item.NameCN = strings.TrimSpace(item.NameCN)
+		item.Date = strings.TrimSpace(item.Date)
+		item.Summary = strings.TrimSpace(item.Summary)
+		item.ISBN = strings.TrimSpace(item.ISBN)
+		item.NSFW = isNSFW != 0
+		item.CoverURL = CoverEndpointURL(item.SubjectID)
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if len(out) == 0 {
+		return nil, false, nil
+	}
+	return out, true, nil
 }
 
 func scanSubjectCandidateRow(scanner interface{ Scan(...any) error }) (SubjectCandidate, error) {

@@ -182,6 +182,22 @@ type apiPersonRelation struct {
 	Relation string `json:"relation"`
 }
 
+type apiSubjectRelationItem struct {
+	ID       int64  `json:"id"`
+	Type     int    `json:"type"`
+	Name     string `json:"name"`
+	NameCN   string `json:"name_cn"`
+	Relation string `json:"relation"`
+	NSFW     *bool  `json:"nsfw"`
+	Date     string `json:"date"`
+	Summary  string `json:"summary"`
+	Images   struct {
+		Common string `json:"common"`
+		Medium string `json:"medium"`
+		Large  string `json:"large"`
+	} `json:"images"`
+}
+
 func (c *LiveClient) Search(
 	ctx context.Context,
 	keyword string,
@@ -339,6 +355,73 @@ func (c *LiveClient) fetchSubjectPersons(ctx context.Context, subjectID int64, t
 		return nil, nil
 	}
 	return list, nil
+}
+
+// SubjectRelations fetches linked tankobon ("单行本") subjects for subjectID via Bangumi API v0.
+func (c *LiveClient) SubjectRelations(ctx context.Context, subjectID int64) ([]TankobonSubject, error) {
+	if subjectID <= 0 {
+		return nil, ErrSubjectNotFound
+	}
+	if err := c.limiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+	endpoint := fmt.Sprintf("%s/v0/subjects/%d/subjects", strings.TrimRight(c.baseURL, "/"), subjectID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", archiveUserAgent)
+	req.Header.Set("Accept", "application/json")
+
+	token := c.bearer(ctx, req.URL)
+	resp, err := c.doRead(req, token, false)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		return nil, ErrSubjectNotFound
+	case http.StatusOK:
+	default:
+		return nil, fmt.Errorf("Bangumi subject relations API returned HTTP %d", resp.StatusCode)
+	}
+	var rawItems []apiSubjectRelationItem
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&rawItems); err != nil {
+		return nil, errors.New("invalid Bangumi subject relations response")
+	}
+	allowNSFW := showLiveNSFW(ctx)
+	out := make([]TankobonSubject, 0, len(rawItems))
+	for _, item := range rawItems {
+		if item.ID <= 0 || strings.TrimSpace(item.Relation) != "单行本" {
+			continue
+		}
+		if item.Type != 0 && item.Type != 1 {
+			continue
+		}
+		isNSFW := item.NSFW != nil && *item.NSFW
+		if isNSFW && !allowNSFW {
+			continue
+		}
+		coverURL := strings.TrimSpace(item.Images.Common)
+		if coverURL == "" {
+			coverURL = strings.TrimSpace(item.Images.Large)
+		}
+		if coverURL == "" {
+			coverURL = CoverEndpointURL(item.ID)
+		}
+		out = append(out, TankobonSubject{
+			SubjectID: item.ID,
+			Name:      strings.TrimSpace(item.Name),
+			NameCN:    strings.TrimSpace(item.NameCN),
+			Date:      strings.TrimSpace(item.Date),
+			Summary:   strings.TrimSpace(item.Summary),
+			Order:     len(out) + 1,
+			NSFW:      isNSFW,
+			CoverURL:  coverURL,
+		})
+	}
+	return out, nil
 }
 
 func (c *LiveClient) FetchCoverBytes(ctx context.Context, coverURL string, subjectID int64) ([]byte, error) {

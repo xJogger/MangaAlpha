@@ -1591,3 +1591,67 @@ func TestManagerOnlineEnrichReportsOutcomes(t *testing.T) {
 		})
 	}
 }
+
+func TestSidecarSupportsMangaAlphaMetaV2AliasAndExtendedColumns(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "open_v2.sqlite")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO meta VALUES ('schema', 'mangaalpha_meta_v2');
+CREATE TABLE entries (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  title_alt TEXT DEFAULT '',
+  authors TEXT DEFAULT '[]',
+  summary TEXT DEFAULT '',
+  tags TEXT DEFAULT '[]',
+  category TEXT DEFAULT '',
+  cover_url TEXT DEFAULT '',
+  rating REAL DEFAULT 0,
+  is_nsfw INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER DEFAULT 0,
+  extra_json TEXT DEFAULT '{}',
+  status TEXT DEFAULT '',
+  publisher TEXT DEFAULT '',
+  reading_direction TEXT DEFAULT '',
+  age_rating INTEGER
+);
+INSERT INTO entries VALUES (
+  'v2-1', '鋼の錬金術師', 'Fullmetal Alchemist', '["荒川弘"]', 'Equivalent exchange',
+  '["奇幻"]', 'Manga', '', 9.7, 0, 1700002000, '{}', 'ENDED', 'Square Enix', 'RIGHT_TO_LEFT', 13
+);
+`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	sidecarPath := filepath.Join(tmpDir, "open_v2.sidecar.sqlite")
+	if err := BuildSidecarIndex(ctx, dbPath, sidecarPath, FormatOpenV2, nil); err != nil {
+		t.Fatalf("BuildSidecarIndex(mangaalpha_meta_v2): %v", err)
+	}
+	store, err := OpenSidecarStore("open-v2-src", dbPath, sidecarPath, FormatOpenV2)
+	if err != nil {
+		t.Fatalf("OpenSidecarStore(mangaalpha_meta_v2): %v", err)
+	}
+	defer store.Close()
+
+	hits, err := store.SearchByTitle(ctx, "钢の炼金术师", 5)
+	if err != nil || len(hits) != 1 || hits[0].EntryID != "v2-1" {
+		t.Fatalf("unexpected v2 sidecar search hits: %+v err=%v", hits, err)
+	}
+	entry, err := store.GetEntry(ctx, "v2-1")
+	if err != nil {
+		t.Fatalf("GetEntry(v2-1): %v", err)
+	}
+	if entry.Status != "ENDED" || entry.Publisher != "Square Enix" || entry.ReadingDirection != "RIGHT_TO_LEFT" ||
+		entry.AgeRating == nil || *entry.AgeRating != 13 {
+		t.Fatalf("unexpected v2 entry extended fields: %+v", entry)
+	}
+}

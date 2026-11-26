@@ -16,6 +16,7 @@ type WikiInfo struct {
 	Status       string
 	TotalVolumes *int
 	ReleaseDate  string
+	ISBN         string
 }
 
 var (
@@ -165,6 +166,13 @@ func applyInfoboxSingle(info *WikiInfo, key, val string) {
 		}
 		if strings.Contains(val, "完") {
 			info.Status = "ENDED"
+		}
+	case "ISBN", "ISBN-13", "ISBN-10", "isbn":
+		if info.ISBN == "" {
+			cleaned := strings.TrimSpace(parenGroupRe.ReplaceAllString(val, ""))
+			if cleaned != "" {
+				info.ISBN = cleaned
+			}
 		}
 	}
 }

@@ -637,6 +637,44 @@ func (s *Service) OfflineSubject(ctx context.Context, series database.Series, su
 	return ToScrapedMetadataWithQuery(series.Name, parsed, candidate), true, nil
 }
 
+// OfflineTankobons returns linked tankobon single-volume subjects from the local
+// bangumi-archive.db with zero network requests.
+func (s *Service) OfflineTankobons(ctx context.Context, parentSubjectID int64) ([]TankobonSubject, bool, error) {
+	if s == nil || s.archive == nil || parentSubjectID <= 0 {
+		return nil, false, nil
+	}
+	items, found, err := s.archive.Tankobons(ctx, parentSubjectID)
+	if err != nil || !found {
+		return items, found, err
+	}
+	if scope, ok := database.UserScopeFromContext(ctx); ok && !scope.EffectiveShowNSFW() {
+		items = slices.DeleteFunc(items, func(item TankobonSubject) bool { return item.NSFW })
+		if len(items) == 0 {
+			return nil, false, nil
+		}
+	}
+	return items, true, nil
+}
+
+// TankobonsForSubject returns linked tankobon single-volume subjects for parentSubjectID,
+// querying the local offline archive first and optionally falling back to Bangumi Live API.
+func (s *Service) TankobonsForSubject(ctx context.Context, parentSubjectID int64, allowLiveFallback bool) ([]TankobonSubject, error) {
+	if s == nil || parentSubjectID <= 0 {
+		return nil, nil
+	}
+	items, found, err := s.OfflineTankobons(ctx, parentSubjectID)
+	if err != nil {
+		return nil, err
+	}
+	if found && len(items) > 0 {
+		return items, nil
+	}
+	if !allowLiveFallback || s.live == nil {
+		return nil, nil
+	}
+	return s.live.SubjectRelations(ctx, parentSubjectID)
+}
+
 // AutoScrapeOne runs automatic title parsing & matching on a single Series.
 func (s *Service) AutoScrapeOne(
 	ctx context.Context,
