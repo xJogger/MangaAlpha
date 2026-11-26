@@ -54,6 +54,7 @@ type Service struct {
 	rar            *RARService
 	volumePrefetch *VolumeIndexPrefetcher
 	loadTracker    *LoadTracker
+	comicInfo      *comicInfoCache
 }
 
 func NewService(
@@ -83,8 +84,13 @@ func NewServiceWithWebDAV(
 		loadTracker: newLoadTracker(),
 	}
 	service.volumePrefetch = newVolumeIndexPrefetcher(
-		store, service.ListPages, logger,
+		store, func(ctx context.Context, book database.Book) ([]PageEntry, error) {
+			return service.ListPages(WithoutComicInfoCaching(ctx), book)
+		}, logger,
 	)
+	if store != nil {
+		service.startComicInfoCache()
+	}
 	return service
 }
 
@@ -285,7 +291,9 @@ func (s *Service) ListPages(ctx context.Context, book database.Book) ([]PageEntr
 	var lastErr error
 	for idx, cand := range candidates {
 		started := time.Now()
-		pages, err := s.listPagesDirect(ctx, cand)
+		var hint comicInfoHint
+		pages, err := s.listPagesDirect(withComicInfoHint(ctx, &hint), cand)
+		s.queueComicInfo(ctx, cand, book, hint, err)
 		if err == nil {
 			if isUnion {
 				s.syncUnionIndexSummary(ctx, book, len(pages), time.Since(started))
@@ -357,7 +365,9 @@ func (s *Service) ReadPage(
 	var lastErr error
 	for idx, cand := range candidates {
 		started := time.Now()
-		page, err := s.readPageDirect(ctx, cand, pageNumber)
+		var hint comicInfoHint
+		page, err := s.readPageDirect(withComicInfoHint(ctx, &hint), cand, pageNumber)
+		s.queueComicInfo(ctx, cand, book, hint, err)
 		if err == nil {
 			if isUnion && page.TotalPages > 0 {
 				if ok, _ := s.store.HasArchiveIndexVersion(ctx, book.ID, BookVersion(book)); !ok {
@@ -390,7 +400,7 @@ func (s *Service) Prefetch(book database.Book, afterPage, count int) {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 				defer cancel()
 				for page := afterPage + 1; page <= afterPage+count; page++ {
-					if _, err := s.ReadPage(ctx, book, page); err != nil {
+					if _, err := s.ReadPage(WithoutComicInfoCaching(ctx), book, page); err != nil {
 						return
 					}
 				}
@@ -415,6 +425,10 @@ func (s *Service) PrefetchNextVolumeIndex(
 
 func (s *Service) Close() {
 	s.volumePrefetch.Close()
+	if s.comicInfo != nil {
+		s.comicInfo.cancel()
+		<-s.comicInfo.done
+	}
 }
 
 func MediaType(name string) string {

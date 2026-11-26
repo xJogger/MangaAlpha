@@ -5,10 +5,12 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -30,6 +32,7 @@ import (
 	"github.com/xJogger/fake-komga-115/internal/thumbnail"
 	"github.com/xJogger/fake-komga-115/internal/updater"
 	"github.com/xJogger/fake-komga-115/internal/webdav"
+	"golang.org/x/time/rate"
 )
 
 const SettingDiagnosticsVerbose = "diagnostics_verbose"
@@ -121,6 +124,7 @@ func New(_ context.Context, options Options) (*App, error) {
 	webdavManager := webdav.NewManager()
 	scanManager := scanner.NewWithWebDAV(store, client, webdavManager, options.Logger)
 	archiveService := archive.NewServiceWithWebDAV(store, client, webdavManager, cacheManager, options.Logger)
+	archiveService.SetComicInfoParser(parseBookComicInfo)
 
 	bangumiService, err := bangumi.NewService(store, filepath.Join(dataDir, "bangumi"), options.Logger)
 	if err != nil {
@@ -130,8 +134,8 @@ func New(_ context.Context, options Options) (*App, error) {
 		return nil, err
 	}
 
-	thumbnailService, err := thumbnail.New(
-		store, filepath.Join(dataDir, "thumbnails", "series"), options.Logger,
+	thumbnailService, err := thumbnail.NewWithDataDir(
+		store, filepath.Join(dataDir, "thumbnails", "series"), dataDir, options.Logger,
 	)
 	if err != nil {
 		_ = bangumiService.Close()
@@ -141,6 +145,43 @@ func New(_ context.Context, options Options) (*App, error) {
 		return nil, err
 	}
 	thumbnailService.SetBangumiCoverFetcher(bangumiService.FetchCoverBytes)
+	thumbnailService.SetTankobonMatcher(func(ctx context.Context, series database.Series, meta database.SeriesMetadata, books []thumbnail.VolumeMatchBook, allowLive bool) ([]thumbnail.VolumeMatchResult, error) {
+		subjectID := *meta.BgmSubjectID
+		var items []bangumi.TankobonSubject
+		var err error
+		if allowLive {
+			items, err = bangumiService.TankobonsForSubject(ctx, subjectID, true)
+		} else {
+			// Keep relation ordering and the distinction between an absent relation and a blocked volume.
+			offlineCtx := database.WithUserScope(ctx, database.UserScope{AllowNSFW: true, ShowNSFW: true})
+			items, _, err = bangumiService.OfflineTankobons(offlineCtx, subjectID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(items) == 0 && series.BooksCount > 1 {
+			return nil, nil
+		}
+		volumes := make([]bangumi.VolumeMatchBook, len(books))
+		for i, book := range books {
+			volumes[i] = bangumi.VolumeMatchBook{BookID: book.BookID, Name: book.Name, Number: book.Number}
+		}
+		matches := bangumi.MatchBooksToTankobons(subjectID, series.EffectiveOneShot(), volumes, items)
+		out := make([]thumbnail.VolumeMatchResult, 0, len(matches))
+		for _, match := range matches {
+			if match.SubjectID == subjectID {
+				match.NSFW = meta.IsNSFW
+				if meta.NSFWLock && !meta.IsNSFW {
+					official, found, err := bangumiService.OfflineSubject(ctx, series, subjectID)
+					match.NSFW = err != nil || !found || official.IsNSFW
+				}
+			}
+			out = append(out, thumbnail.VolumeMatchResult{
+				BookID: match.BookID, SubjectID: match.SubjectID, CoverURL: match.CoverURL, NSFW: match.NSFW,
+			})
+		}
+		return out, nil
+	})
 
 	proxyURLProvider := func(ctx context.Context) string {
 		proxy, _ := store.GetSetting(ctx, bangumi.SettingProxyURL)
@@ -161,6 +202,43 @@ func New(_ context.Context, options Options) (*App, error) {
 		return nil, err
 	}
 	thumbnailService.SetExternalCoverFetcher(metadataManager.FetchCover)
+	publicCovers := rate.NewLimiter(12, 8)
+	thumbnailService.SetPublicBangumiCoverFetcher(func(ctx context.Context, coverURL string, subjectID int64) ([]byte, error) {
+		if err := publicCovers.Wait(ctx); err != nil {
+			return nil, err
+		}
+		return fetchPublicBangumiCover(ctx, proxyURLProvider(ctx), coverURL, subjectID)
+	})
+	thumbnailService.SetBookExternalCoverFetcher(func(ctx context.Context, sourceID, entryID, coverURL string) ([]byte, string, error) {
+		if sourceID == "" && !strings.HasPrefix(coverURL, extmeta.SQLiteBlobCoverPrefix) {
+			cover, err := externalCovers.GetOrFetch(ctx, "book-custom", entryID, coverURL)
+			return cover.Bytes, cover.MediaType, err
+		}
+		if !strings.HasPrefix(coverURL, extmeta.SQLiteBlobCoverPrefix) {
+			return metadataManager.FetchCover(ctx, sourceID, entryID, coverURL)
+		}
+		refSource, kind, recordID, ok := extmeta.ParseSQLiteBlobCoverRef(coverURL)
+		if !ok || refSource != sourceID {
+			return nil, "", extmeta.ErrInvalidConfig
+		}
+		source, err := store.GetMetadataSource(ctx, sourceID)
+		if err != nil || !source.Enabled || !source.Ready || source.Kind != extmeta.KindOfflineSQLite {
+			return nil, "", extmeta.ErrUnavailable
+		}
+		path := source.LocalPath
+		if path == "" {
+			path = filepath.Join(dataDir, "extmeta", source.ID+".sqlite")
+		}
+		key := strings.Join([]string{coverURL, source.LocalSHA256, source.LastUpdatedAt}, "\x00")
+		return thumbnailService.CacheOfflineBookCover(ctx, key, func(ctx context.Context) ([]byte, string, error) {
+			switch kind {
+			case extmeta.SQLiteBlobKindOpenBook, extmeta.SQLiteBlobKindOpenEntry:
+				return extmeta.ReadOpenCoverBLOB(ctx, path, kind, recordID)
+			default:
+				return extmeta.ReadKomgaThumbnailBLOB(ctx, path, kind, recordID)
+			}
+		})
+	})
 	thumbnailService.SetNSFWFallbackCoverFetcher(metadataManager.FetchFallbackNSFWCover, metadataManager.InvalidateFallbackCoverCache)
 	metadataManager.StartScheduler()
 
@@ -480,6 +558,70 @@ func (a *App) Close() error {
 		_ = a.bangumi.Close()
 	}
 	return a.store.Close()
+}
+
+func fetchPublicBangumiCover(ctx context.Context, proxy, coverURL string, subjectID int64) ([]byte, error) {
+	if !bangumi.IsAllowedBangumiCoverURL(coverURL) {
+		coverURL = bangumi.CoverEndpointURL(subjectID)
+	}
+	client := extmeta.NewSafeHTTPClient(proxy, 20*time.Second)
+	checkRedirect := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if !bangumi.IsAllowedBangumiCoverURL(req.URL.String()) {
+			return bangumi.ErrCoverUnavailable
+		}
+		return checkRedirect(req, via)
+	}
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, coverURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "MangaAlpha")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || strings.HasPrefix(path.Base(resp.Request.URL.Path), "no_icon_subject") {
+		return nil, bangumi.ErrCoverUnavailable
+	}
+	const maxCoverBytes = 16 << 20
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxCoverBytes+1))
+	if err == nil && (len(raw) == 0 || len(raw) > maxCoverBytes) {
+		return nil, bangumi.ErrCoverUnavailable
+	}
+	return raw, err
+}
+
+func parseBookComicInfo(reader io.Reader) (database.BookScrapedMetadata, database.SeriesComicInfoBackfill, error) {
+	meta, err := extmeta.ParseComicInfoXML(reader)
+	if err != nil {
+		return database.BookScrapedMetadata{}, database.SeriesComicInfoBackfill{}, err
+	}
+	var authors []database.Author
+	for _, author := range meta.DetailedAuthors {
+		authors = append(authors, database.Author{Name: author.Name, Role: author.Role})
+	}
+	var links []database.Link
+	for _, link := range meta.Links {
+		links = append(links, database.Link{Label: link.Label, URL: link.URL})
+	}
+	book := database.BookScrapedMetadata{
+		Title: meta.Title, Summary: meta.Summary, Number: meta.Number, NumberSort: meta.NumberSort,
+		ReleaseDate: meta.ReleaseDate, ISBN: meta.ISBN, Authors: authors, Tags: meta.Tags, Links: links,
+		SeriesGroup: meta.SeriesGroup, StoryArc: meta.StoryArc, StoryArcNumber: meta.StoryArcNumber,
+	}
+	series := database.SeriesComicInfoBackfill{
+		Title: meta.Series, TitleSort: meta.SeriesSort, Summary: meta.Summary,
+		Publisher: meta.Publisher, Language: meta.LanguageISO, ReleaseDate: meta.ReleaseDate,
+		TotalBookCount: meta.Count, AgeRating: meta.AgeRatingInt, ReadingDirection: meta.ReadingDirection,
+		Genres: meta.Genres, Tags: meta.Tags, Authors: authors, Links: links, IsNSFW: meta.IsNSFW,
+	}
+	if meta.LocalizedSeries != "" {
+		series.AlternateTitles = []database.AlternateTitle{{Title: meta.LocalizedSeries}}
+	}
+	return book, series, nil
 }
 
 func seedInitialAdminFromOptions(ctx context.Context, store *database.Store, options Options) error {

@@ -18,6 +18,7 @@ import (
 	"github.com/xJogger/fake-komga-115/internal/archive"
 	"github.com/xJogger/fake-komga-115/internal/buildinfo"
 	"github.com/xJogger/fake-komga-115/internal/database"
+	"github.com/xJogger/fake-komga-115/internal/thumbnail"
 )
 
 func (s *Server) komgaRoutes(r chi.Router) {
@@ -58,7 +59,8 @@ func (s *Server) komgaRoutes(r chi.Router) {
 	r.Get("/books/{bookID}/pages/{pageNumber}", s.komgaPageImage)
 	r.Get("/books/{bookID}/pages/{pageNumber}/raw", s.komgaPageImage)
 	r.Get("/books/{bookID}/pages/{pageNumber}/thumbnail", s.komgaBookPlaceholderThumbnail)
-	r.Get("/books/{bookID}/thumbnail", s.komgaBookPlaceholderThumbnail)
+	r.Get("/books/{bookID}/thumbnail", s.komgaBookThumbnail)
+	r.With(s.requireAdmin).Patch("/books/{bookID}/metadata", s.patchKomgaBookMetadata)
 
 	r.Get("/collections", s.komgaCollections)
 	r.Post("/collections", s.komgaCreateCollection)
@@ -700,6 +702,57 @@ func (s *Server) komgaPageImage(w http.ResponseWriter, r *http.Request) {
 	s.thumbs.MaybeGenerate(book, pageNumber, page.Data)
 	s.archive.Prefetch(book, pageNumber, int(s.store.Int64Setting(r.Context(), "page_prefetch_count", 2)))
 	s.archive.PrefetchNextVolumeIndex(book, pageNumber, page.TotalPages)
+}
+
+func (s *Server) patchKomgaBookMetadata(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	book, err := s.store.BookByID(ctx, chi.URLParam(r, "bookID"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Book not found.")
+		return
+	}
+	if err != nil {
+		s.writeDBError(w, r, err)
+		return
+	}
+	var patch database.BookMetadataPatch
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&patch); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+	if err := s.store.PatchBookMetadata(ctx, book.ID, patch); errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Book not found.")
+		return
+	} else if err != nil {
+		s.writeDBError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) komgaBookThumbnail(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "bookID")
+	if s.thumbs == nil {
+		s.komgaBookPlaceholderThumbnail(w, r)
+		return
+	}
+	data, ok, err := s.thumbs.GetBookCover(r.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "Book not found.")
+		return
+	}
+	if !ok || err != nil {
+		s.writeUncachedPlaceholder(w)
+		return
+	}
+	writeBookCover(w, data)
+}
+
+func writeBookCover(w http.ResponseWriter, data thumbnail.Data) {
+	w.Header().Set("Content-Type", data.MediaType)
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data.Bytes)))
+	_, _ = w.Write(data.Bytes)
 }
 
 func (s *Server) komgaBookPlaceholderThumbnail(w http.ResponseWriter, r *http.Request) {

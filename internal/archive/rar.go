@@ -89,7 +89,7 @@ func (r *RARService) ListPages(ctx context.Context, book database.Book) ([]PageE
 		parseErr error
 	)
 	if len(cands) == 0 {
-		files, _, err := r.listFilesWithPassword(ctx, book, "")
+		files, remote, err := r.listFilesWithPassword(ctx, book, "")
 		if err != nil {
 			if hasExplicit && isArchivePasswordError(err) {
 				return nil, ErrArchivePasswordInvalid
@@ -99,11 +99,12 @@ func (r *RARService) ListPages(ctx context.Context, book database.Book) ([]PageE
 			}
 			return nil, err
 		}
-		pages, err = rarPageEntries(files)
+		pages, err = rarPageEntriesWithContext(ctx, files)
 		if err != nil {
 			r.recordRARError(book, started, "validate_rar", err)
 			return nil, err
 		}
+		attachRARComicInfoReader(ctx, remote, false)
 		if _, hasEnc := firstEncryptedPageEntry(pages); hasEnc {
 			if hasExplicit {
 				return nil, ErrArchivePasswordInvalid
@@ -126,13 +127,14 @@ func (r *RARService) ListPages(ctx context.Context, book database.Book) ([]PageE
 				parseErr = lErr
 				break
 			}
-			candPages, vErr := rarPageEntries(files)
+			candPages, vErr := rarPageEntriesWithContext(ctx, files)
 			if vErr != nil {
 				parseErr = vErr
 				break
 			}
 			sample, hasEnc := firstEncryptedPageEntry(candPages)
 			if !hasEnc {
+				attachRARComicInfoReader(ctx, remoteFS, true)
 				pages = candPages
 				unlocked = true
 				break
@@ -149,6 +151,7 @@ func (r *RARService) ListPages(ctx context.Context, book database.Book) ([]PageE
 				break
 			}
 			maybeAutoBindArchivePassword(ctx, r.store, book, cand)
+			attachRARComicInfoReader(ctx, remoteFS, true)
 			pages = candPages
 			unlocked = true
 			break
@@ -234,6 +237,11 @@ func (r *RARService) ensureEncryptedPagesUnlocked(ctx context.Context, book data
 }
 
 func rarPageEntries(files []*rardecode.File) ([]PageEntry, error) {
+	return rarPageEntriesWithContext(context.Background(), files)
+}
+
+func rarPageEntriesWithContext(ctx context.Context, files []*rardecode.File) ([]PageEntry, error) {
+	var comicInfo *rardecode.File
 	pages := make([]PageEntry, 0, len(files))
 	for index, file := range files {
 		if err := validateRARFile(file); err != nil {
@@ -241,6 +249,9 @@ func rarPageEntries(files []*rardecode.File) ([]PageEntry, error) {
 		}
 		if file.IsDir || ignoredEntry(file.Name) {
 			continue
+		}
+		if comicInfo == nil && comicInfoEntry(file.Name) {
+			comicInfo = file
 		}
 		mimeType := MimeType(file.Name)
 		if mimeType == "" {
@@ -262,6 +273,12 @@ func rarPageEntries(files []*rardecode.File) ([]PageEntry, error) {
 			EncScheme:        scheme,
 		})
 	}
+	if hint, ok := ctx.Value(comicInfoHintKey{}).(*comicInfoHint); ok {
+		hint.format, hint.rarEntry = formatRAR, comicInfo
+		if comicInfo != nil {
+			hint.name = comicInfo.Name
+		}
+	}
 	slices.SortFunc(pages, func(a, b PageEntry) int {
 		if natsort.Less(a.Name, b.Name) {
 			return -1
@@ -275,6 +292,12 @@ func rarPageEntries(files []*rardecode.File) ([]PageEntry, error) {
 		pages[index].Number = index + 1
 	}
 	return pages, nil
+}
+
+func attachRARComicInfoReader(ctx context.Context, remote *remoteArchiveFS, hasPassword bool) {
+	if hint, ok := ctx.Value(comicInfoHintKey{}).(*comicInfoHint); ok && hint.rarEntry != nil {
+		hint.rarFS, hint.rarPassword = remote, hasPassword
+	}
 }
 
 func (r *RARService) ReadPage(
@@ -430,11 +453,14 @@ func readRARFileEntry(
 	maxPageSize int64,
 	hasPassword bool,
 ) ([]byte, error) {
-	remoteFS.UseDataBlocks()
 	if entry.ArchiveIndex < 0 || entry.ArchiveIndex >= len(files) {
 		return nil, fmt.Errorf("%w: page entry no longer exists", ErrInvalidRAR)
 	}
-	file := files[entry.ArchiveIndex]
+	return readRARFile(remoteFS, files[entry.ArchiveIndex], entry, maxPageSize, hasPassword)
+}
+
+func readRARFile(remoteFS *remoteArchiveFS, file *rardecode.File, entry PageEntry, maxPageSize int64, hasPassword bool) ([]byte, error) {
+	remoteFS.UseDataBlocks()
 	if err := validateRARFile(file); err != nil {
 		return nil, err
 	}

@@ -2145,5 +2145,16 @@ func (s *Server) opdsKomgaBookThumbnail(w http.ResponseWriter, r *http.Request) 
 		s.writeDBError(w, r, err)
 		return
 	}
+	if s.thumbs != nil {
+		data, found, err := s.thumbs.GetBookCover(r.Context(), book.ID)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "Book not found.")
+			return
+		}
+		if err == nil && found {
+			writeBookCover(w, data)
+			return
+		}
+	}
 	s.serveSeriesThumbOrPlaceholder(w, r, book.SeriesID)
 }

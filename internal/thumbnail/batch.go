@@ -97,7 +97,7 @@ func NewBatchManager(
 			return false, err
 		}
 		started := time.Now()
-		page, err := archiveService.ReadPage(ctx, book, 1)
+		page, err := archiveService.ReadPage(archive.WithoutComicInfoCaching(ctx), book, 1)
 		if err != nil {
 			if errors.Is(err, archive.ErrArchivePasswordRequired) || errors.Is(err, archive.ErrArchivePasswordInvalid) {
 				// Skip locked encrypted archives silently during background cover generation.

@@ -9,13 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/xJogger/fake-komga-115/internal/archive"
 	"github.com/xJogger/fake-komga-115/internal/database"
+	"github.com/xJogger/fake-komga-115/internal/diagnostics"
 	"github.com/xJogger/fake-komga-115/internal/thumbnail"
 )
 
@@ -33,7 +33,6 @@ const (
 var (
 	ErrJobAlreadyQueued = errors.New("maintenance job is already queued or running for this target")
 	ErrInvalidOperation = errors.New("invalid maintenance operation")
-	urlPattern          = regexp.MustCompile(`https?://\S+`)
 )
 
 type Run struct {
@@ -66,7 +65,8 @@ type ListFilter struct {
 }
 
 type job struct {
-	runID string
+	runID   string
+	options JobOptions
 }
 
 type indexFunc func(context.Context, database.Book, bool) (bool, error)
@@ -77,10 +77,13 @@ type Manager struct {
 	buildIndex indexFunc
 	buildCover coverFunc
 	logger     *slog.Logger
+	archive    *archive.Service
+	thumbs     *thumbnail.Service
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	jobs   chan job
+	done   chan struct{}
 
 	mu          sync.Mutex
 	queued      map[string]string
@@ -94,7 +97,7 @@ func New(
 	thumbnailService *thumbnail.Service,
 	logger *slog.Logger,
 ) *Manager {
-	return newManager(
+	manager := newManager(
 		store,
 		func(ctx context.Context, book database.Book, force bool) (bool, error) {
 			version := archive.BookVersion(book)
@@ -114,7 +117,7 @@ func New(
 					}
 				}
 			}
-			if _, err := archiveService.ListPages(ctx, book); err != nil {
+			if _, err := archiveService.ListPages(archive.WithoutComicInfoCaching(ctx), book); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -131,7 +134,7 @@ func New(
 				return false, err
 			}
 			started := time.Now()
-			page, err := archiveService.ReadPage(ctx, book, 1)
+			page, err := archiveService.ReadPage(archive.WithoutComicInfoCaching(ctx), book, 1)
 			if err != nil {
 				return false, err
 			}
@@ -145,6 +148,8 @@ func New(
 		},
 		logger,
 	)
+	manager.archive, manager.thumbs = archiveService, thumbnailService
+	return manager
 }
 
 func newManager(
@@ -161,7 +166,7 @@ UPDATE maintenance_runs SET status='failed',completed_at=?,
 WHERE status IN ('queued','running')`, now)
 	manager := &Manager{
 		store: store, buildIndex: buildIndex, buildCover: buildCover, logger: logger,
-		ctx: ctx, cancel: cancel, jobs: make(chan job, 64), queued: make(map[string]string),
+		ctx: ctx, cancel: cancel, jobs: make(chan job, 64), done: make(chan struct{}), queued: make(map[string]string),
 	}
 	go manager.worker()
 	return manager
@@ -174,6 +179,7 @@ func (m *Manager) Close() {
 		m.activeStop()
 	}
 	m.mu.Unlock()
+	<-m.done
 }
 
 func (m *Manager) StartBookIndex(
@@ -227,11 +233,15 @@ func (m *Manager) start(
 	force bool,
 	totalItems int,
 ) (Run, error) {
-	if operation != OperationBookIndex &&
-		operation != OperationSeriesIndex &&
-		operation != OperationSeriesThumbnail {
-		return Run{}, ErrInvalidOperation
-	}
+	return m.enqueue(ctx, operation, targetType, targetID, targetName, seriesID, bookID, JobOptions{Force: force}, totalItems)
+}
+
+func (m *Manager) enqueue(
+	ctx context.Context,
+	operation, targetType, targetID, targetName, seriesID, bookID string,
+	options JobOptions,
+	totalItems int,
+) (Run, error) {
 	key := operation + ":" + targetType + ":" + targetID
 	m.mu.Lock()
 	if _, exists := m.queued[key]; exists {
@@ -248,7 +258,7 @@ INSERT INTO maintenance_runs(
  id,operation,target_type,target_id,target_name,series_id,book_id,force,status,total_items,created_at
 ) VALUES(?,?,?,?,?,?,?,?, 'queued',?,?)`,
 		runID, operation, targetType, targetID, targetName,
-		nullIfEmpty(seriesID), nullIfEmpty(bookID), force, totalItems, now)
+		nullIfEmpty(seriesID), nullIfEmpty(bookID), options.Force, totalItems, now)
 	if err != nil {
 		m.releaseQueued(key)
 		return Run{}, err
@@ -259,7 +269,7 @@ INSERT INTO maintenance_runs(
 		return Run{}, err
 	}
 	select {
-	case m.jobs <- job{runID: runID}:
+	case m.jobs <- job{runID: runID, options: options}:
 		return run, nil
 	case <-m.ctx.Done():
 		m.releaseQueued(key)
@@ -288,25 +298,29 @@ WHERE id=? AND status IN ('queued','running')`, runID)
 
 func (m *Manager) CancelLibrary(ctx context.Context, libraryID string) {
 	rows, err := m.store.DB().QueryContext(ctx, `
-SELECT id FROM maintenance_runs
+UPDATE maintenance_runs SET cancel_requested=1
 WHERE status IN ('queued','running')
  AND (
-  EXISTS (SELECT 1 FROM series s WHERE s.id=maintenance_runs.series_id AND s.library_id=?)
+  (target_type='library' AND target_id=?)
+  OR EXISTS (SELECT 1 FROM series s WHERE s.id=maintenance_runs.series_id AND s.library_id=?)
   OR EXISTS (SELECT 1 FROM books b WHERE b.id=maintenance_runs.book_id AND b.library_id=?)
- )`, libraryID, libraryID)
+ )
+RETURNING id`, libraryID, libraryID, libraryID)
 	if err != nil {
 		return
 	}
-	var ids []string
+	ids := make(map[string]struct{})
 	for rows.Next() {
 		var id string
 		if rows.Scan(&id) == nil {
-			ids = append(ids, id)
+			ids[id] = struct{}{}
 		}
 	}
 	rows.Close()
-	for _, id := range ids {
-		_ = m.Cancel(ctx, id)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := ids[m.activeRunID]; ok && m.activeStop != nil {
+		m.activeStop()
 	}
 }
 
@@ -386,7 +400,8 @@ func scanRun(row rowScanner) (Run, error) {
 }
 
 func (m *Manager) worker() {
-	for {
+	defer close(m.done)
+	for m.ctx.Err() == nil {
 		select {
 		case <-m.ctx.Done():
 			return
@@ -431,6 +446,8 @@ func (m *Manager) execute(item job) {
 		m.executeSeriesIndex(ctx, &run)
 	case OperationSeriesThumbnail:
 		m.executeSeriesThumbnail(ctx, &run)
+	case OperationBatchBookCovers, OperationBatchComicInfo:
+		m.executeBookBatch(ctx, &run, item.options)
 	default:
 		run.Errors = append(run.Errors, "invalid operation")
 		m.finish(run, "failed")
@@ -532,6 +549,10 @@ func (m *Manager) executeSeriesThumbnail(ctx context.Context, run *Run) {
 func (m *Manager) processBook(ctx context.Context, run *Run, book database.Book) {
 	run.CurrentItem = book.Name
 	generated, err := m.buildIndex(ctx, book, run.Force)
+	recordBookResult(run, book, generated, err)
+}
+
+func recordBookResult(run *Run, book database.Book, generated bool, err error) {
 	run.ProcessedItems++
 	switch {
 	case err != nil:
@@ -587,7 +608,7 @@ func (m *Manager) finish(run Run, status string) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	errorsJSON, _ := json.Marshal(run.Errors)
 	_, _ = m.store.DB().ExecContext(context.Background(), `
-UPDATE maintenance_runs SET status=?,completed_at=?,total_items=?,processed_items=?,
+UPDATE maintenance_runs SET status=CASE WHEN cancel_requested=1 THEN 'canceled' ELSE ? END,completed_at=?,total_items=?,processed_items=?,
  generated_count=?,skipped_count=?,failed_count=?,current_item=?,errors_json=?
 WHERE id=?`,
 		status, now, run.TotalItems, run.ProcessedItems, run.GeneratedCount,
@@ -608,8 +629,7 @@ func (m *Manager) releaseQueued(key string) {
 }
 
 func safeError(err error) string {
-	message := urlPattern.ReplaceAllString(err.Error(), "[redacted-url]")
-	message = strings.TrimSpace(message)
+	message := diagnostics.SanitizeText(err.Error())
 	if len(message) > 300 {
 		message = message[:300] + "..."
 	}

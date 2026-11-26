@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -85,8 +86,9 @@ func (z *ZIPService) ListPages(ctx context.Context, book database.Book) ([]PageE
 		return nil, err
 	}
 	defer readerAt.Close()
-	reader, err := zip.NewReader(readerAt, actualSize)
-	if err != nil {
+	source := &comicInfoZIPReader{ReaderAt: readerAt}
+	reader, err := zip.NewReader(source, actualSize)
+	if err != nil && !errors.Is(err, zip.ErrInsecurePath) {
 		diagnostics.Default().Record(diagnostics.Event{
 			Level:         diagnostics.LevelError,
 			Component:     "archive",
@@ -101,9 +103,13 @@ func (z *ZIPService) ListPages(ctx context.Context, book database.Book) ([]PageE
 		return nil, fmt.Errorf("%w: %v", ErrInvalidZIP, err)
 	}
 	var pages []PageEntry
+	var comicInfo *zip.File
 	for _, file := range reader.File {
 		if file.FileInfo().IsDir() || ignoredEntry(file.Name) {
 			continue
+		}
+		if comicInfo == nil && comicInfoEntry(file.Name) {
+			comicInfo = file
 		}
 		mimeType := MimeType(file.Name)
 		if mimeType == "" {
@@ -133,6 +139,18 @@ func (z *ZIPService) ListPages(ctx context.Context, book database.Book) ([]PageE
 		})
 		if len(pages)%10 == 0 {
 			reportLoadPagesFound(ctx, len(pages))
+		}
+	}
+	if hint, ok := ctx.Value(comicInfoHintKey{}).(*comicInfoHint); ok {
+		hint.format = formatZIP
+		if comicInfo != nil {
+			hint.name, hint.zipEntry, hint.zipReader = comicInfo.Name, comicInfo, source
+			defer func() {
+				// Keep the single entry's local-header offset without retaining
+				// the directory or the foreground reader.
+				reader.File = nil
+				source.ReaderAt = nil
+			}()
 		}
 	}
 	reportLoadPagesFound(ctx, len(pages))
