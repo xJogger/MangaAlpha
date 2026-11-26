@@ -61,6 +61,7 @@ func createShelfRevisions(db *sql.DB) error {
 		{"union_layers", "catalog", "", ""},
 		{"series", "catalog", "", ""},
 		{"books", "catalog", "", ""},
+		{"book_metadata", "catalog", "", ""},
 		{"series_metadata", "catalog", " OF bgm_subject_id,scrape_status,bgm_score,bgm_rank,status,title,title_sort,publisher,is_nsfw,cover_source,genres_json,tags_json,authors_json,summary,alternate_titles_json,language", ""},
 		{"series_tags", "catalog", "", ""},
 		{"series_genres", "catalog", "", ""},

@@ -247,7 +247,7 @@ func (s *Store) AuthorizedVisibleLibrariesBasic(ctx context.Context) ([]Library,
 func (s *Store) librariesBasic(ctx context.Context, enabledOnly, applyPersonalHidden bool) ([]Library, error) {
 	query := `
 SELECT l.id,l.name,l.provider_type,l.root_cid,l.webdav_account_id,coalesce(w.name,''),l.root_path,
- l.enabled,l.one_shot,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
+ l.enabled,l.one_shot,l.oneshots_directory,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
  l.created_at,l.updated_at,
  l.last_scan_started_at,l.last_scan_completed_at,l.last_scan_status,l.last_scan_error
 FROM libraries l
@@ -274,7 +274,7 @@ LEFT JOIN libraries up ON up.id=ul.union_library_id`
 		if err := rows.Scan(
 			&item.ID, &item.Name, &item.ProviderType, &item.RootCID,
 			&item.WebDAVAccountID, &item.WebDAVAccountName, &item.RootPath,
-			&item.Enabled, &item.OneShot, &item.UnionParentID, &item.UnionParentName, &item.UnionPriority,
+			&item.Enabled, &item.OneShot, &item.OneshotsDirectory, &item.UnionParentID, &item.UnionParentName, &item.UnionPriority,
 			&item.CreatedAt, &item.UpdatedAt,
 			&item.LastScanStartedAt, &item.LastScanCompletedAt, &item.LastScanStatus, &item.LastScanError,
 		); err != nil {
@@ -298,7 +298,7 @@ LEFT JOIN libraries up ON up.id=ul.union_library_id`
 func (s *Store) Libraries(ctx context.Context, enabledOnly bool) ([]Library, error) {
 	query := `
 SELECT l.id,l.name,l.provider_type,l.root_cid,l.webdav_account_id,coalesce(w.name,''),l.root_path,
- l.enabled,l.one_shot,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
+ l.enabled,l.one_shot,l.oneshots_directory,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
  l.created_at,l.updated_at,
  l.last_scan_started_at,l.last_scan_completed_at,l.last_scan_status,l.last_scan_error,
  coalesce(sc.cnt,0),
@@ -326,7 +326,7 @@ LEFT JOIN (SELECT library_id, count(*) AS cnt, coalesce(sum(size),0) AS bytes FR
 		if err := rows.Scan(
 			&item.ID, &item.Name, &item.ProviderType, &item.RootCID,
 			&item.WebDAVAccountID, &item.WebDAVAccountName, &item.RootPath,
-			&item.Enabled, &item.OneShot, &item.UnionParentID, &item.UnionParentName, &item.UnionPriority,
+			&item.Enabled, &item.OneShot, &item.OneshotsDirectory, &item.UnionParentID, &item.UnionParentName, &item.UnionPriority,
 			&item.CreatedAt, &item.UpdatedAt,
 			&item.LastScanStartedAt, &item.LastScanCompletedAt, &item.LastScanStatus, &item.LastScanError,
 			&item.SeriesCount, &item.BookCount, &item.ComicBytes,
@@ -436,7 +436,7 @@ func (s *Store) Library(ctx context.Context, id string) (Library, error) {
 	var item Library
 	err := s.db.QueryRowContext(ctx, `
 SELECT l.id,l.name,l.provider_type,l.root_cid,l.webdav_account_id,coalesce(w.name,''),l.root_path,
- l.enabled,l.one_shot,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
+ l.enabled,l.one_shot,l.oneshots_directory,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
  l.created_at,l.updated_at,
  l.last_scan_started_at,l.last_scan_completed_at,l.last_scan_status,l.last_scan_error,
  (SELECT count(*) FROM series s WHERE s.library_id=l.id),
@@ -449,7 +449,7 @@ LEFT JOIN libraries up ON up.id=ul.union_library_id
 WHERE l.id=?`, id).Scan(
 		&item.ID, &item.Name, &item.ProviderType, &item.RootCID,
 		&item.WebDAVAccountID, &item.WebDAVAccountName, &item.RootPath,
-		&item.Enabled, &item.OneShot, &item.UnionParentID, &item.UnionParentName, &item.UnionPriority,
+		&item.Enabled, &item.OneShot, &item.OneshotsDirectory, &item.UnionParentID, &item.UnionParentName, &item.UnionPriority,
 		&item.CreatedAt, &item.UpdatedAt,
 		&item.LastScanStartedAt, &item.LastScanCompletedAt, &item.LastScanStatus, &item.LastScanError,
 		&item.SeriesCount, &item.BookCount, &item.ComicBytes,
@@ -473,7 +473,7 @@ func (s *Store) LibraryBasic(ctx context.Context, id string) (Library, error) {
 	var item Library
 	err := s.db.QueryRowContext(ctx, `
 SELECT l.id,l.name,l.provider_type,l.root_cid,l.webdav_account_id,coalesce(w.name,''),l.root_path,
- l.enabled,l.one_shot,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
+ l.enabled,l.one_shot,l.oneshots_directory,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
  l.created_at,l.updated_at,
  l.last_scan_started_at,l.last_scan_completed_at,l.last_scan_status,l.last_scan_error
 FROM libraries l
@@ -483,7 +483,7 @@ LEFT JOIN libraries up ON up.id=ul.union_library_id
 WHERE l.id=?`, id).Scan(
 		&item.ID, &item.Name, &item.ProviderType, &item.RootCID,
 		&item.WebDAVAccountID, &item.WebDAVAccountName, &item.RootPath,
-		&item.Enabled, &item.OneShot, &item.UnionParentID, &item.UnionParentName, &item.UnionPriority,
+		&item.Enabled, &item.OneShot, &item.OneshotsDirectory, &item.UnionParentID, &item.UnionParentName, &item.UnionPriority,
 		&item.CreatedAt, &item.UpdatedAt,
 		&item.LastScanStartedAt, &item.LastScanCompletedAt, &item.LastScanStatus, &item.LastScanError,
 	)
@@ -507,8 +507,8 @@ func (s *Store) UpsertLibrary(ctx context.Context, item Library) error {
 	webdavAccountID := strings.TrimSpace(item.WebDAVAccountID)
 	const upsertSQL = `
 INSERT INTO libraries(
- id,name,provider_type,root_cid,webdav_account_id,root_path,enabled,one_shot,created_at,updated_at
-) VALUES(?,?,?,?,?,?,?,?,?,?)
+ id,name,provider_type,root_cid,webdav_account_id,root_path,enabled,one_shot,oneshots_directory,created_at,updated_at
+) VALUES(?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
  name=excluded.name,
  provider_type=excluded.provider_type,
@@ -517,6 +517,7 @@ ON CONFLICT(id) DO UPDATE SET
  root_path=excluded.root_path,
  enabled=excluded.enabled,
  one_shot=excluded.one_shot,
+ oneshots_directory=excluded.oneshots_directory,
  updated_at=excluded.updated_at`
 	if provider == ProviderWebDAV {
 		conn, err := s.db.Conn(ctx)
@@ -543,7 +544,7 @@ ON CONFLICT(id) DO UPDATE SET
 		if _, err := conn.ExecContext(ctx, upsertSQL,
 			item.ID, strings.TrimSpace(item.Name), provider, strings.TrimSpace(item.RootCID),
 			webdavAccountID, strings.TrimSpace(item.RootPath),
-			item.Enabled, item.OneShot, now, now); err != nil {
+			item.Enabled, item.OneShot, strings.TrimSpace(item.OneshotsDirectory), now, now); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
@@ -555,7 +556,7 @@ ON CONFLICT(id) DO UPDATE SET
 	_, err := s.db.ExecContext(ctx, upsertSQL,
 		item.ID, strings.TrimSpace(item.Name), provider, strings.TrimSpace(item.RootCID),
 		webdavAccountID, strings.TrimSpace(item.RootPath),
-		item.Enabled, item.OneShot, now, now)
+		item.Enabled, item.OneShot, strings.TrimSpace(item.OneshotsDirectory), now, now)
 	return err
 }
 

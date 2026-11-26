@@ -123,6 +123,7 @@ type Library struct {
 	RootPath            string       `json:"rootPath,omitempty"`
 	Enabled             bool         `json:"enabled"`
 	OneShot             bool         `json:"oneShot"`
+	OneshotsDirectory   string       `json:"oneshotsDirectory"`
 	UnionParentID       string       `json:"unionParentId,omitempty"`
 	UnionParentName     string       `json:"unionParentName,omitempty"`
 	UnionPriority       int          `json:"unionPriority,omitempty"`
@@ -148,16 +149,21 @@ func (l Library) EffectiveProvider() string {
 }
 
 type Series struct {
-	ID             string
-	LibraryID      string
-	CID            string
-	Name           string
-	RelativePath   string
-	OneShot        bool
-	FileModifiedAt *time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	BooksCount     int
+	ID              string
+	LibraryID       string
+	CID             string
+	Name            string
+	RelativePath    string
+	OneShot         bool
+	OneShotOverride bool
+	FileModifiedAt  *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	BooksCount      int
+}
+
+func (s Series) EffectiveOneShot() bool {
+	return s.OneShot || (s.OneShotOverride && s.BooksCount == 1)
 }
 
 type Author struct {
@@ -169,6 +175,9 @@ type WebLink struct {
 	Label string `json:"label"`
 	URL   string `json:"url"`
 }
+
+// Link is the Komga metadata link representation.
+type Link = WebLink
 
 type AlternateTitle struct {
 	Label string `json:"label"`

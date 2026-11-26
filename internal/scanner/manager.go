@@ -346,25 +346,9 @@ UPDATE libraries SET last_scan_status='running',last_scan_started_at=?,last_scan
 		CorrelationID: item.runID,
 		Meta:          map[string]any{"provider": provider},
 	})
-	conversion, err := m.needsModeConversion(ctx, item)
-	if err != nil {
-		diagnostics.Default().Record(diagnostics.Event{
-			Level:         diagnostics.LevelError,
-			Component:     "scanner",
-			Stage:         "scan_done",
-			Action:        "mode_check",
-			Code:          diagnostics.ClassifyError(err),
-			DurationMs:    time.Since(startedAt).Milliseconds(),
-			CorrelationID: item.runID,
-			Detail:        err.Error(),
-			Meta:          map[string]any{"provider": provider},
-		})
-		m.finish(item, "failed", counters{}, err.Error())
-		return
-	}
-	counts, err := m.scan(ctx, item, conversion)
+	counts, err := m.scan(ctx, item)
 	if errors.Is(err, context.Canceled) {
-		m.discardStaging(item, conversion)
+		m.discardStaging(item)
 		diagnostics.Default().Record(diagnostics.Event{
 			Level:         diagnostics.LevelWarn,
 			Component:     "scanner",
@@ -379,7 +363,7 @@ UPDATE libraries SET last_scan_status='running',last_scan_started_at=?,last_scan
 		return
 	}
 	if err != nil {
-		m.discardStaging(item, conversion)
+		m.discardStaging(item)
 		m.logger.Error("scan failed", "run", item.runID, "library", item.library.Name, "error", err)
 		diagnostics.Default().Record(diagnostics.Event{
 			Level:         diagnostics.LevelError,
@@ -395,8 +379,12 @@ UPDATE libraries SET last_scan_status='running',last_scan_started_at=?,last_scan
 		m.finish(item, "failed", counts, err.Error())
 		return
 	}
-	if err := m.commitSuccessfulScan(context.Background(), item, conversion); err != nil {
-		m.discardStaging(item, conversion)
+	if err := m.store.CommitLibraryScan(ctx, item.library.ID, item.runID); err != nil {
+		m.discardStaging(item)
+		if errors.Is(err, context.Canceled) {
+			m.finish(item, "canceled", counts, "scan canceled")
+			return
+		}
 		diagnostics.Default().Record(diagnostics.Event{
 			Level:         diagnostics.LevelError,
 			Component:     "scanner",
@@ -425,18 +413,18 @@ UPDATE libraries SET last_scan_status='running',last_scan_started_at=?,last_scan
 		"directories", counts.directories, "files", counts.files, "series", counts.series, "books", counts.books)
 }
 
-func (m *Manager) scan(ctx context.Context, item job, stage bool) (counters, error) {
+func (m *Manager) scan(ctx context.Context, item job) (counters, error) {
 	switch item.library.EffectiveProvider() {
 	case database.ProviderLocal:
-		return m.scanLocal(ctx, item, stage)
+		return m.scanLocal(ctx, item)
 	case database.ProviderWebDAV:
-		return m.scanWebDAV(ctx, item, stage)
+		return m.scanWebDAV(ctx, item)
 	default:
-		return m.scan115(ctx, item, stage)
+		return m.scan115(ctx, item)
 	}
 }
 
-func (m *Manager) scan115(ctx context.Context, item job, stage bool) (counters, error) {
+func (m *Manager) scan115(ctx context.Context, item job) (counters, error) {
 	rootInfo, err := m.client.FolderInfo(ctx, item.library.RootCID)
 	if err != nil {
 		return counters{}, fmt.Errorf("read root folder: %w", err)
@@ -467,7 +455,9 @@ func (m *Manager) scan115(ctx context.Context, item job, stage bool) (counters, 
 		}
 		if current.CID == item.library.RootCID && len(files) == 0 {
 			var existingBooks int64
-			_ = m.store.DB().QueryRowContext(ctx, `SELECT count(*) FROM books WHERE library_id=?`, item.library.ID).Scan(&existingBooks)
+			if err := m.store.DB().QueryRowContext(ctx, `SELECT count(*) FROM books WHERE library_id=?`, item.library.ID).Scan(&existingBooks); err != nil {
+				return counts, err
+			}
 			if existingBooks > 0 {
 				return counts, fmt.Errorf("115 library root appears empty (0 entries) while %d books exist in database; refusing to wipe catalog (check 115 account auth or directory status)", existingBooks)
 			}
@@ -497,14 +487,14 @@ func (m *Manager) scan115(ctx context.Context, item job, stage bool) (counters, 
 				comics = append(comics, file)
 			}
 		}
-		if err := m.persistDirComics(ctx, item, current, comics, stage, &counts); err != nil {
+		if err := m.persistDirComics(ctx, item, current, comics, &counts); err != nil {
 			return counts, err
 		}
 	}
 	return counts, nil
 }
 
-func (m *Manager) scanLocal(ctx context.Context, item job, stage bool) (counters, error) {
+func (m *Manager) scanLocal(ctx context.Context, item job) (counters, error) {
 	rootClean, err := localfs.CleanRoot(item.library.RootPath)
 	if err != nil {
 		return counters{}, fmt.Errorf("local library root: %w", err)
@@ -541,7 +531,9 @@ func (m *Manager) scanLocal(ctx context.Context, item job, stage bool) (counters
 		}
 		if current.CID == "." && len(entries) == 0 {
 			var existingBooks int64
-			_ = m.store.DB().QueryRowContext(ctx, `SELECT count(*) FROM books WHERE library_id=?`, item.library.ID).Scan(&existingBooks)
+			if err := m.store.DB().QueryRowContext(ctx, `SELECT count(*) FROM books WHERE library_id=?`, item.library.ID).Scan(&existingBooks); err != nil {
+				return counts, err
+			}
 			if existingBooks > 0 {
 				return counts, fmt.Errorf("local library root appears empty (0 entries) while %d books exist in database; refusing to wipe catalog (check source availability or directory permission)", existingBooks)
 			}
@@ -581,14 +573,14 @@ func (m *Manager) scanLocal(ctx context.Context, item job, stage bool) (counters
 				})
 			}
 		}
-		if err := m.persistDirComics(ctx, item, current, comics, stage, &counts); err != nil {
+		if err := m.persistDirComics(ctx, item, current, comics, &counts); err != nil {
 			return counts, err
 		}
 	}
 	return counts, nil
 }
 
-func (m *Manager) scanWebDAV(ctx context.Context, item job, stage bool) (counters, error) {
+func (m *Manager) scanWebDAV(ctx context.Context, item job) (counters, error) {
 	if m.webdav == nil {
 		m.webdav = webdav.NewManager()
 	}
@@ -621,7 +613,9 @@ func (m *Manager) scanWebDAV(ctx context.Context, item job, stage bool) (counter
 		}
 		if current.CID == "." && len(entries) == 0 {
 			var existingBooks int64
-			_ = m.store.DB().QueryRowContext(ctx, `SELECT count(*) FROM books WHERE library_id=?`, item.library.ID).Scan(&existingBooks)
+			if err := m.store.DB().QueryRowContext(ctx, `SELECT count(*) FROM books WHERE library_id=?`, item.library.ID).Scan(&existingBooks); err != nil {
+				return counts, err
+			}
 			if existingBooks > 0 {
 				return counts, fmt.Errorf("WebDAV library root appears empty (0 entries) while %d books exist in database; refusing to wipe catalog (check WebDAV source availability)", existingBooks)
 			}
@@ -651,7 +645,7 @@ func (m *Manager) scanWebDAV(ctx context.Context, item job, stage bool) (counter
 				})
 			}
 		}
-		if err := m.persistDirComics(ctx, item, current, comics, stage, &counts); err != nil {
+		if err := m.persistDirComics(ctx, item, current, comics, &counts); err != nil {
 			return counts, err
 		}
 	}
@@ -663,7 +657,6 @@ func (m *Manager) persistDirComics(
 	item job,
 	current queueDir,
 	comics []oneonefive.File,
-	stage bool,
 	counts *counters,
 ) error {
 	if len(comics) > 0 {
@@ -676,14 +669,15 @@ func (m *Manager) persistDirComics(
 			}
 			return strings.Compare(a.ID, b.ID)
 		})
-		if item.library.OneShot {
-			if err := m.saveOneShots(ctx, item, current, comics, stage); err != nil {
+		_, relativeDir, _ := strings.Cut(current.RelativePath, "/")
+		if item.library.OneShot || matchesOneshotsDirectory(relativeDir, item.library.OneshotsDirectory) {
+			if err := m.saveOneShots(ctx, item, current, comics); err != nil {
 				return err
 			}
 			counts.series += int64(len(comics))
 			counts.books += int64(len(comics))
 		} else {
-			if err := m.saveSeries(ctx, item, current, comics, stage); err != nil {
+			if err := m.saveSeries(ctx, item, current, comics); err != nil {
 				return err
 			}
 			counts.series++
@@ -698,7 +692,6 @@ func (m *Manager) saveSeries(
 	item job,
 	dir queueDir,
 	files []oneonefive.File,
-	stage bool,
 ) error {
 	return m.saveScannedSeries(ctx, item, scannedSeries{
 		ID:           id.Series(item.library.ID, dir.CID),
@@ -709,17 +702,21 @@ func (m *Manager) saveSeries(
 		OneShot:      false,
 		ParentCID:    dir.CID,
 		Files:        files,
-	}, stage)
+	})
 }
 
-func (m *Manager) saveOneShot(
-	ctx context.Context,
-	item job,
-	dir queueDir,
-	file oneonefive.File,
-	stage bool,
-) error {
-	return m.saveScannedSeries(ctx, item, oneShotSeries(item, dir, file), stage)
+func matchesOneshotsDirectory(relDir, configuredDir string) bool {
+	configuredDir = strings.TrimSpace(configuredDir)
+	if configuredDir == "" {
+		return false
+	}
+	relDir = strings.ReplaceAll(relDir, "\\", "/")
+	for _, segment := range strings.Split(relDir, "/") {
+		if strings.EqualFold(segment, configuredDir) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) saveOneShots(
@@ -727,7 +724,6 @@ func (m *Manager) saveOneShots(
 	item job,
 	dir queueDir,
 	files []oneonefive.File,
-	stage bool,
 ) error {
 	tx, err := m.store.DB().BeginTx(ctx, nil)
 	if err != nil {
@@ -735,7 +731,7 @@ func (m *Manager) saveOneShots(
 	}
 	defer tx.Rollback()
 	for _, file := range files {
-		if err := m.saveScannedSeriesTx(ctx, tx, item, oneShotSeries(item, dir, file), stage); err != nil {
+		if err := m.saveScannedSeriesTx(ctx, tx, item, oneShotSeries(item, dir, file)); err != nil {
 			return err
 		}
 	}
@@ -770,14 +766,13 @@ func (m *Manager) saveScannedSeries(
 	ctx context.Context,
 	item job,
 	series scannedSeries,
-	stage bool,
 ) error {
 	tx, err := m.store.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := m.saveScannedSeriesTx(ctx, tx, item, series, stage); err != nil {
+	if err := m.saveScannedSeriesTx(ctx, tx, item, series); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -788,41 +783,24 @@ func (m *Manager) saveScannedSeriesTx(
 	tx *sql.Tx,
 	item job,
 	series scannedSeries,
-	stage bool,
 ) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	modified := series.ModifiedAt.UTC().Format(time.RFC3339Nano)
-	var err error
-	if stage {
-		_, err = tx.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 INSERT INTO scan_series_staging(
  run_id,id,library_id,cid,name,relative_path,one_shot,file_modified_at,created_at,updated_at
 ) VALUES(?,?,?,?,?,?,?,?,?,?)
-ON CONFLICT(run_id,library_id,cid) DO UPDATE SET
- name=excluded.name,relative_path=excluded.relative_path,
- one_shot=excluded.one_shot,file_modified_at=excluded.file_modified_at,
- updated_at=excluded.updated_at`,
-			item.runID, series.ID, item.library.ID, series.CID, series.Name, series.RelativePath,
-			series.OneShot, modified, now, now)
-	} else {
-		_, err = tx.ExecContext(ctx, `
-INSERT INTO series(
- id,library_id,cid,name,relative_path,one_shot,file_modified_at,created_at,updated_at,seen_scan_id
-) VALUES(?,?,?,?,?,?,?,?,?,?)
-ON CONFLICT(library_id,cid) DO UPDATE SET
- name=excluded.name,relative_path=excluded.relative_path,
- one_shot=excluded.one_shot,file_modified_at=excluded.file_modified_at,
- updated_at=excluded.updated_at,seen_scan_id=excluded.seen_scan_id`,
-			series.ID, item.library.ID, series.CID, series.Name, series.RelativePath,
-			series.OneShot, modified, now, now, item.runID)
-	}
+ON CONFLICT(run_id,id) DO UPDATE SET
+ name=excluded.name,relative_path=excluded.relative_path,one_shot=excluded.one_shot,
+ file_modified_at=excluded.file_modified_at,updated_at=excluded.updated_at`,
+		item.runID, series.ID, item.library.ID, series.CID, series.Name, series.RelativePath,
+		series.OneShot, modified, now, now)
 	if err != nil {
 		return err
 	}
 	for index, file := range series.Files {
 		bookID := id.Book(item.library.ID, file.ID)
-		if stage {
-			_, err = tx.ExecContext(ctx, `
+		_, err = tx.ExecContext(ctx, `
 INSERT INTO scan_books_staging(
  run_id,id,series_id,library_id,file_id,parent_cid,name,size,pick_code,sha1,
  file_created_at,file_modified_at,number_sort,created_at,updated_at
@@ -832,26 +810,10 @@ ON CONFLICT(run_id,library_id,file_id) DO UPDATE SET
  name=excluded.name,size=excluded.size,pick_code=excluded.pick_code,sha1=excluded.sha1,
  file_created_at=excluded.file_created_at,file_modified_at=excluded.file_modified_at,
  number_sort=excluded.number_sort,updated_at=excluded.updated_at`,
-				item.runID, bookID, series.ID, item.library.ID, file.ID, series.ParentCID,
-				file.Name, file.Size, file.PickCode, file.SHA1,
-				file.CreatedAt.UTC().Format(time.RFC3339Nano), file.ModifiedAt.UTC().Format(time.RFC3339Nano),
-				float64(index+1), now, now)
-		} else {
-			_, err = tx.ExecContext(ctx, `
-INSERT INTO books(
- id,series_id,library_id,file_id,parent_cid,name,size,pick_code,sha1,
- file_created_at,file_modified_at,number_sort,created_at,updated_at,seen_scan_id
-) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-ON CONFLICT(library_id,file_id) DO UPDATE SET
- series_id=excluded.series_id,library_id=excluded.library_id,parent_cid=excluded.parent_cid,
- name=excluded.name,size=excluded.size,pick_code=excluded.pick_code,sha1=excluded.sha1,
- file_created_at=excluded.file_created_at,file_modified_at=excluded.file_modified_at,
- number_sort=excluded.number_sort,updated_at=excluded.updated_at,seen_scan_id=excluded.seen_scan_id`,
-				bookID, series.ID, item.library.ID, file.ID, series.ParentCID,
-				file.Name, file.Size, file.PickCode, file.SHA1,
-				file.CreatedAt.UTC().Format(time.RFC3339Nano), file.ModifiedAt.UTC().Format(time.RFC3339Nano),
-				float64(index+1), now, now, item.runID)
-		}
+			item.runID, bookID, series.ID, item.library.ID, file.ID, series.ParentCID,
+			file.Name, file.Size, file.PickCode, file.SHA1,
+			file.CreatedAt.UTC().Format(time.RFC3339Nano), file.ModifiedAt.UTC().Format(time.RFC3339Nano),
+			float64(index+1), now, now)
 		if err != nil {
 			return err
 		}
@@ -874,72 +836,11 @@ WHERE id=? AND cancel_requested=0`,
 	return nil
 }
 
-func (m *Manager) needsModeConversion(ctx context.Context, item job) (bool, error) {
-	var opposite int
-	err := m.store.DB().QueryRowContext(ctx,
-		`SELECT count(*) FROM series WHERE library_id=? AND one_shot<>?`,
-		item.library.ID, item.library.OneShot,
-	).Scan(&opposite)
-	return opposite > 0, err
-}
-
-func (m *Manager) discardStaging(item job, staged bool) {
-	if !staged {
-		return
-	}
+func (m *Manager) discardStaging(item job) {
 	_, _ = m.store.DB().ExecContext(context.Background(),
 		`DELETE FROM scan_books_staging WHERE run_id=?`, item.runID)
 	_, _ = m.store.DB().ExecContext(context.Background(),
 		`DELETE FROM scan_series_staging WHERE run_id=?`, item.runID)
-}
-
-func (m *Manager) commitSuccessfulScan(ctx context.Context, item job, staged bool) error {
-	tx, err := m.store.DB().BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if staged {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM series WHERE library_id=?`, item.library.ID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO series(
- id,library_id,cid,name,relative_path,one_shot,file_modified_at,created_at,updated_at,seen_scan_id
-)
-SELECT id,library_id,cid,name,relative_path,one_shot,file_modified_at,created_at,updated_at,?
-FROM scan_series_staging WHERE run_id=?`, item.runID, item.runID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO books(
- id,series_id,library_id,file_id,parent_cid,name,size,pick_code,sha1,
- file_created_at,file_modified_at,number_sort,created_at,updated_at,seen_scan_id
-)
-SELECT id,series_id,library_id,file_id,parent_cid,name,size,pick_code,sha1,
- file_created_at,file_modified_at,number_sort,created_at,updated_at,?
-FROM scan_books_staging WHERE run_id=?`, item.runID, item.runID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM scan_books_staging WHERE run_id=?`, item.runID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM scan_series_staging WHERE run_id=?`, item.runID); err != nil {
-			return err
-		}
-		return tx.Commit()
-	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM books WHERE library_id=? AND seen_scan_id<>?`, item.library.ID, item.runID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM series WHERE library_id=? AND seen_scan_id<>?`, item.library.ID, item.runID); err != nil {
-		return err
-	}
-	return tx.Commit()
 }
 
 func (m *Manager) finish(item job, status string, counts counters, message string) {

@@ -33,7 +33,28 @@ func ensureUserHiddenLibraries(db *sql.DB) error {
 	return tx.Commit()
 }
 
+func ensureBookMetadataSchema(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := addColumnIfMissingTx(tx, "libraries", "oneshots_directory", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissingTx(tx, "series", "one_shot_override", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(bookMetadataSchema); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func applyMigrations(db *sql.DB) error {
+	if err := ensureBookMetadataSchema(db); err != nil {
+		return err
+	}
 	if err := ensureClientSettingsTable(db); err != nil {
 		return err
 	}

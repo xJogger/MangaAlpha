@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/xJogger/fake-komga-115/internal/database"
+	"github.com/xJogger/fake-komga-115/internal/id"
 )
 
 func (s *Server) webStyles(w http.ResponseWriter, _ *http.Request) {
@@ -60,7 +61,7 @@ func (s *Server) renderWeb(w http.ResponseWriter, status int, name string, data 
 }
 
 func webBookPath(series database.Series, book database.Book) string {
-	if series.OneShot {
+	if series.CID == id.OneShotCID(book.FileID) || (series.CID == "" && path.Base(series.RelativePath) == book.Name) {
 		return series.RelativePath
 	}
 	return path.Join(series.RelativePath, book.Name)

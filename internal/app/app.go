@@ -150,7 +150,7 @@ func New(_ context.Context, options Options) (*App, error) {
 	var metadataManager *extmeta.Manager
 	if err == nil {
 		metadataManager, err = extmeta.NewManager(store, bangumiService, externalCovers, dataDir, options.Logger, extmeta.ManagerOptions{
-			ProxyURLProvider: proxyURLProvider, ArchiveMetaReader: extmeta.LocalArchiveMetaReader(store),
+			ProxyURLProvider: proxyURLProvider,
 		})
 	}
 	if err != nil {
@@ -162,10 +162,6 @@ func New(_ context.Context, options Options) (*App, error) {
 	}
 	thumbnailService.SetExternalCoverFetcher(metadataManager.FetchCover)
 	thumbnailService.SetNSFWFallbackCoverFetcher(metadataManager.FetchFallbackNSFWCover, metadataManager.InvalidateFallbackCoverCache)
-	thumbnailService.SetLocalFirstPageFetcher(func(ctx context.Context, book database.Book) ([]byte, error) {
-		page, err := archiveService.ReadPage(ctx, book, 1)
-		return page.Data, err
-	})
 	metadataManager.StartScheduler()
 
 	coverManager := thumbnail.NewBatchManager(

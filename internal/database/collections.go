@@ -430,7 +430,7 @@ func (s *Store) CollectionSeriesPage(
 		}
 	}
 	query := `
-SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.file_modified_at,s.created_at,s.updated_at,s.books_count` +
+SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.one_shot_override,s.file_modified_at,s.created_at,s.updated_at,s.books_count` +
 		from + where + ` ORDER BY ` + order
 	qArgs := append([]any(nil), colArgs...)
 	if !unpaged {

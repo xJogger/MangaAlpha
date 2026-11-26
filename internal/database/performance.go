@@ -146,14 +146,14 @@ func (s *Store) RecordBookDownload(
 	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO book_download_stats(book_id,series_id,bytes,duration_ns,samples,updated_at)
-VALUES(?,?,?,?,1,?)
+SELECT id,series_id,?,?,1,? FROM books WHERE id=?
 ON CONFLICT(book_id) DO UPDATE SET
  series_id=excluded.series_id,
  bytes=book_download_stats.bytes+excluded.bytes,
  duration_ns=book_download_stats.duration_ns+excluded.duration_ns,
  samples=book_download_stats.samples+1,
  updated_at=excluded.updated_at`,
-		book.ID, book.SeriesID, bytes, maxDurationNS(duration), nowText())
+		bytes, maxDurationNS(duration), nowText(), book.ID)
 	return err
 }
 

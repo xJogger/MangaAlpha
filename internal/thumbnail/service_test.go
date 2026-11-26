@@ -466,3 +466,39 @@ VALUES(?,?,1,'bangumi','')`, id, subject); err != nil {
 	get(scope("reader-b"), 4, 16, "image/png") // reader-b still cooling down
 	get(ctx, 4, 17, "image/png")               // reader-a retries Bangumi after per-user reset
 }
+
+func TestExternalCoverFailureOnlyUsesCachedFirstPage(t *testing.T) {
+	store, first, _ := thumbnailTestStore(t)
+	ctx := t.Context()
+	if _, err := store.DB().ExecContext(ctx, `UPDATE libraries SET provider_type='local' WHERE id=?`, first.LibraryID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO series_metadata(series_id,ext_source_id,ext_entry_id,ext_cover_url,updated_at)
+VALUES(?,'offline','entry','https://example.test/cover',?)`, first.SeriesID, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(store, filepath.Join(t.TempDir(), "thumbnails", "series"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var externalCalls, pageCalls int
+	service.SetExternalCoverFetcher(func(context.Context, string, string, string) ([]byte, string, error) {
+		externalCalls++
+		return nil, "", errors.New("fixture missing cover")
+	})
+	service.SetLocalFirstPageFetcher(func(context.Context, database.Book) ([]byte, error) {
+		pageCalls++
+		return testPNG(t, 24, 24), nil
+	})
+	if _, ok, err := service.Get(ctx, first.SeriesID); err != nil || ok || externalCalls != 1 || pageCalls != 0 {
+		t.Fatalf("uncached fallback ok=%t err=%v external=%d archive=%d", ok, err, externalCalls, pageCalls)
+	}
+	if err := service.Generate(ctx, first, testPNG(t, 24, 24)); err != nil {
+		t.Fatal(err)
+	}
+	data, ok, err := service.Get(ctx, first.SeriesID)
+	if err != nil || !ok || data.MediaType != "image/jpeg" || externalCalls != 2 || pageCalls != 0 {
+		t.Fatalf("cached fallback ok=%t err=%v external=%d archive=%d", ok, err, externalCalls, pageCalls)
+	}
+}

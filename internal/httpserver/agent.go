@@ -176,6 +176,7 @@ func (s *Server) agentListLibraries(w http.ResponseWriter, r *http.Request) {
 			"enabled":             lib.Enabled,
 			"hidden":              !lib.Enabled,
 			"oneShot":             lib.OneShot,
+			"oneshotsDirectory":   lib.OneshotsDirectory,
 			"seriesCount":         lib.SeriesCount,
 			"bookCount":           lib.BookCount,
 			"comicBytes":          lib.ComicBytes,
@@ -199,10 +200,11 @@ func (s *Server) agentPatchLibrary(w http.ResponseWriter, r *http.Request) {
 	}
 	wasEnabled := item.Enabled
 	var req struct {
-		Name    *string `json:"name"`
-		Enabled *bool   `json:"enabled"`
-		Hidden  *bool   `json:"hidden"`
-		OneShot *bool   `json:"oneShot"`
+		Name              *string `json:"name"`
+		Enabled           *bool   `json:"enabled"`
+		Hidden            *bool   `json:"hidden"`
+		OneShot           *bool   `json:"oneShot"`
+		OneshotsDirectory *string `json:"oneshotsDirectory"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -221,7 +223,8 @@ func (s *Server) agentPatchLibrary(w http.ResponseWriter, r *http.Request) {
 	if req.Enabled != nil {
 		item.Enabled = *req.Enabled
 	}
-	if req.OneShot != nil && *req.OneShot != item.OneShot {
+	if (req.OneShot != nil && *req.OneShot != item.OneShot) ||
+		(req.OneshotsDirectory != nil && strings.TrimSpace(*req.OneshotsDirectory) != item.OneshotsDirectory) {
 		var active int
 		if err := s.store.DB().QueryRowContext(r.Context(),
 			`SELECT count(*) FROM scan_runs WHERE library_id=? AND status IN ('queued','running')`,
@@ -233,7 +236,12 @@ func (s *Server) agentPatchLibrary(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "SCAN_ACTIVE", "Cancel the active scan before changing oneShot mode.")
 			return
 		}
-		item.OneShot = *req.OneShot
+		if req.OneShot != nil {
+			item.OneShot = *req.OneShot
+		}
+		if req.OneshotsDirectory != nil {
+			item.OneshotsDirectory = strings.TrimSpace(*req.OneshotsDirectory)
+		}
 	}
 	if err := s.store.UpsertLibrary(r.Context(), item); err != nil {
 		s.writeDBError(w, r, err)
@@ -328,7 +336,7 @@ func (s *Server) agentListSeries(w http.ResponseWriter, r *http.Request) {
 			"relativePath":     item.RelativePath,
 			"title":            title,
 			"booksCount":       item.BooksCount,
-			"oneShot":          item.OneShot,
+			"oneShot":          item.EffectiveOneShot(),
 			"scrapeStatus":     scrapeSt,
 			"scrapeConfidence": meta.ScrapeConfidence,
 			"bgmSubjectId":     meta.BgmSubjectID,
@@ -405,7 +413,7 @@ ORDER BY b.number_sort ASC,b.name COLLATE NOCASE ASC,b.id ASC`, series.ID)
 		"libraryHidden": !lib.Enabled,
 		"folderName":    series.Name,
 		"relativePath":  series.RelativePath,
-		"oneShot":       series.OneShot,
+		"oneShot":       series.EffectiveOneShot(),
 		"booksCount":    series.BooksCount,
 		"progress":      progress,
 		"metadata":      meta,

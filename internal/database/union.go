@@ -14,10 +14,9 @@ import (
 )
 
 var (
-	ErrInvalidUnionMembers  = errors.New("union library requires at least one physical member library")
-	ErrUnionNestedMember    = errors.New("a union library cannot include another union library")
-	ErrUnionMemberOwned     = errors.New("a member library is already enrolled in another union library")
-	ErrUnionOneShotMismatch = errors.New("all member libraries of a union library must have the same One-Shot mode")
+	ErrInvalidUnionMembers = errors.New("union library requires at least one physical member library")
+	ErrUnionNestedMember   = errors.New("a union library cannot include another union library")
+	ErrUnionMemberOwned    = errors.New("a member library is already enrolled in another union library")
 )
 
 // NormalizeUnionSeriesPath strips the library's own root folder name (the first path segment
@@ -50,8 +49,8 @@ func (s *Store) validateUnionMembers(ctx context.Context, unionID string, member
 		return nil, false, ErrInvalidUnionMembers
 	}
 	members := make([]Library, 0, len(cleanIDs))
-	var oneShot bool
-	for idx, mid := range cleanIDs {
+	oneShot := true
+	for _, mid := range cleanIDs {
 		lib, err := s.LibraryBasic(ctx, mid)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -65,11 +64,7 @@ func (s *Store) validateUnionMembers(ctx context.Context, unionID string, member
 		if lib.UnionParentID != "" && lib.UnionParentID != unionID {
 			return nil, false, fmt.Errorf("%w: %s (already in %s)", ErrUnionMemberOwned, lib.Name, lib.UnionParentName)
 		}
-		if idx == 0 {
-			oneShot = lib.OneShot
-		} else if lib.OneShot != oneShot {
-			return nil, false, ErrUnionOneShotMismatch
-		}
+		oneShot = oneShot && lib.OneShot
 		members = append(members, lib)
 	}
 	return members, oneShot, nil
@@ -225,7 +220,7 @@ type unionPhysSeries struct {
 	Priority       int
 	Name           string
 	RelativePath   string
-	OneShot        bool
+	Shape          Series
 	FileModifiedAt sql.NullString
 }
 
@@ -262,6 +257,7 @@ type unionMergedSeries struct {
 	Name                 string
 	RelativePath         string
 	OneShot              bool
+	OneShotOverride      bool
 	FileModifiedAt       sql.NullString
 	BooksCount           int
 	LatestBookModifiedAt sql.NullString
@@ -281,6 +277,7 @@ type existingUnionSeries struct {
 	Name                 string
 	RelativePath         string
 	OneShot              bool
+	OneShotOverride      bool
 	FileModifiedAt       sql.NullString
 	BooksCount           int
 	LatestBookModifiedAt sql.NullString
@@ -463,7 +460,7 @@ func (s *Store) RefreshUnionLibrary(ctx context.Context, unionLibraryID string) 
 
 	if len(unionLib.UnionLayers) > 0 {
 		sRows, err := s.db.QueryContext(ctx, `
-SELECT s.id,s.library_id,ul.priority,s.name,s.relative_path,s.one_shot,s.file_modified_at
+SELECT s.id,s.library_id,ul.priority,s.name,s.relative_path,s.one_shot,s.one_shot_override,s.books_count,s.file_modified_at
 FROM series s
 JOIN union_layers ul ON ul.member_library_id=s.library_id
 WHERE ul.union_library_id=?
@@ -473,20 +470,18 @@ ORDER BY ul.priority ASC,s.id ASC`, unionLibraryID)
 		}
 		for sRows.Next() {
 			var ps unionPhysSeries
-			var oneShotInt int
 			if err := sRows.Scan(
-				&ps.ID, &ps.LibraryID, &ps.Priority, &ps.Name, &ps.RelativePath, &oneShotInt, &ps.FileModifiedAt,
+				&ps.ID, &ps.LibraryID, &ps.Priority, &ps.Name, &ps.RelativePath,
+				&ps.Shape.OneShot, &ps.Shape.OneShotOverride, &ps.Shape.BooksCount, &ps.FileModifiedAt,
 			); err != nil {
 				sRows.Close()
 				return UnionRefreshStats{}, err
 			}
-			ps.OneShot = oneShotInt != 0
 			sKey := NormalizeUnionSeriesPath(ps.RelativePath)
-			physSeriesKey[ps.ID] = sKey
 			ms, exists := seriesMap[sKey]
 			if !exists {
 				var unionSeriesID, unionCID string
-				if unionLib.OneShot || ps.OneShot {
+				if ps.Shape.OneShot {
 					unionSeriesID = id.OneShotSeries(unionLibraryID, sKey)
 					unionCID = id.OneShotCID(sKey)
 				} else {
@@ -498,16 +493,21 @@ ORDER BY ul.priority ASC,s.id ASC`, unionLibraryID)
 					displayPath = path.Join(unionLib.Name, sKey)
 				}
 				ms = &unionMergedSeries{
-					ID:             unionSeriesID,
-					CID:            unionCID,
-					Name:           ps.Name,
-					RelativePath:   displayPath,
-					OneShot:        unionLib.OneShot || ps.OneShot,
-					FileModifiedAt: ps.FileModifiedAt,
-					BooksByKey:     make(map[string]*unionMergedBook),
+					ID:              unionSeriesID,
+					CID:             unionCID,
+					Name:            ps.Name,
+					RelativePath:    displayPath,
+					OneShot:         ps.Shape.OneShot,
+					OneShotOverride: !ps.Shape.OneShot && ps.Shape.EffectiveOneShot(),
+					FileModifiedAt:  ps.FileModifiedAt,
+					BooksByKey:      make(map[string]*unionMergedBook),
 				}
 				seriesMap[sKey] = ms
 			}
+			if ms.OneShot != ps.Shape.OneShot {
+				continue
+			}
+			physSeriesKey[ps.ID] = sKey
 			hasLayer := false
 			for _, existingSrc := range ms.Sources {
 				if existingSrc.Priority == ps.Priority {
@@ -529,11 +529,21 @@ ORDER BY ul.priority ASC,s.id ASC`, unionLibraryID)
 		}
 		sRows.Close()
 	}
+	for key, ms := range seriesMap {
+		if !ms.OneShot && strings.HasPrefix(key, "file:") {
+			if other := seriesMap[strings.TrimPrefix(key, "file:")]; other != nil && other.OneShot {
+				// A directory named "file:..." can coincide with a file CID.
+				// NUL cannot be part of a filesystem path.
+				ms.CID = "\x00" + key
+				ms.ID = id.Series(unionLibraryID, ms.CID)
+			}
+		}
+	}
 
 	// Load existing union series before scanning books.
 	existingSeries := make(map[string]existingUnionSeries)
 	esRows, err := s.db.QueryContext(ctx, `
-SELECT id,cid,name,relative_path,one_shot,file_modified_at,
+SELECT id,cid,name,relative_path,one_shot,one_shot_override,file_modified_at,
  books_count,latest_book_modified_at,latest_book_created_at,sort_modified_at,sort_created_at,
  created_at,updated_at
 FROM series WHERE library_id=?`, unionLibraryID)
@@ -542,16 +552,14 @@ FROM series WHERE library_id=?`, unionLibraryID)
 	}
 	for esRows.Next() {
 		var es existingUnionSeries
-		var oneShotInt int
 		if err := esRows.Scan(
-			&es.ID, &es.CID, &es.Name, &es.RelativePath, &oneShotInt, &es.FileModifiedAt,
+			&es.ID, &es.CID, &es.Name, &es.RelativePath, &es.OneShot, &es.OneShotOverride, &es.FileModifiedAt,
 			&es.BooksCount, &es.LatestBookModifiedAt, &es.LatestBookCreatedAt, &es.SortModifiedAt, &es.SortCreatedAt,
 			&es.CreatedAt, &es.UpdatedAt,
 		); err != nil {
 			esRows.Close()
 			return UnionRefreshStats{}, err
 		}
-		es.OneShot = oneShotInt != 0
 		existingSeries[es.ID] = es
 	}
 	if err := esRows.Err(); err != nil {
@@ -870,7 +878,7 @@ WHERE ub.library_id=?`, unionLibraryID)
 
 		computeUnionSeriesRollup(ms, oldS.CreatedAt, oldS.UpdatedAt)
 		seriesChanged := oldS.CID != ms.CID || oldS.Name != ms.Name || oldS.RelativePath != ms.RelativePath ||
-			oldS.OneShot != ms.OneShot || !nullStrEqual(oldS.FileModifiedAt, ms.FileModifiedAt) ||
+			oldS.OneShot != ms.OneShot || oldS.OneShotOverride != ms.OneShotOverride || !nullStrEqual(oldS.FileModifiedAt, ms.FileModifiedAt) ||
 			oldS.BooksCount != ms.BooksCount || !nullStrEqual(oldS.LatestBookModifiedAt, ms.LatestBookModifiedAt) ||
 			!nullStrEqual(oldS.LatestBookCreatedAt, ms.LatestBookCreatedAt) ||
 			oldS.SortModifiedAt != ms.SortModifiedAt || oldS.SortCreatedAt != ms.SortCreatedAt ||
@@ -913,11 +921,11 @@ WHERE ub.library_id=?`, unionLibraryID)
 	}
 
 	const insertSeriesPrefix = `INSERT INTO series(
- id,library_id,cid,name,relative_path,one_shot,file_modified_at,
+ id,library_id,cid,name,relative_path,one_shot,one_shot_override,file_modified_at,
  books_count,latest_book_modified_at,latest_book_created_at,sort_modified_at,sort_created_at,
  created_at,updated_at,seen_scan_id
 ) VALUES `
-	const insertSeriesTuple = `(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'union')`
+	const insertSeriesTuple = `(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'union')`
 	const insertBookPrefix = `INSERT INTO books(
  id,series_id,library_id,file_id,parent_cid,name,size,pick_code,sha1,
  file_created_at,file_modified_at,number_sort,created_at,updated_at,seen_scan_id
@@ -947,7 +955,7 @@ WHERE ub.library_id=?`, unionLibraryID)
 			return err
 		}
 		defer batchSStmt.Close()
-		sArgs := make([]any, 0, unionSeriesBatchRows*14)
+		sArgs := make([]any, 0, unionSeriesBatchRows*15)
 		for i := 0; i < len(bundles); {
 			end := i + unionSeriesBatchRows
 			if end > len(bundles) {
@@ -958,7 +966,7 @@ WHERE ub.library_id=?`, unionLibraryID)
 				ms := b.Series
 				sArgs = append(sArgs,
 					ms.ID, unionLibraryID, ms.CID, ms.Name, ms.RelativePath,
-					ms.OneShot, ms.FileModifiedAt,
+					ms.OneShot, ms.OneShotOverride, ms.FileModifiedAt,
 					ms.BooksCount, ms.LatestBookModifiedAt, ms.LatestBookCreatedAt,
 					ms.SortModifiedAt, ms.SortCreatedAt,
 					ms.CreatedAt, ms.UpdatedAt,
@@ -1202,7 +1210,7 @@ WHERE ub.library_id=?`, unionLibraryID)
 		if len(seriesToUpdate) > 0 {
 			stmtUpdS, err := tx.PrepareContext(ctx, `
 UPDATE series SET
- cid=?,name=?,relative_path=?,one_shot=?,file_modified_at=?,
+ cid=?,name=?,relative_path=?,one_shot=?,one_shot_override=?,file_modified_at=?,
  books_count=?,latest_book_modified_at=?,latest_book_created_at=?,
  sort_modified_at=?,sort_created_at=?,updated_at=?
 WHERE id=?`)
@@ -1211,7 +1219,7 @@ WHERE id=?`)
 			}
 			for _, ms := range seriesToUpdate {
 				if _, err := stmtUpdS.ExecContext(ctx,
-					ms.CID, ms.Name, ms.RelativePath, ms.OneShot, ms.FileModifiedAt,
+					ms.CID, ms.Name, ms.RelativePath, ms.OneShot, ms.OneShotOverride, ms.FileModifiedAt,
 					ms.BooksCount, ms.LatestBookModifiedAt, ms.LatestBookCreatedAt,
 					ms.SortModifiedAt, ms.SortCreatedAt, ms.UpdatedAt, ms.ID,
 				); err != nil {
@@ -1356,6 +1364,23 @@ SET last_scan_status='success',last_scan_completed_at=?,last_scan_error='',updat
 WHERE id=?`, now, now, unionLibraryID); err != nil {
 		return UnionRefreshStats{}, err
 	}
+	changedMode, err := tx.ExecContext(ctx, `
+UPDATE libraries SET one_shot=layers.one_shot
+FROM (
+ SELECT count(*)>0 AND min(m.one_shot)=1 AS one_shot
+ FROM union_layers ul JOIN libraries m ON m.id=ul.member_library_id
+ WHERE ul.union_library_id=?
+) layers
+WHERE libraries.id=? AND libraries.one_shot<>layers.one_shot`, unionLibraryID, unionLibraryID)
+	if err != nil {
+		return UnionRefreshStats{}, err
+	}
+
+	modeRows, err := changedMode.RowsAffected()
+	if err != nil {
+		return UnionRefreshStats{}, err
+	}
+	catalogMutated = catalogMutated || modeRows != 0
 
 	if bulkEnabled {
 		catBump, progBump := 0, 0
@@ -1894,7 +1919,7 @@ func (s *Store) LookupSeriesByBangumiSubject(ctx context.Context, subjectID int6
 	scope, hasScope := UserScopeFromContext(ctx)
 	query := `
 SELECT s.id, COALESCE(NULLIF(sm.title,''), s.name), s.name, s.library_id,
- l.name, l.provider_type, coalesce(w.name,''), s.books_count, s.one_shot,
+ l.name, l.provider_type, coalesce(w.name,''), s.books_count, ` + effectiveOneShotSQL + `,
  (SELECT count(*) FROM book_read_progress p WHERE p.user_id=? AND p.series_id=s.id AND p.completed=1)
 FROM series_metadata sm
 JOIN series s ON s.id=sm.series_id

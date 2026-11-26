@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS libraries (
   root_path TEXT NOT NULL DEFAULT '',
   enabled INTEGER NOT NULL DEFAULT 1,
   one_shot INTEGER NOT NULL DEFAULT 0,
+  oneshots_directory TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_scan_started_at TEXT,
@@ -155,6 +156,7 @@ CREATE TABLE IF NOT EXISTS series (
   name TEXT NOT NULL,
   relative_path TEXT NOT NULL,
   one_shot INTEGER NOT NULL DEFAULT 0,
+  one_shot_override INTEGER NOT NULL DEFAULT 0,
   file_modified_at TEXT,
   books_count INTEGER NOT NULL DEFAULT 0,
   latest_book_modified_at TEXT,
@@ -700,4 +702,64 @@ CREATE TABLE IF NOT EXISTS library_metadata_sources (
 );
 CREATE INDEX IF NOT EXISTS idx_lib_meta_sources_prio ON library_metadata_sources(library_id, priority);
 CREATE INDEX IF NOT EXISTS idx_lib_meta_sources_source ON library_metadata_sources(source_id);
+`
+
+const bookMetadataSchema = `
+CREATE TABLE IF NOT EXISTS book_metadata (
+  book_id TEXT PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+  title TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  number TEXT NOT NULL DEFAULT '',
+  number_sort REAL,
+  release_date TEXT NOT NULL DEFAULT '',
+  isbn TEXT NOT NULL DEFAULT '',
+  authors_json TEXT NOT NULL DEFAULT '[]',
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  links_json TEXT NOT NULL DEFAULT '[]',
+  title_lock INTEGER NOT NULL DEFAULT 0,
+  summary_lock INTEGER NOT NULL DEFAULT 0,
+  number_lock INTEGER NOT NULL DEFAULT 0,
+  number_sort_lock INTEGER NOT NULL DEFAULT 0,
+  release_date_lock INTEGER NOT NULL DEFAULT 0,
+  authors_lock INTEGER NOT NULL DEFAULT 0,
+  tags_lock INTEGER NOT NULL DEFAULT 0,
+  isbn_lock INTEGER NOT NULL DEFAULT 0,
+  links_lock INTEGER NOT NULL DEFAULT 0,
+  bgm_subject_id INTEGER NOT NULL DEFAULT 0,
+  bgm_cover_url TEXT NOT NULL DEFAULT '',
+  bgm_cover_path TEXT NOT NULL DEFAULT '',
+  bgm_is_nsfw INTEGER NOT NULL DEFAULT 0,
+  ext_source_id TEXT NOT NULL DEFAULT '',
+  ext_entry_id TEXT NOT NULL DEFAULT '',
+  ext_cover_url TEXT NOT NULL DEFAULT '',
+  ext_cover_path TEXT NOT NULL DEFAULT '',
+  custom_cover_path TEXT NOT NULL DEFAULT '',
+  custom_cover_url TEXT NOT NULL DEFAULT '',
+  cover_source TEXT NOT NULL DEFAULT 'auto'
+    CHECK (cover_source IN ('auto','custom','ext','bangumi','book')),
+  series_group TEXT NOT NULL DEFAULT '',
+  story_arc TEXT NOT NULL DEFAULT '',
+  story_arc_number TEXT NOT NULL DEFAULT '',
+  comicinfo_version TEXT NOT NULL DEFAULT '',
+  comicinfo_status TEXT NOT NULL DEFAULT ''
+    CHECK (comicinfo_status IN ('','parsed','absent','skipped_solid','skipped_encrypted','skipped_unsupported')),
+  match_origin TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  explicit_empty INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_book_metadata_bgm ON book_metadata(bgm_subject_id);
+CREATE INDEX IF NOT EXISTS idx_book_metadata_ext ON book_metadata(ext_source_id,ext_entry_id);
+
+CREATE TABLE IF NOT EXISTS book_thumbnails (
+  book_id TEXT PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+  source_version TEXT NOT NULL,
+  path TEXT NOT NULL,
+  media_type TEXT NOT NULL,
+  width INTEGER NOT NULL,
+  height INTEGER NOT NULL,
+  size INTEGER NOT NULL,
+  generation_duration_ns INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `

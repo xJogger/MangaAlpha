@@ -274,3 +274,67 @@ CREATE TABLE series_metadata (
 		}
 	}
 }
+
+func TestOpenMigratesSparseBookMetadataAndOneShots(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "legacy-books.db")
+	old, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := old.UpsertLibrary(ctx, Library{ID: "legacy", Name: "Legacy", RootCID: "root", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	insertCatalogSeries(t, old, "legacy", "work", "Work", make([]catalogBookTime, 1))
+	collection, err := old.CreateCollection(ctx, "Legacy collection", false, []string{"work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var collectionRowID int64
+	if err := old.DB().QueryRowContext(ctx, `SELECT rowid FROM collections WHERE id=?`, collection.ID).Scan(&collectionRowID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.DB().ExecContext(ctx, `
+DROP TABLE book_metadata;
+DROP TABLE book_thumbnails;
+ALTER TABLE libraries DROP COLUMN oneshots_directory;
+ALTER TABLE series DROP COLUMN one_shot_override;
+`); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		store, err := Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		lib, err := store.LibraryBasic(ctx, "legacy")
+		if err != nil || lib.OneshotsDirectory != "" {
+			t.Fatalf("legacy library = %+v, %v", lib, err)
+		}
+		series, err := store.SeriesByID(ctx, "work")
+		if err != nil || series.OneShotOverride || series.BooksCount != 1 {
+			t.Fatalf("legacy series = %+v, %v", series, err)
+		}
+		if _, ok, err := store.BookMetadataByID(ctx, "work-book-a"); err != nil || ok {
+			t.Fatalf("migration backfilled book metadata: found=%t, err=%v", ok, err)
+		}
+		var thumbnails, indexes int
+		if err := store.DB().QueryRowContext(ctx, `
+SELECT (SELECT count(*) FROM book_thumbnails), (SELECT count(*) FROM sqlite_master
+ WHERE type='index' AND name IN ('idx_book_metadata_bgm','idx_book_metadata_ext'))`).Scan(&thumbnails, &indexes); err != nil || thumbnails != 0 || indexes != 2 {
+			t.Fatalf("migration thumbnails=%d indexes=%d err=%v", thumbnails, indexes, err)
+		}
+		migrated, err := store.CollectionByRowID(ctx, collectionRowID)
+		if err != nil || migrated.ID != collection.ID || len(migrated.SeriesIDs) != 1 || migrated.SeriesIDs[0] != "work" {
+			t.Fatalf("legacy collection = %+v, %v", migrated, err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

@@ -11,30 +11,33 @@ import (
 )
 
 type ScrapedMetadata struct {
-	SubjectID       int64
-	ExtSourceID     string
-	ExtEntryID      string
-	ExtCoverURL     string
-	ExtCoverPath    string
-	MatchOrigin     string
-	Confidence      float64
-	CoverURL        string
-	Score           *float64
-	Rank            int
-	Status          string
-	Title           string
-	TitleSort       string
-	Summary         string
-	Publisher       string
-	Language        string
-	TotalBookCount  *int
-	ReleaseDate     string
-	Genres          []string
-	Tags            []string
-	Authors         []Author
-	AlternateTitles []AlternateTitle
-	Links           []WebLink
-	IsNSFW          bool
+	SubjectID        int64
+	ExtSourceID      string
+	ExtEntryID       string
+	ExtCoverURL      string
+	ExtCoverPath     string
+	MatchOrigin      string
+	Confidence       float64
+	CoverURL         string
+	Score            *float64
+	Rank             int
+	Status           string
+	Title            string
+	TitleSort        string
+	Summary          string
+	Publisher        string
+	Language         string
+	ReadingDirection string
+	AgeRating        *int
+	SharingLabels    []string
+	TotalBookCount   *int
+	ReleaseDate      string
+	Genres           []string
+	Tags             []string
+	Authors          []Author
+	AlternateTitles  []AlternateTitle
+	Links            []Link
+	IsNSFW           bool
 }
 
 type SeriesMetadataPatch struct {
@@ -114,6 +117,19 @@ authors_json,authors_lock,alternate_titles_json,alternate_titles_lock,
 links_json,links_lock,sharing_labels_json,sharing_labels_lock,is_nsfw,nsfw_lock,updated_at`
 
 func scanSeriesMetadataRow(scanner interface{ Scan(...any) error }) (SeriesMetadata, error) {
+	m, err := scanRawSeriesMetadataRow(scanner)
+	if err == nil {
+		if m.Status == "" {
+			m.Status = "ONGOING"
+		}
+		if m.ReadingDirection == "" {
+			m.ReadingDirection = "LEFT_TO_RIGHT"
+		}
+	}
+	return m, err
+}
+
+func scanRawSeriesMetadataRow(scanner interface{ Scan(...any) error }) (SeriesMetadata, error) {
 	var (
 		m                  SeriesMetadata
 		bgmID              sql.NullInt64
@@ -234,12 +250,6 @@ func scanSeriesMetadataRow(scanner interface{ Scan(...any) error }) (SeriesMetad
 	if m.CoverSource == "" {
 		m.CoverSource = CoverSourceAuto
 	}
-	if m.Status == "" {
-		m.Status = "ONGOING"
-	}
-	if m.ReadingDirection == "" {
-		m.ReadingDirection = "LEFT_TO_RIGHT"
-	}
 	m.UpdatedAt = parseTime(updatedAt)
 	return m, nil
 }
@@ -321,8 +331,16 @@ func (s *Store) ApplyScrapedMetadata(
 	series Series,
 	incoming ScrapedMetadata,
 ) (SeriesMetadata, error) {
-	current, err := s.SeriesMetadataByID(ctx, series)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return SeriesMetadata{}, err
+	}
+	defer tx.Rollback()
+	current, err := scanSeriesMetadataRow(tx.QueryRowContext(ctx,
+		`SELECT `+seriesMetadataColumns+` FROM series_metadata WHERE series_id=?`, series.ID))
+	if errors.Is(err, sql.ErrNoRows) {
+		current = defaultSeriesMetadata(series)
+	} else if err != nil {
 		return SeriesMetadata{}, err
 	}
 	prevSubjectID := int64(0)
@@ -335,19 +353,21 @@ func (s *Store) ApplyScrapedMetadata(
 	extCoverPath := strings.TrimSpace(incoming.ExtCoverPath)
 	matchOrigin := strings.TrimSpace(incoming.MatchOrigin)
 
-	subj := incoming.SubjectID
-	current.BgmSubjectID = &subj
+	externalOnly := extSourceID != "" && incoming.SubjectID == 0
+	if !externalOnly {
+		subj := incoming.SubjectID
+		current.BgmSubjectID = &subj
+	}
 	if extSourceID != "" {
 		if current.ExtSourceID != extSourceID || current.ExtEntryID != extEntryID || current.ExtCoverURL != extCoverURL {
 			current.ExtCoverPath = ""
 		}
 		current.ExtSourceID, current.ExtEntryID, current.ExtCoverURL = extSourceID, extEntryID, extCoverURL
-		current.BgmCoverURL, current.BgmCoverPath = "", ""
 	} else if incoming.SubjectID > 0 {
 		current.ExtSourceID, current.ExtEntryID, current.ExtCoverURL, current.ExtCoverPath = "", "", "", ""
-		if prevSubjectID != incoming.SubjectID {
-			current.BgmCoverURL, current.BgmCoverPath = "", ""
-		}
+	}
+	if !externalOnly && prevSubjectID != incoming.SubjectID {
+		current.BgmCoverURL, current.BgmCoverPath = "", ""
 	}
 	if extCoverPath != "" {
 		current.ExtCoverPath = extCoverPath
@@ -359,80 +379,162 @@ func (s *Store) ApplyScrapedMetadata(
 	current.ScrapeConfidence = incoming.Confidence
 	now := nowText()
 	current.ScrapeSyncedAt = &now
-	if incoming.CoverURL != "" {
-		if prevSubjectID != incoming.SubjectID {
-			current.BgmCoverPath = ""
+	if !externalOnly {
+		if incoming.CoverURL != "" {
+			if current.BgmCoverURL != incoming.CoverURL {
+				current.BgmCoverPath = ""
+			}
+			current.BgmCoverURL = incoming.CoverURL
 		}
-		current.BgmCoverURL = incoming.CoverURL
+		current.BgmScore = incoming.Score
+		current.BgmRank = nil
+		if incoming.Rank > 0 {
+			current.BgmRank = &incoming.Rank
+		}
 	}
-	current.BgmScore = incoming.Score
-	current.BgmRank = nil
-	if incoming.Rank > 0 {
-		rank := incoming.Rank
-		current.BgmRank = &rank
+	if !current.TitleSortLock && incoming.TitleSort == "" &&
+		(current.TitleSort == "" || current.TitleSort == current.Title) {
+		incoming.TitleSort = incoming.Title
 	}
+	applySeriesFields(&current, incoming, false)
 
-	if !current.StatusLock && incoming.Status != "" {
-		current.Status = normalizeSeriesStatus(incoming.Status)
-	}
-	if !current.TitleLock && strings.TrimSpace(incoming.Title) != "" {
-		current.Title = strings.TrimSpace(incoming.Title)
-	}
-	if !current.TitleSortLock {
-		if strings.TrimSpace(incoming.TitleSort) != "" {
-			current.TitleSort = strings.TrimSpace(incoming.TitleSort)
-		} else if strings.TrimSpace(current.Title) != "" {
-			current.TitleSort = current.Title
-		}
-	}
-	if !current.SummaryLock {
-		current.Summary = strings.TrimSpace(incoming.Summary)
-	}
-	if !current.PublisherLock && strings.TrimSpace(incoming.Publisher) != "" {
-		current.Publisher = strings.TrimSpace(incoming.Publisher)
-	}
-	if !current.LanguageLock && strings.TrimSpace(incoming.Language) != "" {
-		current.Language = strings.TrimSpace(incoming.Language)
-	}
-	if !current.TotalBookCountLock && incoming.TotalBookCount != nil && *incoming.TotalBookCount > 0 {
-		current.TotalBookCount = incoming.TotalBookCount
-	}
-	if !current.ReleaseDateLock && strings.TrimSpace(incoming.ReleaseDate) != "" {
-		current.ReleaseDate = strings.TrimSpace(incoming.ReleaseDate)
-	}
-	if !current.GenresLock && incoming.Genres != nil {
-		current.Genres = cleanStringSlice(incoming.Genres)
-	}
-	if !current.TagsLock && incoming.Tags != nil {
-		current.Tags = cleanStringSlice(incoming.Tags)
-	}
-	if !current.AuthorsLock && incoming.Authors != nil {
-		current.Authors = cleanAuthors(incoming.Authors)
-	}
-	if !current.AlternateTitlesLock && incoming.AlternateTitles != nil {
-		current.AlternateTitles = cleanAlternateTitles(incoming.AlternateTitles)
-	}
-	if !current.LinksLock && incoming.Links != nil {
-		current.Links = cleanWebLinks(incoming.Links)
-	}
 	if !current.NSFWLock {
-		current.IsNSFW = incoming.IsNSFW
+		current.IsNSFW = incoming.IsNSFW || (externalOnly && prevSubjectID > 0 && current.IsNSFW)
 		if !current.IsNSFW {
-			current.IsNSFW, err = s.unionHasNSFWSource(ctx, series.ID)
+			current.IsNSFW, err = queryUnionHasNSFWSource(ctx, tx, series.ID)
 			if err != nil {
 				return SeriesMetadata{}, err
 			}
 		}
 	}
-	if err := s.saveSeriesMetadata(ctx, current, now); err != nil {
+	if err := saveSeriesMetadataTx(ctx, tx, current, now); err != nil {
+		return SeriesMetadata{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return SeriesMetadata{}, err
 	}
 	return s.SeriesMetadataByID(ctx, series)
 }
 
+// SeriesComicInfoBackfill contains series-level fields extracted during an
+// authorized archive read. An NSFW indication can only raise the classification.
+type SeriesComicInfoBackfill struct {
+	Status           string
+	Title            string
+	TitleSort        string
+	Summary          string
+	Publisher        string
+	Language         string
+	ReleaseDate      string
+	TotalBookCount   *int
+	AgeRating        *int
+	ReadingDirection string
+	Genres           []string
+	Tags             []string
+	Authors          []Author
+	Links            []Link
+	SharingLabels    []string
+	AlternateTitles  []AlternateTitle
+	IsNSFW           bool
+}
+
+func (s *Store) BackfillSeriesMetadataFromComicInfo(ctx context.Context, seriesID string, patch SeriesComicInfoBackfill) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	current, err := scanRawSeriesMetadataRow(tx.QueryRowContext(ctx,
+		`SELECT `+seriesMetadataColumns+` FROM series_metadata WHERE series_id=?`, seriesID))
+	if errors.Is(err, sql.ErrNoRows) {
+		if err := tx.QueryRowContext(ctx, `SELECT id FROM series WHERE id=?`, seriesID).Scan(&current.SeriesID); err != nil {
+			return err
+		}
+		current.ScrapeStatus, current.CoverSource = ScrapeStatusNone, CoverSourceAuto
+	} else if err != nil {
+		return err
+	}
+
+	fields := ScrapedMetadata{
+		Status: patch.Status, Title: patch.Title, TitleSort: patch.TitleSort, Summary: patch.Summary,
+		Publisher: patch.Publisher, Language: patch.Language, ReleaseDate: patch.ReleaseDate,
+		TotalBookCount: patch.TotalBookCount, AgeRating: patch.AgeRating, ReadingDirection: patch.ReadingDirection,
+		Genres: patch.Genres, Tags: patch.Tags, Authors: patch.Authors, Links: patch.Links,
+		SharingLabels: patch.SharingLabels, AlternateTitles: patch.AlternateTitles,
+	}
+	changed := applySeriesFields(&current, fields, true)
+	if patch.IsNSFW && !current.IsNSFW && !current.NSFWLock && current.BgmSubjectID == nil && current.ExtEntryID == "" {
+		current.IsNSFW, changed = true, true
+	}
+	if !changed {
+		return nil
+	}
+	if err := saveSeriesMetadataTx(ctx, tx, current, nowText()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func applySeriesFields(m *SeriesMetadata, incoming ScrapedMetadata, onlyEmpty bool) bool {
+	changed := false
+	for _, field := range []struct {
+		dst    *string
+		value  string
+		locked bool
+	}{
+		{&m.Status, incoming.Status, m.StatusLock},
+		{&m.Title, incoming.Title, m.TitleLock},
+		{&m.TitleSort, incoming.TitleSort, m.TitleSortLock},
+		{&m.Summary, incoming.Summary, m.SummaryLock},
+		{&m.Publisher, incoming.Publisher, m.PublisherLock},
+		{&m.Language, incoming.Language, m.LanguageLock},
+		{&m.ReleaseDate, incoming.ReleaseDate, m.ReleaseDateLock},
+		{&m.ReadingDirection, incoming.ReadingDirection, m.ReadingDirLock},
+	} {
+		value := strings.TrimSpace(field.value)
+		if value == "" || field.locked || (onlyEmpty && *field.dst != "") {
+			continue
+		}
+		switch field.dst {
+		case &m.Status:
+			value = normalizeSeriesStatus(value)
+		case &m.ReadingDirection:
+			value = normalizeReadingDirection(value)
+		}
+		*field.dst, changed = value, true
+	}
+	if incoming.TotalBookCount != nil && !m.TotalBookCountLock && (!onlyEmpty || m.TotalBookCount == nil) {
+		m.TotalBookCount, changed = incoming.TotalBookCount, true
+	}
+	if incoming.AgeRating != nil && !m.AgeRatingLock && (!onlyEmpty || m.AgeRating == nil) {
+		m.AgeRating, changed = incoming.AgeRating, true
+	}
+	genres := applySeriesList(&m.Genres, incoming.Genres, m.GenresLock, onlyEmpty, cleanStringSlice)
+	tags := applySeriesList(&m.Tags, incoming.Tags, m.TagsLock, onlyEmpty, cleanStringSlice)
+	authors := applySeriesList(&m.Authors, incoming.Authors, m.AuthorsLock, onlyEmpty, cleanAuthors)
+	titles := applySeriesList(&m.AlternateTitles, incoming.AlternateTitles, m.AlternateTitlesLock, onlyEmpty, cleanAlternateTitles)
+	links := applySeriesList(&m.Links, incoming.Links, m.LinksLock, onlyEmpty, cleanWebLinks)
+	labels := applySeriesList(&m.SharingLabels, incoming.SharingLabels, m.SharingLabelsLock, onlyEmpty, cleanStringSlice)
+	return changed || genres || tags || authors || titles || links || labels
+}
+
+func applySeriesList[T any](dst *[]T, values []T, locked, onlyEmpty bool, clean func([]T) []T) bool {
+	if values == nil || locked || (onlyEmpty && (len(*dst) != 0 || len(values) == 0)) {
+		return false
+	}
+	*dst = clean(values)
+	return true
+}
+
 func (s *Store) unionHasNSFWSource(ctx context.Context, seriesID string) (bool, error) {
+	return queryUnionHasNSFWSource(ctx, s.db, seriesID)
+}
+
+func queryUnionHasNSFWSource(ctx context.Context, db interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, seriesID string) (bool, error) {
 	var hasNSFWSource bool
-	err := s.db.QueryRowContext(ctx, `
+	err := db.QueryRowContext(ctx, `
 SELECT EXISTS (
 SELECT 1
 FROM union_series_sources uss
@@ -753,18 +855,24 @@ func WithAutomaticMetadata(ctx context.Context) context.Context {
 var ErrMetadataChanged = errors.New("series metadata changed during automatic scraping")
 
 func (s *Store) saveSeriesMetadata(ctx context.Context, m SeriesMetadata, now string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := saveSeriesMetadataTx(ctx, tx, m, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func saveSeriesMetadataTx(ctx context.Context, tx *sql.Tx, m SeriesMetadata, now string) error {
 	genresJSON, _ := json.Marshal(cleanStringSlice(m.Genres))
 	tagsJSON, _ := json.Marshal(cleanStringSlice(m.Tags))
 	authorsJSON, _ := json.Marshal(cleanAuthors(m.Authors))
 	altTitlesJSON, _ := json.Marshal(cleanAlternateTitles(m.AlternateTitles))
 	linksJSON, _ := json.Marshal(cleanWebLinks(m.Links))
 	sharingJSON, _ := json.Marshal(cleanStringSlice(m.SharingLabels))
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 
 	if automated, _ := ctx.Value(automaticMetadataKey{}).(bool); automated {
 		var origin, updatedAt, extEntryID string
@@ -787,7 +895,7 @@ WHERE s.id=? AND l.enabled=1 AND NOT EXISTS (
 		}
 	}
 
-	_, err = tx.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 INSERT INTO series_metadata(
  `+seriesMetadataColumns+`
 ) VALUES(
@@ -886,7 +994,7 @@ ON CONFLICT(series_id) DO UPDATE SET
 		}
 	}
 
-	return tx.Commit()
+	return nil
 }
 
 func (s *Store) Genres(ctx context.Context, libraryIDs []string) ([]string, error) {

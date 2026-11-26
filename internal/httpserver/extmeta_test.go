@@ -373,9 +373,13 @@ VALUES('first','work','catalog','first.cbz','fixture','first.cbz',?,'',1,?,?,'sc
 	admin("GET", sourcePath+"/entries/102/cover", nil, http.StatusServiceUnavailable)
 	bind("103")
 	fallback := call("GET", thumbnailPath, readerKey, nil, http.StatusOK)
-	if fallback.Header().Get("Content-Type") != "image/jpeg" || fallback.Header().Get("Cache-Control") != "private, no-store" ||
-		!bytes.HasPrefix(fallback.Body.Bytes(), []byte{0xff, 0xd8}) || coverCalls.Load() != 2 {
-		t.Fatalf("thumbnail circuit did not fall back to first local page: %v, requests = %d", fallback.Header(), coverCalls.Load())
+	if fallback.Header().Get("Content-Type") != "image/png" || fallback.Header().Get("Cache-Control") != "private, no-store" ||
+		!bytes.HasPrefix(fallback.Body.Bytes(), []byte{0x89, 'P', 'N', 'G'}) || coverCalls.Load() != 2 {
+		t.Fatalf("thumbnail circuit should fall back to placeholder without opening local archive: %v, requests = %d", fallback.Header(), coverCalls.Load())
+	}
+	var indexedBooks int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM zip_indexes`).Scan(&indexedBooks); err != nil || indexedBooks != 0 {
+		t.Fatalf("thumbnail fallback implicitly opened archive: zip_indexes=%d err=%v", indexedBooks, err)
 	}
 	bind("104")
 	call("GET", thumbnailPath, readerKey, nil, http.StatusNotFound)

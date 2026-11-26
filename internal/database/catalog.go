@@ -225,7 +225,7 @@ func (s *Store) querySeriesPage(ctx context.Context, q SeriesQuery) ([]Series, i
 		// edition with the most volumes (books_count DESC, then union library,
 		// library name, series name, id) as the representative anchor while keeping
 		// group-level date/rank/score rollups from all eligible versions.
-		groupKey := "CASE WHEN s.one_shot=0 AND gm.bgm_subject_id>0 THEN 'bgm:'||gm.bgm_subject_id ELSE 'series:'||s.id END"
+		groupKey := "CASE WHEN NOT " + effectiveOneShotSQL + " AND gm.bgm_subject_id>0 THEN 'bgm:'||gm.bgm_subject_id ELSE 'series:'||s.id END"
 		baseFrom := " FROM series s JOIN libraries gl ON gl.id=s.library_id LEFT JOIN series_metadata gm ON gm.series_id=s.id" + where
 		groupCount := "SELECT count(*) FROM (SELECT 1" + baseFrom + " GROUP BY " + groupKey + ")"
 		if err := s.db.QueryRowContext(ctx, groupCount, args...).Scan(&total); err != nil {
@@ -284,7 +284,7 @@ func (s *Store) querySeriesPage(ctx context.Context, q SeriesQuery) ([]Series, i
 			smJoin = ` LEFT JOIN series_metadata sm ON sm.series_id=s.id`
 		}
 		query := candCTE + `, _tot AS (SELECT COUNT(*) AS n FROM _cand)
-SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.file_modified_at,s.created_at,s.updated_at,s.books_count,
+SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.one_shot_override,s.file_modified_at,s.created_at,s.updated_at,s.books_count,
  (SELECT n FROM _tot) AS _total
 FROM _cand _c
 CROSS JOIN series s ON s.id=_c.series_id` + smJoin + ` ORDER BY ` + searchPrimary + searchTies + ` LIMIT ? OFFSET ?`
@@ -338,7 +338,7 @@ CROSS JOIN series s ON s.id=_c.series_id` + smJoin + ` ORDER BY ` + searchPrimar
 		}
 	}
 	query := `
-SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.file_modified_at,s.created_at,s.updated_at,s.books_count` +
+SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.one_shot_override,s.file_modified_at,s.created_at,s.updated_at,s.books_count` +
 		source + where + ` ORDER BY ` + primary + ties + ` LIMIT ? OFFSET ?`
 	queryArgs := make([]any, 0, len(sourceArgs)+len(args)+len(orderArgs)+2)
 	queryArgs = append(queryArgs, sourceArgs...)
@@ -405,7 +405,7 @@ func (s *Store) querySeriesBgmRankAscFast(
 	}
 	args = append(args, q.Size+1, offset)
 	query := `
-SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.file_modified_at,s.created_at,s.updated_at,s.books_count
+SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.one_shot_override,s.file_modified_at,s.created_at,s.updated_at,s.books_count
 FROM series_metadata sm
 CROSS JOIN series s ON s.id=sm.series_id
 WHERE sm.bgm_rank>0` + nsfwClause + ` AND s.library_id IN ` + Placeholders(len(libs)) + `
@@ -496,7 +496,7 @@ func (s *Store) seriesByIDDirect(ctx context.Context, id string, includeHidden, 
 	var modified sql.NullString
 	var created, updated string
 	query := `
-SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.file_modified_at,s.created_at,s.updated_at,s.books_count
+SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.one_shot_override,s.file_modified_at,s.created_at,s.updated_at,s.books_count
 FROM series s`
 	if !includeHidden {
 		query += ` JOIN libraries l ON l.id=s.library_id AND l.enabled=1 AND NOT EXISTS (SELECT 1 FROM union_layers ul WHERE ul.member_library_id=l.id)`
@@ -506,7 +506,7 @@ FROM series s`
 		query += ` AND NOT EXISTS (SELECT 1 FROM series_metadata sm_nsfw WHERE sm_nsfw.series_id=s.id AND sm_nsfw.is_nsfw=1)`
 	}
 	err := s.db.QueryRowContext(ctx, query, id).Scan(
-		&item.ID, &item.LibraryID, &item.CID, &item.Name, &item.RelativePath, &item.OneShot,
+		&item.ID, &item.LibraryID, &item.CID, &item.Name, &item.RelativePath, &item.OneShot, &item.OneShotOverride,
 		&modified, &created, &updated, &item.BooksCount,
 	)
 	if err != nil {
@@ -663,7 +663,7 @@ func (s *Store) queryBooksPage(ctx context.Context, q BookQuery) ([]Book, int64,
 			where += " AND p.completed=1"
 		}
 	}
-	order := "b.number_sort ASC,b.name COLLATE NOCASE ASC,b.id ASC"
+	order := "COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC"
 	sortValue := strings.ToLower(strings.TrimSpace(q.Sort))
 	var orderArgs []any
 	switch {
@@ -679,15 +679,15 @@ func (s *Store) queryBooksPage(ctx context.Context, q BookQuery) ([]Book, int64,
  WHEN cjk_key(b.name) = ? THEN 0
  WHEN cjk_key(b.name) LIKE ? ESCAPE '\' THEN 1
  WHEN cjk_key(b.name) LIKE ? ESCAPE '\' THEN 2
- ELSE 3 END ASC, b.name COLLATE NOCASE ASC, b.number_sort ASC, b.id ASC`
+ ELSE 3 END ASC, b.name COLLATE NOCASE ASC, COALESCE(bm.number_sort,b.number_sort) ASC, b.id ASC`
 			orderArgs = append(orderArgs, key, prefix, contains)
 		}
 	case strings.HasPrefix(sortValue, "readprogress.readdate"), strings.HasPrefix(sortValue, "readdate"):
 		if progMode != "" {
-			order = "p.updated_at " + sortDirection(sortValue) + ",b.number_sort ASC,b.id ASC"
+			order = "p.updated_at " + sortDirection(sortValue) + ",COALESCE(bm.number_sort,b.number_sort) ASC,b.id ASC"
 		} else {
 			order = `COALESCE((SELECT p.updated_at FROM book_read_progress p WHERE p.user_id=? AND p.book_id=b.id), '') ` +
-				sortDirection(sortValue) + `,b.number_sort ASC,b.id ASC`
+				sortDirection(sortValue) + `,COALESCE(bm.number_sort,b.number_sort) ASC,b.id ASC`
 			orderArgs = append(orderArgs, userID)
 		}
 	case strings.HasPrefix(sortValue, "lastmodifieddate"):
@@ -704,7 +704,7 @@ func (s *Store) queryBooksPage(ctx context.Context, q BookQuery) ([]Book, int64,
 	case strings.Contains(sortValue, "name,asc"):
 		order = "b.name COLLATE NOCASE ASC,b.id ASC"
 	case strings.Contains(sortValue, ",desc"):
-		order = "b.number_sort DESC,b.name COLLATE NOCASE DESC,b.id DESC"
+		order = "COALESCE(bm.number_sort,b.number_sort) DESC,b.name COLLATE NOCASE DESC,b.id DESC"
 	}
 
 	// For paged search queries, materialize matching 8-byte book rowids once (avoiding
@@ -728,9 +728,10 @@ func (s *Store) queryBooksPage(ctx context.Context, q BookQuery) ([]Book, int64,
 		}
 		query := candCTE + `, _tot AS (SELECT COUNT(*) AS n FROM _cand), _page AS (
 SELECT b.id,b.series_id,b.library_id,b.file_id,b.parent_cid,b.name,b.size,b.pick_code,b.sha1,
- b.file_created_at,b.file_modified_at,b.number_sort,b.created_at,b.updated_at
+ b.file_created_at,b.file_modified_at,COALESCE(bm.number_sort,b.number_sort) AS number_sort,b.created_at,b.updated_at
 FROM _cand _c
 CROSS JOIN books b ON b.rowid=_c.book_rowid
+LEFT JOIN book_metadata bm ON bm.book_id=b.id
 ORDER BY ` + order + ` LIMIT ? OFFSET ?
 )
 SELECT p.id,p.series_id,p.library_id,p.file_id,p.parent_cid,p.name,p.size,p.pick_code,p.sha1,
@@ -771,8 +772,8 @@ LEFT JOIN zip_indexes z ON z.book_id=p.id`
 	}
 	query := `
 SELECT b.id,b.series_id,b.library_id,b.file_id,b.parent_cid,b.name,b.size,b.pick_code,b.sha1,
- b.file_created_at,b.file_modified_at,b.number_sort,b.created_at,b.updated_at,
- coalesce(z.page_count,0)` + source + ` LEFT JOIN zip_indexes z ON z.book_id=b.id` + where + ` ORDER BY ` + order
+ b.file_created_at,b.file_modified_at,COALESCE(bm.number_sort,b.number_sort),b.created_at,b.updated_at,
+ coalesce(z.page_count,0)` + source + ` LEFT JOIN book_metadata bm ON bm.book_id=b.id LEFT JOIN zip_indexes z ON z.book_id=b.id` + where + ` ORDER BY ` + order
 	queryArgs := make([]any, 0, len(sourceArgs)+len(args)+len(orderArgs)+2)
 	queryArgs = append(queryArgs, sourceArgs...)
 	queryArgs = append(queryArgs, args...)
@@ -847,12 +848,13 @@ WHERE s.library_id IN ` + Placeholders(len(enabledLibs))
 		}
 		query := `
 SELECT b.id,b.series_id,b.library_id,b.file_id,b.parent_cid,b.name,b.size,b.pick_code,b.sha1,
- b.file_created_at,b.file_modified_at,b.number_sort,b.created_at,b.updated_at,
+ b.file_created_at,b.file_modified_at,COALESCE(bm.number_sort,b.number_sort),b.created_at,b.updated_at,
  coalesce(z.page_count,0)
 FROM books b
+LEFT JOIN book_metadata bm ON bm.book_id=b.id
 LEFT JOIN zip_indexes z ON z.book_id=b.id
 WHERE b.series_id IN ` + Placeholders(len(chunk)) + `
-ORDER BY b.series_id ASC, b.number_sort ASC, b.name COLLATE NOCASE ASC, b.id ASC`
+ORDER BY b.series_id ASC, COALESCE(bm.number_sort,b.number_sort) ASC, b.name COLLATE NOCASE ASC, b.id ASC`
 		rows, err := s.db.QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, 0, err
@@ -892,9 +894,9 @@ func (s *Store) bookByIDDirect(ctx context.Context, id string, includeHidden, ex
 	var created, updated string
 	query := `
 SELECT b.id,b.series_id,b.library_id,b.file_id,b.parent_cid,b.name,b.size,b.pick_code,b.sha1,
- b.file_created_at,b.file_modified_at,b.number_sort,b.created_at,b.updated_at,
+ b.file_created_at,b.file_modified_at,COALESCE(bm.number_sort,b.number_sort),b.created_at,b.updated_at,
  coalesce(z.page_count,0)
-FROM books b`
+FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id`
 	if !includeHidden {
 		query += ` JOIN libraries l ON l.id=b.library_id AND l.enabled=1 AND NOT EXISTS (SELECT 1 FROM union_layers ul WHERE ul.member_library_id=l.id)`
 	}
@@ -938,7 +940,7 @@ func (s *Store) SeriesByIDs(ctx context.Context, ids []string) (map[string]Serie
 			args = append(args, id)
 		}
 		query := `
-SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.file_modified_at,s.created_at,s.updated_at,s.books_count
+SELECT s.id,s.library_id,s.cid,s.name,s.relative_path,s.one_shot,s.one_shot_override,s.file_modified_at,s.created_at,s.updated_at,s.books_count
 FROM series s
 JOIN libraries l ON l.id=s.library_id AND l.enabled=1 AND NOT EXISTS (SELECT 1 FROM union_layers ul WHERE ul.member_library_id=l.id)
 WHERE s.id IN ` + Placeholders(len(args))
@@ -964,11 +966,31 @@ WHERE s.id IN ` + Placeholders(len(args))
 	return out, nil
 }
 
+func (s *Store) SetSeriesOneShotOverride(ctx context.Context, seriesID string, enabled bool) error {
+	result, err := s.db.ExecContext(ctx, `
+UPDATE series SET one_shot_override=?
+WHERE id=? AND (NOT ? OR (one_shot=0 AND books_count=1))`, enabled, seriesID, enabled)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil || n != 0 {
+		return err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM series WHERE id=?`, seriesID).Scan(new(int)); err != nil {
+		return err
+	}
+	return ErrInvalidOneShotOverride
+}
+
+var ErrInvalidOneShotOverride = errors.New("one-shot override requires a regular series with exactly one book")
+
+const effectiveOneShotSQL = "(s.one_shot = 1 OR (s.one_shot_override = 1 AND s.books_count = 1))"
+
 func (s *Store) FirstBookInSeries(ctx context.Context, seriesID string) (Book, error) {
 	var id string
 	err := s.db.QueryRowContext(ctx, `
-SELECT id FROM books WHERE series_id=?
-ORDER BY number_sort ASC,name COLLATE NOCASE ASC,id ASC LIMIT 1`, seriesID).Scan(&id)
+SELECT b.id FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id WHERE b.series_id=?
+ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC LIMIT 1`, seriesID).Scan(&id)
 	if err != nil {
 		return Book{}, err
 	}
@@ -978,8 +1000,8 @@ ORDER BY number_sort ASC,name COLLATE NOCASE ASC,id ASC LIMIT 1`, seriesID).Scan
 func (s *Store) FirstBookInSeriesAny(ctx context.Context, seriesID string) (Book, error) {
 	var id string
 	err := s.db.QueryRowContext(ctx, `
-SELECT id FROM books WHERE series_id=?
-ORDER BY number_sort ASC,name COLLATE NOCASE ASC,id ASC LIMIT 1`, seriesID).Scan(&id)
+SELECT b.id FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id WHERE b.series_id=?
+ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC LIMIT 1`, seriesID).Scan(&id)
 	if err != nil {
 		return Book{}, err
 	}
@@ -990,17 +1012,17 @@ func (s *Store) NextBookInSeries(ctx context.Context, current Book) (Book, error
 	var id string
 	err := s.db.QueryRowContext(ctx, `
 WITH ordered AS (
- SELECT id,
-  LEAD(id) OVER (
-   ORDER BY number_sort ASC,name COLLATE NOCASE ASC,id ASC
+ SELECT b.id,
+  LEAD(b.id) OVER (
+   ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC
   ) AS next_id
- FROM books
- WHERE series_id=?
+ FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id
+ WHERE b.series_id=?
 )
 SELECT ordered.next_id
 FROM ordered
-JOIN series ON series.id=?
-WHERE ordered.id=? AND ordered.next_id IS NOT NULL AND series.one_shot=0`,
+JOIN series s ON s.id=?
+WHERE ordered.id=? AND ordered.next_id IS NOT NULL AND NOT `+effectiveOneShotSQL,
 		current.SeriesID, current.SeriesID, current.ID).Scan(&id)
 	if err != nil {
 		return Book{}, err
@@ -1012,17 +1034,17 @@ func (s *Store) PreviousBookInSeries(ctx context.Context, current Book) (Book, e
 	var id string
 	err := s.db.QueryRowContext(ctx, `
 WITH ordered AS (
- SELECT id,
-  LAG(id) OVER (
-   ORDER BY number_sort ASC,name COLLATE NOCASE ASC,id ASC
+ SELECT b.id,
+  LAG(b.id) OVER (
+   ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC
   ) AS previous_id
- FROM books
- WHERE series_id=?
+ FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id
+ WHERE b.series_id=?
 )
 SELECT ordered.previous_id
 FROM ordered
-JOIN series ON series.id=?
-WHERE ordered.id=? AND ordered.previous_id IS NOT NULL AND series.one_shot=0`,
+JOIN series s ON s.id=?
+WHERE ordered.id=? AND ordered.previous_id IS NOT NULL AND NOT `+effectiveOneShotSQL,
 		current.SeriesID, current.SeriesID, current.ID).Scan(&id)
 	if err != nil {
 		return Book{}, err
@@ -1170,7 +1192,7 @@ func buildSeriesFilters(q SeriesQuery, enabledLibs []string, userID string, useF
 		args = append(args, searchArgs...)
 	}
 	if q.OneShot != nil {
-		clauses = append(clauses, "s.one_shot=?")
+		clauses = append(clauses, effectiveOneShotSQL+"=?")
 		args = append(args, *q.OneShot)
 	}
 	if len(q.Statuses) > 0 {
@@ -1354,7 +1376,7 @@ func buildBookFilters(q BookQuery, enabledLibs []string, excludeNSFW bool, userI
 	}
 	if q.OneShot != nil {
 		clauses = append(clauses,
-			"b.series_id IN (SELECT oneshot_series.id FROM series oneshot_series WHERE oneshot_series.one_shot=?)")
+			"b.series_id IN (SELECT s.id FROM series s WHERE "+effectiveOneShotSQL+"=?)")
 		args = append(args, *q.OneShot)
 	}
 	if len(q.Tags) > 0 {
@@ -1386,7 +1408,7 @@ func scanSeriesRows(rows *sql.Rows) ([]Series, error) {
 		var modified sql.NullString
 		var created, updated string
 		if err := rows.Scan(
-			&item.ID, &item.LibraryID, &item.CID, &item.Name, &item.RelativePath, &item.OneShot,
+			&item.ID, &item.LibraryID, &item.CID, &item.Name, &item.RelativePath, &item.OneShot, &item.OneShotOverride,
 			&modified, &created, &updated, &item.BooksCount,
 		); err != nil {
 			return nil, err
@@ -1407,7 +1429,7 @@ func scanSeriesRowsWithTotal(rows *sql.Rows) ([]Series, int64, error) {
 		var modified sql.NullString
 		var created, updated string
 		if err := rows.Scan(
-			&item.ID, &item.LibraryID, &item.CID, &item.Name, &item.RelativePath, &item.OneShot,
+			&item.ID, &item.LibraryID, &item.CID, &item.Name, &item.RelativePath, &item.OneShot, &item.OneShotOverride,
 			&modified, &created, &updated, &item.BooksCount, &total,
 		); err != nil {
 			return nil, 0, err

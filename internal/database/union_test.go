@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/xJogger/fake-komga-115/internal/id"
 )
 
 func TestNormalizeUnionSeriesPath(t *testing.T) {
@@ -116,11 +118,6 @@ INSERT INTO books(id,series_id,library_id,file_id,parent_cid,name,size,pick_code
 	rl, err := store.CreateReadList(ctx, "必读清单", "", true, []string{"b_loc_1", "b_115_2"})
 	if err != nil {
 		t.Fatal(err)
-	}
-
-	// Validation: One-Shot mismatch must fail
-	if _, _, err := store.CreateUnionLibrary(ctx, "错误联合", true, []string{"lib_local", "lib_oneshot"}); !errors.Is(err, ErrUnionOneShotMismatch) {
-		t.Fatalf("expected ErrUnionOneShotMismatch, got %v", err)
 	}
 
 	// Create union library [lib_local (prio 0), lib_115 (prio 1)]
@@ -547,4 +544,69 @@ INSERT INTO books(id,series_id,library_id,file_id,parent_cid,name,size,pick_code
 	if sTopResolved, err := store.SeriesByID(ctx, "s_top"); err != nil || sTopResolved.ID != uSeries.ID {
 		t.Fatalf("expected enabled source s_top still resolves to union, got %+v err=%v", sTopResolved, err)
 	}
+}
+
+func TestUnionMaterializesMixedOneShotShapesByPriority(t *testing.T) {
+	ctx := t.Context()
+	store, err := Open(filepath.Join(t.TempDir(), "mixed-union.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	for _, lib := range []Library{
+		{ID: "upper", RootCID: "upper", Enabled: true, OneshotsDirectory: "_oneshots"},
+		{ID: "lower", RootCID: "lower", Enabled: true, OneShot: true},
+	} {
+		if err := store.UpsertLibrary(ctx, lib); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, data := range []struct {
+		lib, series, rel, filename string
+		file, override             bool
+	}{
+		{"upper", "upper-shared", "Upper/Shared", "A.cbz", false, true},
+		{"lower", "lower-shared", "Lower/Shared", "B.cbz", false, true},
+		{"upper", "upper-single", "Upper/Single", "Only.cbz", false, true},
+		{"upper", "upper-conflict", "Upper/Collision.cbz", "Collision.cbz", true, false},
+		{"lower", "lower-conflict", "Lower/Collision.cbz", "Different.cbz", false, false},
+		{"lower", "lower-exclusive", "Lower/Exclusive.cbz", "Exclusive.cbz", true, false},
+	} {
+		insertCatalogSeries(t, store, data.lib, data.series, data.series, make([]catalogBookTime, 1))
+		if _, err := store.DB().ExecContext(ctx, `UPDATE series SET relative_path=?,one_shot=?,one_shot_override=? WHERE id=?`,
+			data.rel, data.file, data.override, data.series); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().ExecContext(ctx, `UPDATE books SET name=? WHERE series_id=?`, data.filename, data.series); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lib, stats, err := store.CreateUnionLibrary(ctx, "Mixed", true, []string{"upper", "lower"})
+	if err != nil || lib.OneShot || stats.SeriesCount != 4 || stats.BooksCount != 5 {
+		t.Fatalf("mixed union = %+v, %+v, %v", lib, stats, err)
+	}
+	shared, err := store.SeriesByID(ctx, id.Series(lib.ID, "Shared"))
+	if err != nil || shared.EffectiveOneShot() || shared.BooksCount != 2 {
+		t.Fatalf("shared ordinary directory = %+v, %v", shared, err)
+	}
+	single, err := store.SeriesByID(ctx, id.Series(lib.ID, "Single"))
+	if err != nil || single.OneShot || !single.EffectiveOneShot() {
+		t.Fatalf("single-volume directory override = %+v, %v", single, err)
+	}
+	check := func(seriesID, filename string, file bool) {
+		t.Helper()
+		series, err := store.SeriesByID(ctx, seriesID)
+		if err != nil || series.OneShot != file || series.BooksCount != 1 {
+			t.Fatalf("collision winner series = %+v, %v", series, err)
+		}
+		book, err := store.FirstBookInSeries(ctx, seriesID)
+		if err != nil || book.Name != filename {
+			t.Fatalf("collision winner volume = %+v, %v", book, err)
+		}
+	}
+	check(id.OneShotSeries(lib.ID, "Collision.cbz"), "Collision.cbz", true)
+	if _, _, err := store.UpdateUnionLibrary(ctx, lib.ID, nil, nil, []string{"lower", "upper"}); err != nil {
+		t.Fatal(err)
+	}
+	check(id.Series(lib.ID, "Collision.cbz"), "Different.cbz", false)
 }

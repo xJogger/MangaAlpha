@@ -418,6 +418,15 @@ func buildBookSearchSQL(raw string, useSeriesFTS, useBooksFTS bool) (string, []a
 	return "(" + sql + ")", args
 }
 
+// Keep sparse metadata searchable while FTS is rebuilding or catching up.
+func bookMetadataSearchSQL(bookAlias string) string {
+	return `EXISTS (SELECT 1 FROM book_metadata _bm WHERE _bm.book_id=` + bookAlias + `.id AND (
+ cjk_contains(_bm.title, ?) OR cjk_contains(_bm.summary, ?)
+ OR EXISTS (SELECT 1 FROM json_each(_bm.tags_json) t WHERE cjk_contains(t.value, ?))
+ OR EXISTS (SELECT 1 FROM json_each(_bm.authors_json) a WHERE cjk_contains(a.value ->> 'name', ?))
+))`
+}
+
 func renderBookSearchExpr(expr searchExpr, useSeriesFTS, useBooksFTS bool, args *[]any) string {
 	switch node := expr.(type) {
 	case searchOr:
@@ -483,8 +492,8 @@ func renderBookSearchExpr(expr searchExpr, useSeriesFTS, useBooksFTS bool, args 
 					*args = append(*args, "name_fts : "+phrase, "{name_fts title_fts alt_fts} : "+phrase)
 					return `(b.rowid IN (SELECT bf.rowid FROM books_search_fts bf WHERE bf.books_search_fts MATCH ? AND NOT EXISTS (SELECT 1 FROM search_fts_dirty _sd WHERE _sd.kind='b' AND _sd.row_id=bf.rowid)) OR b.series_id IN (SELECT sf.id FROM series_search_fts f CROSS JOIN series sf ON sf.rowid=f.rowid WHERE f.series_search_fts MATCH ? AND NOT EXISTS (SELECT 1 FROM search_fts_dirty _sd WHERE _sd.kind='s' AND _sd.row_id=f.rowid)))`
 				}
-				*args = append(*args, folded, "{name_fts title_fts alt_fts} : "+phrase)
-				return `(cjk_contains(b.name, ?) OR b.series_id IN (SELECT sf.id FROM series_search_fts f CROSS JOIN series sf ON sf.rowid=f.rowid WHERE f.series_search_fts MATCH ? AND NOT EXISTS (SELECT 1 FROM search_fts_dirty _sd WHERE _sd.kind='s' AND _sd.row_id=f.rowid)))`
+				*args = append(*args, folded, folded, folded, folded, folded, "{name_fts title_fts alt_fts} : "+phrase)
+				return `(cjk_contains(b.name, ?) OR ` + bookMetadataSearchSQL("b") + ` OR b.series_id IN (SELECT sf.id FROM series_search_fts f CROSS JOIN series sf ON sf.rowid=f.rowid WHERE f.series_search_fts MATCH ? AND NOT EXISTS (SELECT 1 FROM search_fts_dirty _sd WHERE _sd.kind='s' AND _sd.row_id=f.rowid)))`
 			}
 		}
 		like := "%" + escapeLike(val) + "%"
@@ -505,8 +514,8 @@ func renderBookSearchExpr(expr searchExpr, useSeriesFTS, useBooksFTS bool, args 
 			*args = append(*args, like, node.field)
 			return `b.series_id IN (SELECT sa.series_id FROM series_authors sa WHERE sa.name LIKE ? ESCAPE '\' COLLATE NOCASE AND sa.role=? COLLATE NOCASE)`
 		default:
-			*args = append(*args, like, like, like, like)
-			return `(b.name LIKE ? ESCAPE '\' COLLATE NOCASE OR b.series_id IN (SELECT s2.id FROM series s2 WHERE s2.name LIKE ? ESCAPE '\' COLLATE NOCASE) OR b.series_id IN (SELECT sm.series_id FROM series_metadata sm WHERE sm.title LIKE ? ESCAPE '\' COLLATE NOCASE OR sm.alternate_titles_json LIKE ? ESCAPE '\' COLLATE NOCASE))`
+			*args = append(*args, like, folded, folded, folded, folded, like, like, like)
+			return `(b.name LIKE ? ESCAPE '\' COLLATE NOCASE OR ` + bookMetadataSearchSQL("b") + ` OR b.series_id IN (SELECT s2.id FROM series s2 WHERE s2.name LIKE ? ESCAPE '\' COLLATE NOCASE) OR b.series_id IN (SELECT sm.series_id FROM series_metadata sm WHERE sm.title LIKE ? ESCAPE '\' COLLATE NOCASE OR sm.alternate_titles_json LIKE ? ESCAPE '\' COLLATE NOCASE))`
 		}
 	}
 	return ""
@@ -740,8 +749,8 @@ func collectBookOrParts(expr searchExpr, libs []string, useSeriesFTS, useBooksFT
 				for _, id := range libs {
 					bArgs = append(bArgs, id)
 				}
-				bArgs = append(bArgs, like)
-				bookSQL = `SELECT b2.rowid AS book_rowid FROM books b2 WHERE b2.library_id IN ` + Placeholders(len(libs)) + ` AND b2.name LIKE ? ESCAPE '\' COLLATE NOCASE`
+				bArgs = append(bArgs, like, folded, folded, folded, folded)
+				bookSQL = `SELECT b2.rowid AS book_rowid FROM books b2 WHERE b2.library_id IN ` + Placeholders(len(libs)) + ` AND (b2.name LIKE ? ESCAPE '\' COLLATE NOCASE OR ` + bookMetadataSearchSQL("b2") + `)`
 			}
 			var sArgs []any
 			seriesSQL, ok := renderSeriesCandidateSet(node, libs, useSeriesFTS, &sArgs)

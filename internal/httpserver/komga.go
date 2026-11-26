@@ -151,6 +151,9 @@ func (s *Server) komgaLibraries(w http.ResponseWriter, r *http.Request) {
 				if library.OneShot {
 					return "."
 				}
+				if library.OneshotsDirectory != "" {
+					return library.OneshotsDirectory
+				}
 				return nil
 			}(),
 		}
@@ -424,7 +427,12 @@ func (s *Server) komgaBookByID(w http.ResponseWriter, r *http.Request) {
 		s.writeDBError(w, r, err)
 		return
 	}
-	writeJSON(w, 200, bookDTOWithProgressAndMeta(book, series, seriesMeta, progress, ok))
+	bookMeta, _, err := s.store.BookMetadataByID(r.Context(), book.ID)
+	if err != nil {
+		s.writeDBError(w, r, err)
+		return
+	}
+	writeJSON(w, 200, bookDTOWithProgressAndMeta(book, series, seriesMeta, progress, ok, bookMeta))
 }
 
 func (s *Server) seriesDTOs(r *http.Request, items []database.Series) ([]any, error) {
@@ -467,6 +475,10 @@ func (s *Server) bookDTOs(r *http.Request, items []database.Book) ([]any, error)
 	if err != nil {
 		return nil, err
 	}
+	bookMetas, err := s.store.BookMetadataMap(r.Context(), bookIDs)
+	if err != nil {
+		return nil, err
+	}
 	seriesMap, err := s.store.SeriesByIDs(r.Context(), seriesIDs)
 	if err != nil {
 		return nil, err
@@ -489,7 +501,7 @@ func (s *Server) bookDTOs(r *http.Request, items []database.Book) ([]any, error)
 		}
 		meta := metaMap[item.SeriesID]
 		progress, hasProg := progresses[item.ID]
-		out = append(out, bookDTOWithProgressAndMeta(item, series, meta, progress, hasProg))
+		out = append(out, bookDTOWithProgressAndMeta(item, series, meta, progress, hasProg, bookMetas[item.ID]))
 	}
 	return out, nil
 }
@@ -533,7 +545,12 @@ func (s *Server) komgaBookSibling(w http.ResponseWriter, r *http.Request, next b
 		s.writeDBError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, bookDTOWithProgressAndMeta(sibling, series, seriesMeta, progress, ok))
+	bookMeta, _, err := s.store.BookMetadataByID(r.Context(), sibling.ID)
+	if err != nil {
+		s.writeDBError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, bookDTOWithProgressAndMeta(sibling, series, seriesMeta, progress, ok, bookMeta))
 }
 
 func (s *Server) komgaBookReadProgress(w http.ResponseWriter, r *http.Request) {
@@ -906,7 +923,7 @@ func seriesDTOFull(
 			"authors": authors, "tags": tags, "releaseDate": releaseDate,
 			"summary": meta.Summary, "summaryNumber": "", "created": created, "lastModified": updated,
 		},
-		"deleted": false, "oneshot": item.OneShot,
+		"deleted": false, "oneshot": item.EffectiveOneShot(),
 	}
 }
 
@@ -929,7 +946,12 @@ func bookDTOWithProgressAndMeta(
 	seriesMeta database.SeriesMetadata,
 	progress database.BookReadProgress,
 	hasProgress bool,
+	bookMetas ...database.BookMetadata,
 ) map[string]any {
+	var meta database.BookMetadata
+	if len(bookMetas) > 0 {
+		meta = bookMetas[0]
+	}
 	createdAt := item.CreatedAt
 	if item.FileCreatedAt != nil {
 		createdAt = *item.FileCreatedAt
@@ -944,11 +966,36 @@ func bookDTOWithProgressAndMeta(
 	if seriesTitle == "" {
 		seriesTitle = series.Name
 	}
+	if meta.HasTitle() {
+		title = meta.Title
+	}
 	authors := seriesMeta.Authors
+	if meta.HasAuthors() {
+		authors = meta.Authors
+	}
 	if authors == nil {
 		authors = []database.Author{}
 	}
 	number := strconv.FormatFloat(item.NumberSort, 'f', -1, 64)
+	if meta.HasNumber() {
+		number = meta.Number
+	}
+	numberSort := item.NumberSort
+	if meta.NumberSort != nil {
+		numberSort = *meta.NumberSort
+	}
+	var releaseDate any
+	if meta.HasReleaseDate() {
+		releaseDate = meta.ReleaseDate
+	}
+	tags := meta.Tags
+	if tags == nil {
+		tags = []string{}
+	}
+	links := meta.Links
+	if links == nil {
+		links = []database.Link{}
+	}
 	return map[string]any{
 		"id": item.ID, "seriesId": item.SeriesID, "seriesTitle": seriesTitle,
 		"libraryId": item.LibraryID, "name": item.Name, "url": "", "number": int(item.NumberSort),
@@ -959,11 +1006,11 @@ func bookDTOWithProgressAndMeta(
 			"comment": "", "mediaProfile": "DIVINA", "epubDivinaCompatible": false, "epubIsKepub": false,
 		},
 		"metadata": map[string]any{
-			"title": title, "titleLock": false, "summary": "", "summaryLock": false,
-			"number": number, "numberLock": false, "numberSort": item.NumberSort, "numberSortLock": false,
-			"releaseDate": nil, "releaseDateLock": false, "authors": authors, "authorsLock": false,
-			"tags": []string{}, "tagsLock": false, "isbn": "", "isbnLock": false,
-			"links": []any{}, "linksLock": false, "created": created, "lastModified": updated,
+			"title": title, "titleLock": meta.TitleLock, "summary": meta.Summary, "summaryLock": meta.SummaryLock,
+			"number": number, "numberLock": meta.NumberLock, "numberSort": numberSort, "numberSortLock": meta.NumberSortLock,
+			"releaseDate": releaseDate, "releaseDateLock": meta.ReleaseDateLock, "authors": authors, "authorsLock": meta.AuthorsLock,
+			"tags": tags, "tagsLock": meta.TagsLock, "isbn": meta.ISBN, "isbnLock": meta.ISBNLock,
+			"links": links, "linksLock": meta.LinksLock, "created": created, "lastModified": updated,
 		},
 		"readProgress": func() any {
 			if !hasProgress {
@@ -971,7 +1018,7 @@ func bookDTOWithProgressAndMeta(
 			}
 			return bookReadProgressDTO(progress)
 		}(),
-		"deleted": false, "oneshot": series.OneShot,
+		"deleted": false, "oneshot": series.EffectiveOneShot(),
 	}
 }
 

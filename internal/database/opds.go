@@ -127,9 +127,9 @@ func (s *Store) SeriesBookOrdinals(ctx context.Context, seriesID string) (map[st
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT b.id
-FROM books b
+FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id
 WHERE b.series_id=?
-ORDER BY b.number_sort ASC, b.name COLLATE NOCASE ASC, b.id ASC`, seriesID)
+ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC, b.name COLLATE NOCASE ASC, b.id ASC`, seriesID)
 	if err != nil {
 		return nil, err
 	}
@@ -215,10 +215,10 @@ ORDER BY MAX(p.updated_at) DESC, p.series_id ASC`
 		var bookID string
 		err := s.db.QueryRowContext(ctx, `
 SELECT b.id
-FROM books b
+FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id
 WHERE b.series_id=?
   AND NOT EXISTS (SELECT 1 FROM book_read_progress p WHERE p.user_id=? AND p.book_id=b.id)
-ORDER BY b.number_sort ASC, b.name COLLATE NOCASE ASC, b.id ASC
+ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC, b.name COLLATE NOCASE ASC, b.id ASC
 LIMIT 1`, sid, userID).Scan(&bookID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {

@@ -591,14 +591,15 @@ func (s *Server) listLibraries(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createLibrary(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		Name             string   `json:"name"`
-		ProviderType     string   `json:"providerType"`
-		RootCID          string   `json:"rootCid"`
-		WebDAVAccountID  string   `json:"webdavAccountId"`
-		RootPath         string   `json:"rootPath"`
-		Enabled          *bool    `json:"enabled"`
-		OneShot          bool     `json:"oneShot"`
-		MemberLibraryIDs []string `json:"memberLibraryIds"`
+		Name              string   `json:"name"`
+		ProviderType      string   `json:"providerType"`
+		RootCID           string   `json:"rootCid"`
+		WebDAVAccountID   string   `json:"webdavAccountId"`
+		RootPath          string   `json:"rootPath"`
+		Enabled           *bool    `json:"enabled"`
+		OneShot           bool     `json:"oneShot"`
+		OneshotsDirectory string   `json:"oneshotsDirectory"`
+		MemberLibraryIDs  []string `json:"memberLibraryIds"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
@@ -698,6 +699,8 @@ func (s *Server) createLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	item.OneshotsDirectory = strings.TrimSpace(request.OneshotsDirectory)
+
 	var existing int
 	_ = s.store.DB().QueryRowContext(r.Context(), `SELECT count(*) FROM libraries WHERE id=?`, item.ID).Scan(&existing)
 	if existing > 0 {
@@ -731,10 +734,11 @@ func (s *Server) updateLibrary(w http.ResponseWriter, r *http.Request) {
 	}
 	wasEnabled := item.Enabled
 	var request struct {
-		Name             *string   `json:"name"`
-		Enabled          *bool     `json:"enabled"`
-		OneShot          *bool     `json:"oneShot"`
-		MemberLibraryIDs *[]string `json:"memberLibraryIds"`
+		Name              *string   `json:"name"`
+		Enabled           *bool     `json:"enabled"`
+		OneShot           *bool     `json:"oneShot"`
+		OneshotsDirectory *string   `json:"oneshotsDirectory"`
+		MemberLibraryIDs  *[]string `json:"memberLibraryIds"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
@@ -766,7 +770,8 @@ func (s *Server) updateLibrary(w http.ResponseWriter, r *http.Request) {
 	if request.Enabled != nil {
 		item.Enabled = *request.Enabled
 	}
-	if request.OneShot != nil && *request.OneShot != item.OneShot {
+	if (request.OneShot != nil && *request.OneShot != item.OneShot) ||
+		(request.OneshotsDirectory != nil && strings.TrimSpace(*request.OneshotsDirectory) != item.OneshotsDirectory) {
 		var active int
 		if err := s.store.DB().QueryRowContext(r.Context(), `
 SELECT count(*) FROM scan_runs WHERE library_id=? AND status IN ('queued','running')`,
@@ -779,7 +784,12 @@ SELECT count(*) FROM scan_runs WHERE library_id=? AND status IN ('queued','runni
 				"Cancel the active or queued scan before changing One-Shots mode.")
 			return
 		}
-		item.OneShot = *request.OneShot
+		if request.OneShot != nil {
+			item.OneShot = *request.OneShot
+		}
+		if request.OneshotsDirectory != nil {
+			item.OneshotsDirectory = strings.TrimSpace(*request.OneshotsDirectory)
+		}
 	}
 	if err := s.store.UpsertLibrary(r.Context(), item); err != nil {
 		s.writeDBError(w, r, err)
@@ -1390,6 +1400,7 @@ func (s *Server) seriesRichDetail(w http.ResponseWriter, r *http.Request) {
 		"providerType":      library.ProviderType,
 		"webdavAccountName": library.WebDAVAccountName,
 		"oneShot":           library.OneShot,
+		"oneshotsDirectory": library.OneshotsDirectory,
 	}
 	if len(library.UnionLayers) > 0 {
 		libPayload["unionLayers"] = library.UnionLayers
@@ -1433,6 +1444,11 @@ func (s *Server) bookRichDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	library, _ := s.store.LibraryBasic(r.Context(), book.LibraryID)
 	seriesMeta, _ := s.store.SeriesMetadataByID(r.Context(), series)
+	bookMeta, _, err := s.store.BookMetadataByID(r.Context(), book.ID)
+	if err != nil {
+		s.writeDBError(w, r, err)
+		return
+	}
 	progress, hasProgress, _ := s.store.BookReadProgress(r.Context(), book.ID)
 	pageProgress, hasPageProgress, _ := s.store.BookPageProgress(r.Context(), book.ID)
 	indexStats, hasIndexStats, _ := s.store.ArchiveIndexStats(r.Context(), book.ID)
@@ -1492,7 +1508,7 @@ func (s *Server) bookRichDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"book":              bookDTOWithProgressAndMeta(book, series, seriesMeta, progress, hasProgress),
+		"book":              bookDTOWithProgressAndMeta(book, series, seriesMeta, progress, hasProgress, bookMeta),
 		"seriesId":          series.ID,
 		"seriesTitle":       seriesMeta.Title,
 		"originalSeries":    series.Name,

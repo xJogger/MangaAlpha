@@ -100,6 +100,9 @@ DROP TRIGGER IF EXISTS trg_sfts_authors_ad;
 DROP TRIGGER IF EXISTS trg_sfts_books_ai;
 DROP TRIGGER IF EXISTS trg_sfts_books_au;
 DROP TRIGGER IF EXISTS trg_sfts_books_ad;
+DROP TRIGGER IF EXISTS trg_sfts_book_metadata_ai;
+DROP TRIGGER IF EXISTS trg_sfts_book_metadata_au;
+DROP TRIGGER IF EXISTS trg_sfts_book_metadata_ad;
 DROP TABLE IF EXISTS series_search_fts;
 DROP TABLE IF EXISTS books_search_fts;
 DROP TABLE IF EXISTS series_search_docs;
@@ -225,6 +228,22 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_sfts_books_ad AFTER DELETE ON books BEGIN
   INSERT INTO search_fts_dirty(kind, row_id, gen) VALUES('b', OLD.rowid, 1)
   ON CONFLICT(kind, row_id) DO UPDATE SET gen = gen + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_sfts_book_metadata_ai AFTER INSERT ON book_metadata BEGIN
+  INSERT INTO search_fts_dirty(kind,row_id,gen)
+  SELECT 'b',b.rowid,1 FROM books b WHERE b.id=NEW.book_id
+  ON CONFLICT(kind,row_id) DO UPDATE SET gen=gen+1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_sfts_book_metadata_au AFTER UPDATE OF title,summary,tags_json,authors_json ON book_metadata
+WHEN (OLD.title,OLD.summary,OLD.tags_json,OLD.authors_json) IS NOT (NEW.title,NEW.summary,NEW.tags_json,NEW.authors_json) BEGIN
+  INSERT INTO search_fts_dirty(kind,row_id,gen)
+  SELECT 'b',b.rowid,1 FROM books b WHERE b.id=NEW.book_id
+  ON CONFLICT(kind,row_id) DO UPDATE SET gen=gen+1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_sfts_book_metadata_ad AFTER DELETE ON book_metadata BEGIN
+  INSERT INTO search_fts_dirty(kind,row_id,gen)
+  SELECT 'b',b.rowid,1 FROM books b WHERE b.id=OLD.book_id
+  ON CONFLICT(kind,row_id) DO UPDATE SET gen=gen+1;
 END;
 `)
 	return err
@@ -737,8 +756,22 @@ func (s *Store) attachSeriesFTSTaxonomies(ctx context.Context, batch []seriesFTS
 }
 
 type bookFTSRow struct {
-	rowID int64
-	name  string
+	rowID                                       int64
+	name, title, summary, tagsJSON, authorsJSON string
+}
+
+const bookFTSColumns = `b.rowid,b.name,COALESCE(bm.title,''),COALESCE(bm.summary,''),COALESCE(bm.tags_json,'[]'),COALESCE(bm.authors_json,'[]')`
+
+func (r bookFTSRow) indexText() string {
+	var tags []string
+	var authors []Author
+	_ = json.Unmarshal([]byte(r.tagsJSON), &tags)
+	_ = json.Unmarshal([]byte(r.authorsJSON), &authors)
+	parts := append([]string{r.name, r.title, r.summary}, tags...)
+	for _, author := range authors {
+		parts = append(parts, author.Name)
+	}
+	return cjk.FTSIndexText(strings.Join(parts, " "))
 }
 
 func (s *Store) rebuildBooksFTS(ctx context.Context) error {
@@ -765,10 +798,10 @@ func (s *Store) rebuildBooksFTS(ctx context.Context) error {
 	var lastRowID int64
 	for ctx.Err() == nil {
 		rows, err := s.db.QueryContext(ctx, `
-SELECT rowid, name
-FROM books
-WHERE rowid > ?
-ORDER BY rowid ASC
+SELECT `+bookFTSColumns+`
+FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id
+WHERE b.rowid > ?
+ORDER BY b.rowid ASC
 LIMIT ?`, lastRowID, searchFTSBooksBatchSize)
 		if err != nil {
 			return err
@@ -776,7 +809,7 @@ LIMIT ?`, lastRowID, searchFTSBooksBatchSize)
 		batch := make([]bookFTSRow, 0, min(searchFTSBooksBatchSize, 512))
 		for rows.Next() {
 			var r bookFTSRow
-			if err := rows.Scan(&r.rowID, &r.name); err != nil {
+			if err := rows.Scan(&r.rowID, &r.name, &r.title, &r.summary, &r.tagsJSON, &r.authorsJSON); err != nil {
 				rows.Close()
 				return err
 			}
@@ -837,13 +870,13 @@ func (s *Store) loadBooksFTSByRowIDs(ctx context.Context, rowIDs []int64) ([]boo
 			args[i] = id
 		}
 		rows, err := s.db.QueryContext(ctx, `
-SELECT rowid, name FROM books WHERE rowid IN `+Placeholders(len(chunk)), args...)
+SELECT `+bookFTSColumns+` FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id WHERE b.rowid IN `+Placeholders(len(chunk)), args...)
 		if err != nil {
 			return nil, nil, err
 		}
 		for rows.Next() {
 			var r bookFTSRow
-			if err := rows.Scan(&r.rowID, &r.name); err != nil {
+			if err := rows.Scan(&r.rowID, &r.name, &r.title, &r.summary, &r.tagsJSON, &r.authorsJSON); err != nil {
 				rows.Close()
 				return nil, nil, err
 			}
@@ -1026,7 +1059,7 @@ INSERT INTO books_search_fts(rowid, name_fts) VALUES(?,?)`)
 				return err
 			}
 		}
-		if _, err := insertFTSStmt.ExecContext(ctx, r.rowID, cjk.FTSIndexText(r.name)); err != nil {
+		if _, err := insertFTSStmt.ExecContext(ctx, r.rowID, r.indexText()); err != nil {
 			return err
 		}
 	}
