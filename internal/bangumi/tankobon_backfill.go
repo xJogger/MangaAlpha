@@ -16,6 +16,7 @@ import (
 const tankobonSeriesBatchSize = 50
 
 type tankobonChain struct {
+	sourceID      string
 	rank          int
 	higherSources map[string]bool
 }
@@ -45,7 +46,10 @@ func (s *Service) tankobonBackfillPlan(ctx context.Context) (tankobonBackfillPla
 	for _, src := range sources {
 		byID[src.ID] = src
 	}
-	plan := tankobonBackfillPlan{chains: make(map[string]tankobonChain, len(chains)), versions: versions}
+	plan := tankobonBackfillPlan{
+		chains: make(map[string]tankobonChain, len(chains)), versions: versions,
+		defaultChain: tankobonChain{sourceID: "bangumi"},
+	}
 	builtin, configured := byID["bangumi"]
 	if configured && !builtin.Enabled {
 		plan.defaultChain.rank = -1
@@ -59,6 +63,7 @@ func (s *Service) tankobonBackfillPlan(ctx context.Context) (tankobonBackfillPla
 			src := byID[link.SourceID]
 			if (link.SourceID == "bangumi" && plan.defaultChain.rank == 0) ||
 				(src.Kind == "bangumi_archive" && src.Enabled && src.Ready) {
+				chain.sourceID = link.SourceID
 				chain.rank = rank
 				break
 			}
@@ -140,11 +145,13 @@ type tankobonBatchQueryer interface {
 }
 
 func loadTankobonBookBatch(ctx context.Context, db tankobonBatchQueryer, targets map[string]tankobonSeriesRow) ([]tankobonBookRow, error) {
-	args := make([]any, 0, len(targets))
-	for id := range targets {
-		args = append(args, id)
+	args := make([]any, 0, 2*len(targets))
+	for id, target := range targets {
+		args = append(args, id, target.chain.sourceID)
 	}
+	values := strings.TrimSuffix(strings.Repeat("(?,?),", len(targets)), ",")
 	rows, err := db.QueryContext(ctx, `
+WITH targets(series_id,source_id) AS (VALUES `+values+`)
 SELECT b.id,b.series_id,b.name,sm.bgm_subject_id,coalesce(cs.chain_version,''),
  coalesce(m.number,''),m.book_id IS NOT NULL,coalesce(m.match_origin,''),coalesce(m.ext_source_id,''),
  coalesce(m.title,''),coalesce(m.summary,''),coalesce(m.release_date,''),coalesce(m.isbn,''),
@@ -153,14 +160,14 @@ SELECT b.id,b.series_id,b.name,sm.bgm_subject_id,coalesce(cs.chain_version,''),
  coalesce(sb.source_id,''),coalesce(sb.series_entry_id,''),coalesce(sb.entry_id,''),coalesce(sb.match_origin,''),
  coalesce(c.series_entry_id,''),coalesce(c.entry_id,''),coalesce(c.cover_kind,''),coalesce(c.cover_ref,''),
  coalesce(c.rank_order,0),coalesce(c.is_nsfw,0),coalesce(c.nsfw_known,0)
-FROM books b
+FROM targets CROSS JOIN books b ON b.series_id=targets.series_id
 JOIN series_metadata sm ON sm.series_id=b.series_id
 JOIN libraries l ON l.id=b.library_id
 LEFT JOIN library_metadata_chain_state cs ON cs.library_id=l.id
 LEFT JOIN book_metadata m ON m.book_id=b.id
 LEFT JOIN book_source_bindings sb ON sb.book_id=b.id
-LEFT JOIN book_cover_candidates c ON c.book_id=b.id AND c.source_id='bangumi'
-WHERE b.series_id IN `+database.Placeholders(len(args))+` AND sm.bgm_subject_id>0 AND `+visibleTankobonLibrary+`
+LEFT JOIN book_cover_candidates c ON c.book_id=b.id AND c.source_id=targets.source_id
+WHERE sm.bgm_subject_id>0 AND `+visibleTankobonLibrary+`
 ORDER BY b.series_id,b.effective_number_sort,b.name COLLATE NOCASE,b.id,sb.source_id`, args...)
 	if err != nil {
 		return nil, err
@@ -180,14 +187,15 @@ ORDER BY b.series_id,b.effective_number_sort,b.name COLLATE NOCASE,b.id,sb.sourc
 			&c.parent, &c.entry, &c.kind, &c.ref, &c.rank, &c.nsfw, &c.nsfwKnown); err != nil {
 			return nil, err
 		}
-		higher := targets[row.seriesID].chain.higherSources
+		chain := targets[row.seriesID].chain
+		higher := chain.higherSources
 		if len(books) == 0 || books[len(books)-1].BookID != row.BookID {
 			row.higherPriority = higher[extSource]
 			books = append(books, row)
 		}
 		book := &books[len(books)-1]
 		book.higherPriority = book.higherPriority || higher[source]
-		if source == "bangumi" {
+		if source == chain.sourceID {
 			book.binding = binding
 		}
 	}
@@ -195,17 +203,17 @@ ORDER BY b.series_id,b.effective_number_sort,b.name COLLATE NOCASE,b.id,sb.sourc
 }
 
 type tankobonBookUpdate struct {
-	id, origin    string
-	metadata      tankobonBookMetadata
-	binding       tankobonBookBinding
-	cover         tankobonBookCover
-	writeMetadata bool
-	writeBinding  bool
-	writeCover    bool
-	searchDirty   bool
+	id, sourceID, origin string
+	metadata             tankobonBookMetadata
+	binding              tankobonBookBinding
+	cover                tankobonBookCover
+	writeMetadata        bool
+	writeBinding         bool
+	writeCover           bool
+	searchDirty          bool
 }
 
-func diffTankobonBook(book tankobonBookRow, match VolumeMatchResult, rank int) (tankobonBookUpdate, bool) {
+func diffTankobonBook(book tankobonBookRow, match VolumeMatchResult, chain tankobonChain) (tankobonBookUpdate, bool) {
 	if !match.NSFWKnown || book.origin == "manual" || book.origin == "agent" ||
 		book.binding.origin == "manual" || book.binding.origin == "agent" {
 		return tankobonBookUpdate{}, false
@@ -239,10 +247,10 @@ func diffTankobonBook(book tankobonBookRow, match VolumeMatchResult, rank int) (
 	binding := tankobonBookBinding{parent: parent, entry: entry, origin: "auto"}
 	cover := tankobonBookCover{
 		parent: parent, entry: entry, kind: database.CoverKindBangumi, ref: match.CoverURL,
-		rank: rank, nsfw: match.NSFW, nsfwKnown: true,
+		rank: chain.rank, nsfw: match.NSFW, nsfwKnown: true,
 	}
 	update := tankobonBookUpdate{
-		id: book.BookID, origin: book.origin, metadata: m, binding: binding, cover: cover,
+		id: book.BookID, sourceID: chain.sourceID, origin: book.origin, metadata: m, binding: binding, cover: cover,
 		writeMetadata: m != book.metadata, writeBinding: binding != book.binding, writeCover: cover != book.cover,
 		searchDirty: m.title != book.metadata.title || m.summary != book.metadata.summary,
 	}
@@ -284,7 +292,7 @@ func diffTankobonBatch(ctx context.Context, books []tankobonBookRow, targets map
 			matchedSeries++
 		}
 		for _, match := range matches {
-			if update, changed := diffTankobonBook(byID[match.BookID], match, target.chain.rank); changed {
+			if update, changed := diffTankobonBook(byID[match.BookID], match, target.chain); changed {
 				updates = append(updates, update)
 			}
 		}
@@ -380,6 +388,7 @@ func (s *Service) syncOfflineTankobonBooks(ctx context.Context, force bool) (int
 		if err != nil {
 			return updatedBooks, err
 		}
+		planRetries = 0
 		matchedSeries += matched
 		if n > 0 {
 			completed = false
@@ -502,7 +511,7 @@ ON CONFLICT(book_id) DO UPDATE SET title=excluded.title,summary=excluded.summary
 	defer metadata.Close()
 	bindings, err := tx.PrepareContext(ctx, `
 INSERT INTO book_source_bindings(book_id,source_id,series_entry_id,entry_id,match_origin,updated_at)
-VALUES(?,'bangumi',?,?,?,?)
+VALUES(?,?,?,?,?,?)
 ON CONFLICT(book_id,source_id) DO UPDATE SET series_entry_id=excluded.series_entry_id,entry_id=excluded.entry_id,
  match_origin=excluded.match_origin,updated_at=excluded.updated_at`)
 	if err != nil {
@@ -511,7 +520,7 @@ ON CONFLICT(book_id,source_id) DO UPDATE SET series_entry_id=excluded.series_ent
 	defer bindings.Close()
 	covers, err := tx.PrepareContext(ctx, `
 INSERT INTO book_cover_candidates(book_id,source_id,series_entry_id,entry_id,cover_kind,cover_ref,rank_order,is_nsfw,nsfw_known,updated_at)
-VALUES(?,'bangumi',?,?,?,?,?,?,?,?)
+VALUES(?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(book_id,source_id) DO UPDATE SET series_entry_id=excluded.series_entry_id,entry_id=excluded.entry_id,
  cover_kind=excluded.cover_kind,cover_ref=excluded.cover_ref,rank_order=excluded.rank_order,
  is_nsfw=excluded.is_nsfw,nsfw_known=excluded.nsfw_known,updated_at=excluded.updated_at`)
@@ -537,14 +546,14 @@ ON CONFLICT(book_id,source_id) DO UPDATE SET series_entry_id=excluded.series_ent
 		}
 		if update.writeBinding {
 			b := update.binding
-			if _, err := bindings.ExecContext(ctx, update.id, b.parent, b.entry, b.origin, now); err != nil {
+			if _, err := bindings.ExecContext(ctx, update.id, update.sourceID, b.parent, b.entry, b.origin, now); err != nil {
 				return false, false, err
 			}
 		}
 		if update.writeCover {
 			visible = true
 			c := update.cover
-			if _, err := covers.ExecContext(ctx, update.id, c.parent, c.entry, c.kind, c.ref, c.rank, c.nsfw, c.nsfwKnown, now); err != nil {
+			if _, err := covers.ExecContext(ctx, update.id, update.sourceID, c.parent, c.entry, c.kind, c.ref, c.rank, c.nsfw, c.nsfwKnown, now); err != nil {
 				return false, false, err
 			}
 		}

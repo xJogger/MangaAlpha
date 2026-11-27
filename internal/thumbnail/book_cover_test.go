@@ -3,8 +3,10 @@ package thumbnail
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"fmt"
 	"image"
 	"log/slog"
 	"os"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/xJogger/fake-komga-115/internal/archive"
 	"github.com/xJogger/fake-komga-115/internal/database"
+	"github.com/xJogger/fake-komga-115/internal/importedcover"
 )
 
 func TestBookCoverPriorityAndSourceOverride(t *testing.T) {
@@ -68,18 +71,23 @@ func TestBookCoverPriorityAndSourceOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCover(second.ID, 24, 27)
-	if _, err := store.UpsertMetadataSource(ctx, database.MetadataSource{
-		ID: "catalog", Kind: "offline_sqlite", Name: "Catalog", Enabled: true, Ready: true,
+	for _, source := range []database.MetadataSource{
+		{ID: "catalog", Kind: "offline_sqlite", Name: "Catalog", Enabled: true, Ready: true},
+		{ID: "custom-archive", Kind: "bangumi_archive", Name: "Custom archive", Enabled: true, Ready: true},
+	} {
+		if _, err := store.UpsertMetadataSource(ctx, source); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SetLibraryMetadataSources(ctx, second.LibraryID, []string{"catalog", "custom-archive"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBookCoverCandidates(ctx, []database.BookCoverCandidate{
+		{BookID: second.ID, SourceID: "custom-archive", EntryID: "42", RankOrder: 1,
+			CoverKind: database.CoverKindBangumi, CoverRef: "https://bgm.tv/subject/42", NSFWKnown: true},
+		{BookID: second.ID, SourceID: "third", EntryID: "third-book", RankOrder: 2,
+			CoverKind: database.CoverKindHTTPURL, CoverRef: "https://example.invalid/third.png", NSFWKnown: true, IsNSFW: true},
 	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SetLibraryMetadataSources(ctx, second.LibraryID, []string{"catalog", "bangumi"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.UpsertBookCoverCandidates(ctx, []database.BookCoverCandidate{{
-		BookID: second.ID, SourceID: "bangumi", EntryID: "42", RankOrder: 1,
-		CoverKind: database.CoverKindBangumi, CoverRef: "https://bgm.tv/subject/42", NSFWKnown: true,
-	}}); err != nil {
 		t.Fatal(err)
 	}
 	assertCover(second.ID, 24, 27)
@@ -109,6 +117,14 @@ func TestBookCoverPriorityAndSourceOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCover(second.ID, 24, 27)
+	if err := store.SetLibraryMetadataSources(ctx, second.LibraryID, []string{"bangumi", "catalog", "custom-archive"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `
+UPDATE book_cover_candidates SET rank_order=rank_order+1 WHERE book_id=?`, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertCover(second.ID, 33, 55)
 	if err := store.SetBookCoverSource(ctx, second.ID, "book"); err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +143,132 @@ func TestBookCoverPriorityAndSourceOverride(t *testing.T) {
 	if _, _, err := s.GetBookCover(ctx, second.ID); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("hidden library allowed cover: %v", err)
 	}
+}
+
+func TestUnionBookCoverPrefersHigherMemberCandidate(t *testing.T) {
+	store, member, _ := thumbnailTestStore(t)
+	ctx := t.Context()
+	dir := t.TempDir()
+	s, err := NewWithDataDir(store, filepath.Join(dir, "series"), dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO libraries(id,name,root_cid,enabled,created_at,updated_at,provider_type)
+VALUES ('union','Union','union-root',1,'','','union');
+INSERT INTO union_layers(union_library_id,member_library_id,priority,created_at) VALUES ('union','lib',1,'');
+INSERT INTO series(id,library_id,cid,name,relative_path,created_at,updated_at,seen_scan_id)
+VALUES ('union-series','union','union-cid','Series','Series','','','scan');
+INSERT INTO books(id,series_id,library_id,file_id,parent_cid,name,size,pick_code,number_sort,created_at,updated_at,seen_scan_id)
+VALUES ('union-book','union-series','union','union-file','union-cid','001.cbz',123,'',1,'','','scan');
+INSERT INTO union_book_sources(union_book_id,source_book_id,source_library_id,priority)
+VALUES ('union-book','first','lib',1);
+`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpsertMetadataSource(ctx, database.MetadataSource{
+		ID: "komga", Kind: "offline_sqlite", Name: "Komga", Enabled: true, Ready: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, library := range []string{member.LibraryID, "union"} {
+		if err := store.SetLibraryMetadataSources(ctx, library, []string{"komga", "bangumi"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	imported, bgmPNG, external := testPNG(t, 24, 27), testPNG(t, 33, 55), testPNG(t, 36, 49)
+	bgm, _, _, err := compressWithMaxEdge(bgmPNG, 420)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := fmt.Sprintf("%x.png", sha256.Sum256(imported))
+	path, _ := importedcover.Path(s.importedCoversDir, ref)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, imported, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	memberCover := database.BookCoverCandidate{
+		BookID: member.ID, SourceID: "komga", EntryID: "imported", RankOrder: 0,
+		CoverKind: database.CoverKindImportedFile, CoverRef: ref, NSFWKnown: true,
+	}
+	if err := store.UpsertBookCoverCandidates(ctx, []database.BookCoverCandidate{
+		memberCover,
+		{BookID: "union-book", SourceID: "bangumi", EntryID: "42", RankOrder: 1,
+			CoverKind: database.CoverKindBangumi, CoverRef: "https://bgm.tv/subject/42", NSFWKnown: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bgmFetches := 0
+	s.SetBangumiCoverFetcher(func(context.Context, string, int64) ([]byte, error) {
+		bgmFetches++
+		return bgmPNG, nil
+	})
+	s.SetBookExternalCoverFetcher(func(context.Context, string, string, string, string) ([]byte, string, error) {
+		return external, "image/png", nil
+	})
+	assertCover := func(ctx context.Context, want []byte) {
+		t.Helper()
+		data, ok, err := s.GetBookCover(ctx, "union-book")
+		if err != nil || !ok || !bytes.Equal(data.Bytes, want) {
+			t.Fatalf("union book cover found=%t, matched=%t, err=%v", ok, bytes.Equal(data.Bytes, want), err)
+		}
+	}
+	allowed := database.WithUserScope(ctx, database.UserScope{
+		UserID: "reader", AllowedLibraryIDs: []string{"union", member.LibraryID},
+	})
+	unionOnly := database.WithUserScope(ctx, database.UserScope{
+		UserID: "reader", AllowedLibraryIDs: []string{"union"},
+	})
+	assertCover(allowed, imported)
+	if bgmFetches != 0 {
+		t.Fatal("Bangumi cover was fetched before the higher-priority member cover")
+	}
+	assertCover(unionOnly, bgm)
+	if err := store.SetBookCoverSource(ctx, "union-book", database.CoverSourceBangumi); err != nil {
+		t.Fatal(err)
+	}
+	assertCover(allowed, bgm)
+	if err := store.SetBookCoverSource(ctx, "union-book", database.CoverSourceAuto); err != nil {
+		t.Fatal(err)
+	}
+	memberCover.IsNSFW = true
+	if err := store.UpsertBookCoverCandidates(ctx, []database.BookCoverCandidate{memberCover}); err != nil {
+		t.Fatal(err)
+	}
+	assertCover(allowed, bgm)
+
+	// The union's chain also identifies a higher-priority source when the
+	// member's recorded rank is stale.
+	memberCover.IsNSFW = false
+	memberCover.RankOrder = 2
+	memberCover.CoverKind = database.CoverKindHTTPURL
+	memberCover.CoverRef = "https://example.invalid/vol.png"
+	if err := store.UpsertBookCoverCandidates(ctx, []database.BookCoverCandidate{memberCover}); err != nil {
+		t.Fatal(err)
+	}
+	assertCover(allowed, external)
+	if _, err := store.DB().ExecContext(ctx, `
+DELETE FROM book_cover_candidates WHERE book_id=? AND source_id=?`, member.ID, memberCover.SourceID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBookScrapedMetadata(ctx, member.ID, database.BookScrapedMetadata{
+		ExtSourceID: memberCover.SourceID, ExtEntryID: memberCover.EntryID, ExtCoverURL: memberCover.CoverRef,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertCover(allowed, external)
+	assertCover(unionOnly, bgm)
+	customName, err := s.SaveBookCustomCover(ctx, "union-book", testPNG(t, 45, 60))
+	if err != nil {
+		t.Fatal(err)
+	}
+	custom, err := os.ReadFile(filepath.Join(s.bookCoverDir, customName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCover(allowed, custom)
 }
 
 func TestReadingSecondVolumeCachesThumbnailBelowCustom(t *testing.T) {

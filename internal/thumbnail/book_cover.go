@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -106,6 +107,9 @@ func (s *Service) GetBookCover(ctx context.Context, bookID string) (Data, bool, 
 		return Data{}, false, err
 	}
 	for _, item := range candidates {
+		if !item.allowed {
+			continue
+		}
 		if data := s.fetchBookUserCover(ctx, item.book, item.meta, "custom"); len(data.Bytes) > 0 {
 			return s.visibleBookCover(ctx, bookID, data)
 		}
@@ -119,12 +123,16 @@ func (s *Service) GetBookCover(ctx context.Context, bookID string) (Data, bool, 
 	}
 	if mode != database.CoverSourceBook {
 		var hasOwnChain bool
-		for _, item := range candidates {
+		for i, item := range candidates {
 			if !item.allowed {
 				continue
 			}
-			cover, hasChain := s.resolveBookMetadataCover(ctx, item, mode)
-			if item.book.ID == bookID {
+			var members []bookCoverCandidate
+			if i == 0 && mode != database.CoverSourceBangumi {
+				members = candidates[1:]
+			}
+			cover, hasChain := s.resolveBookMetadataCover(ctx, item, mode, members)
+			if i == 0 {
 				hasOwnChain = hasChain
 			}
 			if len(cover.Bytes) > 0 {
@@ -153,23 +161,26 @@ func (s *Service) GetBookCover(ctx context.Context, bookID string) (Data, bool, 
 	return Data{}, false, nil
 }
 
-func (s *Service) resolveBookMetadataCover(ctx context.Context, item bookCoverCandidate, mode string) (Data, bool) {
+func (s *Service) resolveBookMetadataCover(ctx context.Context, item bookCoverCandidate, mode string, members []bookCoverCandidate) (Data, bool) {
 	candidates, err := s.store.ListBookCoverCandidates(ctx, item.book.ID)
 	if err != nil {
 		return Data{}, true
 	}
+	var chain []database.LibraryMetadataSource
+	chainLoaded := false
+	higherChain := func(rank int) []database.LibraryMetadataSource {
+		if !chainLoaded {
+			chain, _ = s.store.ListLibraryMetadataSources(ctx, item.book.LibraryID)
+			chainLoaded = true
+		}
+		return chain[:min(len(chain), rank)]
+	}
 	// A backfilled Bangumi candidate can be the first chain row for a book
 	// whose older external cover is still stored in book_metadata.
-	if len(candidates) == 1 && candidates[0].SourceID == "bangumi" && candidates[0].RankOrder > 0 &&
+	if len(candidates) > 0 && candidates[0].CoverKind == database.CoverKindBangumi && candidates[0].RankOrder > 0 &&
 		mode != database.CoverSourceBangumi && item.meta.ExtSourceID != "" && item.meta.ExtCoverURL != "" {
-		chain, _ := s.store.ListLibraryMetadataSources(ctx, item.book.LibraryID)
-		for _, link := range chain[:min(len(chain), candidates[0].RankOrder)] {
-			if link.SourceID == item.meta.ExtSourceID && link.Enabled && link.SourceEnabled {
-				if data := s.fetchBookUserCover(ctx, item.book, item.meta, "ext"); len(data.Bytes) > 0 {
-					return data, true
-				}
-				break
-			}
+		if data := s.fetchLegacyBookCoverInChain(ctx, item, higherChain(candidates[0].RankOrder)); len(data.Bytes) > 0 {
+			return data, true
 		}
 	}
 	preferred := func(c database.BookCoverCandidate) bool {
@@ -186,48 +197,101 @@ func (s *Service) resolveBookMetadataCover(ctx context.Context, item bookCoverCa
 		if !s.coverRatingAllowed(ctx, c.IsNSFW, c.NSFWKnown) {
 			return Data{}
 		}
-		switch c.CoverKind {
-		case database.CoverKindImportedFile:
-			return s.importedCover(c.CoverRef)
-		case database.CoverKindBangumi:
-			id, _ := strconv.ParseInt(c.EntryID, 10, 64)
-			if id <= 0 {
-				return Data{}
+		// Check higher-priority member covers before loading a lower-priority union cover.
+		if len(members) > 0 && c.RankOrder > 0 {
+			if data := s.fetchHigherMemberBookCover(ctx, members, higherChain(c.RankOrder), c.RankOrder, mode); len(data.Bytes) > 0 {
+				return data
 			}
-			data, _ := s.getBookBangumiCover(ctx, database.BookMetadata{BgmSubjectID: id, BgmCoverURL: c.CoverRef, BgmIsNSFW: c.IsNSFW || !c.NSFWKnown})
-			return data
-		case database.CoverKindHTTPURL:
-			return s.fetchExternalBookCover(ctx, c.SourceID, c.EntryID, c.SeriesEntryID, c.CoverRef)
 		}
-		return Data{}
+		return s.fetchRankedBookCover(ctx, c)
 	}
 	for _, c := range candidates {
 		if preferred(c) {
 			if data := fetchCandidate(c); len(data.Bytes) > 0 {
-				return data, len(candidates) > 0
+				return data, true
 			}
 		}
 	}
 	if len(candidates) == 0 {
 		if mode != database.CoverSourceBangumi {
 			if data := s.fetchBookUserCover(ctx, item.book, item.meta, "ext"); len(data.Bytes) > 0 {
-				return data, len(candidates) > 0
+				return data, false
 			}
 		}
 		if item.meta.BgmSubjectID > 0 {
 			if data, _ := s.getBookBangumiCover(ctx, item.meta); len(data.Bytes) > 0 {
-				return data, len(candidates) > 0
+				return data, false
 			}
 		}
 	}
 	for _, c := range candidates {
 		if !preferred(c) {
 			if data := fetchCandidate(c); len(data.Bytes) > 0 {
-				return data, len(candidates) > 0
+				return data, true
 			}
 		}
 	}
 	return Data{}, len(candidates) > 0
+}
+
+func (s *Service) fetchLegacyBookCoverInChain(ctx context.Context, item bookCoverCandidate, chain []database.LibraryMetadataSource) Data {
+	if item.meta.ExtSourceID == "" || item.meta.ExtCoverURL == "" {
+		return Data{}
+	}
+	for _, link := range chain {
+		if link.SourceID == "bangumi" || link.SourceKind == "bangumi_archive" {
+			break
+		}
+		if link.SourceID == item.meta.ExtSourceID && link.Enabled && link.SourceEnabled {
+			return s.fetchBookUserCover(ctx, item.book, item.meta, "ext")
+		}
+	}
+	return Data{}
+}
+
+func (s *Service) fetchHigherMemberBookCover(ctx context.Context, members []bookCoverCandidate, chain []database.LibraryMetadataSource, rank int, mode string) Data {
+	for _, member := range members {
+		if !member.allowed {
+			continue
+		}
+		covers, err := s.store.ListBookCoverCandidates(ctx, member.book.ID)
+		if err != nil {
+			continue
+		}
+		for _, c := range covers {
+			if (mode == "ext" && c.CoverKind == database.CoverKindBangumi) ||
+				!s.coverRatingAllowed(ctx, c.IsNSFW, c.NSFWKnown) {
+				continue
+			}
+			if c.RankOrder < rank || slices.ContainsFunc(chain, func(link database.LibraryMetadataSource) bool {
+				return link.SourceID == c.SourceID
+			}) {
+				if data := s.fetchRankedBookCover(ctx, c); len(data.Bytes) > 0 {
+					return data
+				}
+			}
+		}
+		if data := s.fetchLegacyBookCoverInChain(ctx, member, chain); len(data.Bytes) > 0 {
+			return data
+		}
+	}
+	return Data{}
+}
+
+func (s *Service) fetchRankedBookCover(ctx context.Context, c database.BookCoverCandidate) Data {
+	switch c.CoverKind {
+	case database.CoverKindImportedFile:
+		return s.importedCover(c.CoverRef)
+	case database.CoverKindBangumi:
+		id, _ := strconv.ParseInt(c.EntryID, 10, 64)
+		if id > 0 {
+			data, _ := s.getBookBangumiCover(ctx, database.BookMetadata{BgmSubjectID: id, BgmCoverURL: c.CoverRef, BgmIsNSFW: c.IsNSFW || !c.NSFWKnown})
+			return data
+		}
+	case database.CoverKindHTTPURL:
+		return s.fetchExternalBookCover(ctx, c.SourceID, c.EntryID, c.SeriesEntryID, c.CoverRef)
+	}
+	return Data{}
 }
 
 func (s *Service) visibleBookCover(ctx context.Context, id string, data Data) (Data, bool, error) {

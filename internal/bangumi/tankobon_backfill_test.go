@@ -35,6 +35,7 @@ INSERT INTO union_layers(union_library_id,member_library_id,priority,created_at)
 `)
 	for _, src := range []database.MetadataSource{
 		{ID: "komga", Kind: "offline_sqlite", Name: "Komga", Enabled: true, Ready: true},
+		{ID: "custom-archive", Kind: "bangumi_archive", Name: "Custom archive", Enabled: true, Ready: true},
 		{ID: "offline-disabled", Kind: "bangumi_archive", Name: "Disabled archive", Enabled: false, Ready: true},
 	} {
 		if _, err := store.UpsertMetadataSource(ctx, src); err != nil {
@@ -42,7 +43,7 @@ INSERT INTO union_layers(union_library_id,member_library_id,priority,created_at)
 		}
 	}
 	for library, sources := range map[string][]string{
-		"mixed": {"komga", "bangumi"}, "excluded": {"komga"}, "disabled": {"offline-disabled"},
+		"mixed": {"komga", "custom-archive"}, "excluded": {"komga"}, "disabled": {"offline-disabled"},
 	} {
 		if err := store.SetLibraryMetadataSources(ctx, library, sources); err != nil {
 			t.Fatal(err)
@@ -53,6 +54,7 @@ INSERT INTO union_layers(union_library_id,member_library_id,priority,created_at)
 		{"manual", "default", "auto"}, {"agent", "default", "auto"}, {"manual-binding", "default", ""},
 		{"old-binding", "default", ""}, {"automatic", "default", "auto"},
 		{"priority-binding", "mixed", "auto"}, {"priority-field", "mixed", "auto"}, {"no-priority-binding", "mixed", "auto"},
+		{"custom-manual-binding", "mixed", "auto"}, {"custom-agent-binding", "mixed", "auto"},
 		{"excluded", "excluded", "auto"}, {"disabled", "disabled", "auto"},
 		{"hidden", "hidden", "auto"}, {"member", "member", "auto"}, {"union", "union", "auto"},
 	} {
@@ -74,9 +76,13 @@ UPDATE book_metadata SET title_lock=1,summary_lock=1,release_date_lock=1,isbn_lo
 UPDATE book_metadata SET bgm_subject_id=909 WHERE book_id='old-binding';
 INSERT INTO book_source_bindings(book_id,source_id,series_entry_id,entry_id,match_origin,updated_at) VALUES
  ('priority-binding','komga','komga-parent','komga-vol','auto',''),
- ('manual-binding','bangumi','100','909','manual','');
+ ('manual-binding','bangumi','100','909','manual',''),
+ ('custom-manual-binding','custom-archive','100','909','manual',''),
+ ('custom-agent-binding','custom-archive','100','909','agent',''),
+ ('priority-field','custom-archive','100','909','auto','');
 INSERT INTO book_cover_candidates(book_id,source_id,entry_id,cover_kind,cover_ref,updated_at)
-VALUES ('priority-binding','komga','komga-vol','http_url','https://covers.example/fixture','');
+VALUES ('priority-binding','komga','komga-vol','http_url','https://covers.example/fixture',''),
+ ('priority-field','custom-archive','909','bangumi','https://covers.example/old','');
 `)
 
 	svc, err := NewService(store, dir, nil)
@@ -109,8 +115,15 @@ VALUES ('priority-binding','komga','komga-vol','http_url','https://covers.exampl
 			meta.BgmSubjectID != 101 || meta.BgmCoverURL != CoverEndpointURL(101) || meta.BgmIsNSFW {
 			t.Errorf("%s metadata = %+v, exists=%t err=%v", want.id, meta, ok, err)
 		}
+		sourceID, bindingCount := "bangumi", 1
+		if want.rank == 1 {
+			sourceID = "custom-archive"
+		}
+		if want.id == "priority-binding" {
+			bindingCount++
+		}
 		bindings, err := store.ListBookSourceBindings(ctx, want.id)
-		if err != nil || len(bindings) == 0 || bindings[0].SourceID != "bangumi" || bindings[0].SeriesEntryID != "100" ||
+		if err != nil || len(bindings) != bindingCount || bindings[0].SourceID != sourceID || bindings[0].SeriesEntryID != "100" ||
 			bindings[0].EntryID != "101" || bindings[0].MatchOrigin != "auto" {
 			t.Errorf("%s bindings = %+v, err=%v", want.id, bindings, err)
 		}
@@ -121,7 +134,7 @@ VALUES ('priority-binding','komga','komga-vol','http_url','https://covers.exampl
 			}
 			covers = covers[1:]
 		}
-		if err != nil || len(covers) != 1 || covers[0].CoverKind != database.CoverKindBangumi || covers[0].RankOrder != want.rank ||
+		if err != nil || len(covers) != 1 || covers[0].SourceID != sourceID || covers[0].CoverKind != database.CoverKindBangumi || covers[0].RankOrder != want.rank ||
 			covers[0].EntryID != "101" || !covers[0].NSFWKnown || covers[0].IsNSFW || covers[0].CoverRef != CoverEndpointURL(101) {
 			t.Errorf("%s candidates = %+v, err=%v", want.id, covers, err)
 		}
@@ -138,6 +151,7 @@ VALUES ('priority-binding','komga','komga-vol','http_url','https://covers.exampl
 	}{
 		{"manual", "Manual title", 0, true}, {"agent", "Agent title", 0, true},
 		{"old-binding", "Old binding", 909, true}, {"manual-binding", "", 0, false},
+		{"custom-manual-binding", "", 0, false}, {"custom-agent-binding", "", 0, false},
 		{"excluded", "", 0, false}, {"disabled", "", 0, false}, {"hidden", "", 0, false}, {"member", "", 0, false},
 	} {
 		book, ok, err := store.BookMetadataByID(ctx, skip.id)
@@ -147,6 +161,12 @@ VALUES ('priority-binding','komga','komga-vol','http_url','https://covers.exampl
 		candidates, err := store.ListBookCoverCandidates(ctx, skip.id)
 		if err != nil || len(candidates) != 0 {
 			t.Errorf("protected %s candidates = %+v, %v", skip.id, candidates, err)
+		}
+	}
+	for bookID, origin := range map[string]string{"custom-manual-binding": "manual", "custom-agent-binding": "agent"} {
+		bindings, err := store.ListBookSourceBindings(ctx, bookID)
+		if err != nil || len(bindings) != 1 || bindings[0].SourceID != "custom-archive" || bindings[0].EntryID != "909" || bindings[0].MatchOrigin != origin {
+			t.Errorf("protected %s bindings = %+v, %v", bookID, bindings, err)
 		}
 	}
 
@@ -164,6 +184,7 @@ VALUES ('priority-binding','komga','komga-vol','http_url','https://covers.exampl
 }
 
 var cancelBackfillFixture atomic.Pointer[context.CancelFunc]
+var changeBackfillChainFixture atomic.Pointer[func() error]
 
 func init() {
 	err := sqlite.RegisterScalarFunction("cancel_tankobon_backfill_fixture", 0,
@@ -175,6 +196,72 @@ func init() {
 		})
 	if err != nil {
 		panic(err)
+	}
+	err = sqlite.RegisterScalarFunction("change_tankobon_chain_fixture", 0,
+		func(*sqlite.FunctionContext, []driver.Value) (driver.Value, error) {
+			if change := changeBackfillChainFixture.Load(); change != nil {
+				return int64(0), (*change)()
+			}
+			return int64(0), nil
+		})
+	if err != nil {
+		panic(err)
+	}
+}
+
+func TestTankobonBackfillResetsChainRetriesAfterSuccessfulBatch(t *testing.T) {
+	ctx := t.Context()
+	store, err := database.Open(filepath.Join(t.TempDir(), "main.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	execTankobonFixture(t, store, `
+INSERT INTO libraries(id,name,root_cid,enabled,created_at,updated_at) VALUES ('default','Catalog','root',1,'','');
+`)
+	if _, err := store.UpsertMetadataSource(ctx, database.MetadataSource{
+		ID: "komga", Kind: "offline_sqlite", Name: "Komga", Enabled: true, Ready: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range tankobonSeriesBatchSize + 1 {
+		seedTankobonFixture(t, store, fmt.Sprintf("issue-%03d", i), "default", "auto")
+	}
+
+	archiveDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archiveDB.Close()
+	archiveDB.SetMaxOpenConns(1)
+	if _, err := archiveDB.ExecContext(ctx, `
+CREATE TABLE bgm_subject_relations(subject_id,related_subject_id,relation_type,sort_order);
+CREATE VIEW bgm_subjects AS
+ SELECT 101 AS id, 'Fixture Vol.1' AS name, '' AS name_cn, '' AS release_date, '' AS summary,
+ change_tankobon_chain_fixture() AS is_nsfw;
+INSERT INTO bgm_subject_relations VALUES (100,101,?,1);
+`, relationTypeTankobon); err != nil {
+		t.Fatal(err)
+	}
+	// Each archive lookup runs after the plan is read and before its batch is applied.
+	// Force three conflicts in the first batch and two in the second.
+	calls := 0
+	change := func() error {
+		calls++
+		switch calls {
+		case 1, 3, 6:
+			return store.SetLibraryMetadataSources(ctx, "default", []string{"komga", "bangumi"})
+		case 2, 5:
+			return store.SetLibraryMetadataSources(ctx, "default", []string{"bangumi"})
+		default:
+			return nil
+		}
+	}
+	changeBackfillChainFixture.Store(&change)
+	defer changeBackfillChainFixture.Store(nil)
+	svc := &Service{store: store, archive: &ArchiveIndex{db: archiveDB, status: ArchiveStatus{Ready: true}}}
+	if n, err := svc.syncOfflineTankobonBooks(ctx, false); n != tankobonSeriesBatchSize+1 || err != nil || calls != 7 {
+		t.Fatalf("backfill updated %d books in %d attempts: %v", n, calls, err)
 	}
 }
 
