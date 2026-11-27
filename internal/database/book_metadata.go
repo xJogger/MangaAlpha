@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -155,15 +156,15 @@ bgm_subject_id,bgm_cover_url,bgm_cover_path,bgm_is_nsfw,ext_source_id,ext_entry_
 custom_cover_path,custom_cover_url,cover_source,series_group,story_arc,story_arc_number,comicinfo_version,comicinfo_status,
 match_origin,updated_at,explicit_empty`
 
-func scanBookMetadata(row interface{ Scan(...any) error }) (BookMetadata, error) {
+func scanBookMetadata(row interface{ Scan(...any) error }, prefix ...any) (BookMetadata, error) {
 	var m BookMetadata
 	var authors, tags, links, updated string
-	err := row.Scan(&m.BookID, &m.Title, &m.Summary, &m.Number, &m.NumberSort, &m.ReleaseDate, &m.ISBN,
+	err := row.Scan(append(prefix, &m.BookID, &m.Title, &m.Summary, &m.Number, &m.NumberSort, &m.ReleaseDate, &m.ISBN,
 		&authors, &tags, &links, &m.TitleLock, &m.SummaryLock, &m.NumberLock, &m.NumberSortLock, &m.ReleaseDateLock,
 		&m.ISBNLock, &m.AuthorsLock, &m.TagsLock, &m.LinksLock, &m.BgmSubjectID, &m.BgmCoverURL, &m.BgmCoverPath,
 		&m.BgmIsNSFW, &m.ExtSourceID, &m.ExtEntryID, &m.ExtCoverURL, &m.ExtCoverPath, &m.CustomCoverPath,
 		&m.CustomCoverURL, &m.CoverSource, &m.SeriesGroup, &m.StoryArc, &m.StoryArcNumber, &m.ComicInfoVersion,
-		&m.ComicInfoStatus, &m.MatchOrigin, &updated, &m.explicitEmpty)
+		&m.ComicInfoStatus, &m.MatchOrigin, &updated, &m.explicitEmpty)...)
 	if err != nil {
 		return BookMetadata{}, err
 	}
@@ -370,45 +371,88 @@ func (s *Store) updateBookMetadata(ctx context.Context, bookID string, update fu
 	defer tx.Rollback()
 	m, err := scanBookMetadata(tx.QueryRowContext(ctx,
 		`SELECT `+bookMetadataColumns+` FROM book_metadata WHERE book_id=?`, bookID))
-	if errors.Is(err, sql.ErrNoRows) {
-		result, err := tx.ExecContext(ctx, `INSERT INTO book_metadata(book_id) SELECT id FROM books WHERE id=?`, bookID)
-		if err != nil {
+	hasMetadata := !errors.Is(err, sql.ErrNoRows)
+	if !hasMetadata {
+		m = BookMetadata{BookID: bookID, CoverSource: CoverSourceAuto}
+		var exists int
+		if err := tx.QueryRowContext(ctx, "SELECT 1 FROM books WHERE id=?", bookID).Scan(&exists); err != nil {
 			return err
 		}
-		if n, err := result.RowsAffected(); err != nil {
-			return err
-		} else if n == 0 {
-			return sql.ErrNoRows
-		}
-		m = BookMetadata{CoverSource: CoverSourceAuto}
 	} else if err != nil {
 		return err
 	}
+	before := m
 	if err := update(&m); err != nil {
 		return err
 	}
 	if m.NumberSort != nil && (math.IsInf(*m.NumberSort, 0) || math.IsNaN(*m.NumberSort)) {
 		return errors.New("book number sort must be finite")
 	}
-	authors, _ := json.Marshal(cleanAuthors(m.Authors))
-	tags, _ := json.Marshal(cleanStringSlice(m.Tags))
-	links, _ := json.Marshal(cleanWebLinks(m.Links))
-	if _, err := tx.ExecContext(ctx, `
-UPDATE book_metadata SET title=?,summary=?,number=?,number_sort=?,release_date=?,isbn=?,authors_json=?,tags_json=?,links_json=?,
- title_lock=?,summary_lock=?,number_lock=?,number_sort_lock=?,release_date_lock=?,isbn_lock=?,authors_lock=?,tags_lock=?,links_lock=?,
- bgm_subject_id=?,bgm_cover_url=?,bgm_cover_path=?,bgm_is_nsfw=?,ext_source_id=?,ext_entry_id=?,ext_cover_url=?,ext_cover_path=?,
- custom_cover_path=?,custom_cover_url=?,cover_source=?,series_group=?,story_arc=?,story_arc_number=?,comicinfo_version=?,comicinfo_status=?,
- match_origin=?,updated_at=?,explicit_empty=? WHERE book_id=?`,
-		m.Title, m.Summary, m.Number, m.NumberSort, m.ReleaseDate, m.ISBN, string(authors), string(tags), string(links),
-		m.TitleLock, m.SummaryLock, m.NumberLock, m.NumberSortLock, m.ReleaseDateLock, m.ISBNLock, m.AuthorsLock, m.TagsLock, m.LinksLock,
-		m.BgmSubjectID, m.BgmCoverURL, m.BgmCoverPath, m.BgmIsNSFW, m.ExtSourceID, m.ExtEntryID, m.ExtCoverURL, m.ExtCoverPath,
-		m.CustomCoverPath, m.CustomCoverURL, m.CoverSource, m.SeriesGroup, m.StoryArc, m.StoryArcNumber, m.ComicInfoVersion,
-		m.ComicInfoStatus, m.MatchOrigin, nowText(), m.explicitEmpty, bookID); err != nil {
+	m.Authors = preserveMetadataSet(before.Authors, m.Authors, cleanAuthors)
+	m.Tags = preserveMetadataSet(before.Tags, m.Tags, cleanStringSlice)
+	if len(before.Links) == 0 && len(cleanWebLinks(m.Links)) == 0 {
+		m.Links = before.Links
+	} else {
+		m.Links = cleanWebLinks(m.Links)
+	}
+	if hasMetadata && reflect.DeepEqual(before, m) {
+		return nil
+	}
+	stmt, err := tx.PrepareContext(ctx, upsertBookMetadataSQL)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	if err := execBookMetadataUpsert(ctx, stmt, m, nowText()); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.wakeSearchFTSWorker()
+	s.NotifyBookSearchDirty()
 	return nil
+}
+
+const upsertBookMetadataSQL = `
+INSERT INTO book_metadata(` + bookMetadataColumns + `) VALUES(
+ ?,?,?,?,?,?,?,?,?,?,
+ ?,?,?,?,?,?,?,?,?,
+ ?,?,?,?,?,?,?,?,
+ ?,?,?,?,?,?,?,?,?,
+ ?,?
+)
+ON CONFLICT(book_id) DO UPDATE SET
+ title=excluded.title,summary=excluded.summary,number=excluded.number,number_sort=excluded.number_sort,
+ release_date=excluded.release_date,isbn=excluded.isbn,authors_json=excluded.authors_json,
+ tags_json=excluded.tags_json,links_json=excluded.links_json,
+ title_lock=excluded.title_lock,summary_lock=excluded.summary_lock,number_lock=excluded.number_lock,
+ number_sort_lock=excluded.number_sort_lock,release_date_lock=excluded.release_date_lock,
+ isbn_lock=excluded.isbn_lock,authors_lock=excluded.authors_lock,tags_lock=excluded.tags_lock,links_lock=excluded.links_lock,
+ bgm_subject_id=excluded.bgm_subject_id,bgm_cover_url=excluded.bgm_cover_url,bgm_cover_path=excluded.bgm_cover_path,bgm_is_nsfw=excluded.bgm_is_nsfw,
+ ext_source_id=excluded.ext_source_id,ext_entry_id=excluded.ext_entry_id,ext_cover_url=excluded.ext_cover_url,ext_cover_path=excluded.ext_cover_path,
+ custom_cover_path=excluded.custom_cover_path,custom_cover_url=excluded.custom_cover_url,cover_source=excluded.cover_source,
+ series_group=excluded.series_group,story_arc=excluded.story_arc,story_arc_number=excluded.story_arc_number,
+ comicinfo_version=excluded.comicinfo_version,comicinfo_status=excluded.comicinfo_status,
+ match_origin=excluded.match_origin,updated_at=excluded.updated_at,explicit_empty=excluded.explicit_empty`
+
+func execBookMetadataUpsert(ctx context.Context, stmt *sql.Stmt, m BookMetadata, now string) error {
+	authors, _ := json.Marshal(cleanAuthors(m.Authors))
+	tags, _ := json.Marshal(cleanStringSlice(m.Tags))
+	links, _ := json.Marshal(cleanWebLinks(m.Links))
+	if m.CoverSource == "" {
+		m.CoverSource = CoverSourceAuto
+	}
+	_, err := stmt.ExecContext(ctx,
+		m.BookID, m.Title, m.Summary, m.Number, m.NumberSort, m.ReleaseDate, m.ISBN,
+		string(authors), string(tags), string(links),
+		m.TitleLock, m.SummaryLock, m.NumberLock, m.NumberSortLock, m.ReleaseDateLock,
+		m.ISBNLock, m.AuthorsLock, m.TagsLock, m.LinksLock,
+		m.BgmSubjectID, m.BgmCoverURL, m.BgmCoverPath, m.BgmIsNSFW,
+		m.ExtSourceID, m.ExtEntryID, m.ExtCoverURL, m.ExtCoverPath,
+		m.CustomCoverPath, m.CustomCoverURL, m.CoverSource,
+		m.SeriesGroup, m.StoryArc, m.StoryArcNumber,
+		m.ComicInfoVersion, m.ComicInfoStatus,
+		m.MatchOrigin, now, m.explicitEmpty,
+	)
+	return err
 }

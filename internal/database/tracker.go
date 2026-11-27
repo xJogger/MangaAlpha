@@ -181,10 +181,9 @@ func (s *Store) BangumiTrackerSeriesSnapshot(ctx context.Context, seriesID strin
 SELECT CASE WHEN p.book_id IS NULL THEN 0 ELSE 1 END AS has_progress,
  coalesce(p.completed,0), coalesce(p.page,0)
 FROM books b
-LEFT JOIN book_metadata bm ON bm.book_id=b.id
 LEFT JOIN book_read_progress p ON p.user_id=? AND p.book_id=b.id
 WHERE b.series_id=?
-ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC`, userID, series.ID)
+ORDER BY b.effective_number_sort ASC,b.name COLLATE NOCASE ASC,b.id ASC`, userID, series.ID)
 	if err != nil {
 		return BangumiTrackerSeriesSnapshot{}, false, err
 	}

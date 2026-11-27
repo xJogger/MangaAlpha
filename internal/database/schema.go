@@ -185,6 +185,8 @@ CREATE TABLE IF NOT EXISTS books (
   file_created_at TEXT,
   file_modified_at TEXT,
   number_sort REAL NOT NULL,
+  number_sort_override REAL,
+  effective_number_sort REAL GENERATED ALWAYS AS (COALESCE(number_sort_override, number_sort)) VIRTUAL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   seen_scan_id TEXT NOT NULL,
@@ -321,6 +323,7 @@ CREATE INDEX IF NOT EXISTS idx_series_authors_name ON series_authors(name COLLAT
 CREATE TABLE IF NOT EXISTS bangumi_scrape_runs (
   id TEXT PRIMARY KEY,
   library_id TEXT,
+  library_ids_json TEXT NOT NULL DEFAULT '',
   mode TEXT NOT NULL,
   force INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
@@ -676,6 +679,7 @@ CREATE TABLE IF NOT EXISTS metadata_sources (
   auto_update TEXT NOT NULL DEFAULT 'manual',
   online_api_url TEXT NOT NULL DEFAULT '',
   online_enabled INTEGER NOT NULL DEFAULT 0,
+  import_covers INTEGER NOT NULL DEFAULT 0,
   enabled INTEGER NOT NULL DEFAULT 0,
   ready INTEGER NOT NULL DEFAULT 0,
   entry_count INTEGER NOT NULL DEFAULT 0,
@@ -702,6 +706,35 @@ CREATE TABLE IF NOT EXISTS library_metadata_sources (
 );
 CREATE INDEX IF NOT EXISTS idx_lib_meta_sources_prio ON library_metadata_sources(library_id, priority);
 CREATE INDEX IF NOT EXISTS idx_lib_meta_sources_source ON library_metadata_sources(source_id);
+` + metadataUnionSchema
+
+const effectiveBookNumberIndexes = `
+CREATE INDEX IF NOT EXISTS idx_books_series_eff_number ON books(series_id, effective_number_sort, name COLLATE NOCASE, id);
+CREATE INDEX IF NOT EXISTS idx_books_eff_number ON books(effective_number_sort, name COLLATE NOCASE, id);
+CREATE INDEX IF NOT EXISTS idx_series_effective_oneshot ON series(library_id, id)
+WHERE one_shot = 1 OR (one_shot_override = 1 AND books_count = 1);
+`
+
+const legacyCoverRefIndexes = `
+CREATE INDEX IF NOT EXISTS idx_series_metadata_legacy_blob ON series_metadata(ext_cover_url)
+WHERE ext_cover_url GLOB 'sqlite-blob://*';
+CREATE INDEX IF NOT EXISTS idx_book_metadata_legacy_blob ON book_metadata(ext_cover_url)
+WHERE ext_cover_url GLOB 'sqlite-blob://*';
+`
+
+const bookNumberOverrideTriggers = `
+CREATE TRIGGER IF NOT EXISTS trg_book_number_override_insert AFTER INSERT ON book_metadata
+WHEN NEW.number_sort IS NOT NULL BEGIN
+ UPDATE books SET number_sort_override=NEW.number_sort WHERE id=NEW.book_id;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_book_number_override_update AFTER UPDATE OF number_sort ON book_metadata
+WHEN OLD.number_sort IS NOT NEW.number_sort BEGIN
+ UPDATE books SET number_sort_override=NEW.number_sort WHERE id=NEW.book_id;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_book_number_override_delete AFTER DELETE ON book_metadata
+WHEN OLD.number_sort IS NOT NULL BEGIN
+ UPDATE books SET number_sort_override=NULL WHERE id=OLD.book_id;
+END;
 `
 
 const bookMetadataSchema = `
@@ -762,4 +795,99 @@ CREATE TABLE IF NOT EXISTS book_thumbnails (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+`
+
+const metadataUnionSchema = `
+CREATE TABLE IF NOT EXISTS series_source_bindings (
+  series_id TEXT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL,
+  entry_id TEXT NOT NULL,
+  match_origin TEXT NOT NULL DEFAULT 'auto',
+  confidence REAL NOT NULL DEFAULT 0,
+  source_generation TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(series_id, source_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_series_source_bindings_src_gen ON series_source_bindings(source_id, source_generation);
+
+CREATE TABLE IF NOT EXISTS book_source_bindings (
+  book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL,
+  series_entry_id TEXT NOT NULL DEFAULT '',
+  entry_id TEXT NOT NULL,
+  match_origin TEXT NOT NULL DEFAULT 'auto',
+  confidence REAL NOT NULL DEFAULT 0,
+  source_generation TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(book_id, source_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_book_source_bindings_src_gen ON book_source_bindings(source_id, source_generation);
+
+CREATE TABLE IF NOT EXISTS series_cover_candidates (
+  series_id TEXT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL,
+  entry_id TEXT NOT NULL DEFAULT '',
+  cover_kind TEXT NOT NULL,
+  cover_ref TEXT NOT NULL,
+  is_nsfw INTEGER NOT NULL DEFAULT 0,
+  nsfw_known INTEGER NOT NULL DEFAULT 1,
+  rank_order INTEGER NOT NULL DEFAULT 0,
+  source_generation TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(series_id, source_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_series_cover_candidates_src_gen ON series_cover_candidates(source_id, source_generation);
+CREATE INDEX IF NOT EXISTS idx_series_cover_candidates_ref ON series_cover_candidates(cover_kind, cover_ref);
+
+CREATE TABLE IF NOT EXISTS book_cover_candidates (
+  book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL,
+  series_entry_id TEXT NOT NULL DEFAULT '',
+  entry_id TEXT NOT NULL DEFAULT '',
+  cover_kind TEXT NOT NULL,
+  cover_ref TEXT NOT NULL,
+  is_nsfw INTEGER NOT NULL DEFAULT 0,
+  nsfw_known INTEGER NOT NULL DEFAULT 1,
+  rank_order INTEGER NOT NULL DEFAULT 0,
+  source_generation TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(book_id, source_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_book_cover_candidates_src_gen ON book_cover_candidates(source_id, source_generation);
+CREATE INDEX IF NOT EXISTS idx_book_cover_candidates_ref ON book_cover_candidates(cover_kind, cover_ref);
+
+CREATE TABLE IF NOT EXISTS library_metadata_chain_state (
+  library_id TEXT PRIMARY KEY NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+  chain_version TEXT NOT NULL DEFAULT '',
+  applied_chain_version TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL
+);
+`
+
+const unionBookMetadataDirtySchema = `
+CREATE TABLE IF NOT EXISTS union_book_metadata_dirty (
+ library_id TEXT NOT NULL,
+ book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+ previous_source TEXT,
+ previous_size INTEGER,
+ PRIMARY KEY(library_id, book_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_union_book_metadata_dirty_book ON union_book_metadata_dirty(book_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_union_book_metadata_mapping_insert AFTER INSERT ON union_book_sources
+WHEN EXISTS (SELECT 1 FROM book_metadata WHERE book_id=NEW.source_book_id) BEGIN
+ INSERT INTO union_book_metadata_dirty(library_id,book_id)
+ SELECT library_id,id FROM books WHERE id=NEW.union_book_id ON CONFLICT DO NOTHING;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_union_book_metadata_mapping_delete AFTER DELETE ON union_book_sources
+WHEN NOT EXISTS (
+ SELECT 1 FROM union_book_sources WHERE union_book_id=OLD.union_book_id AND priority<OLD.priority
+) BEGIN
+ INSERT INTO union_book_metadata_dirty(library_id,book_id,previous_source,previous_size)
+ SELECT library_id,id,OLD.source_book_id,OLD.source_size FROM books WHERE id=OLD.union_book_id
+ ON CONFLICT(library_id,book_id) DO UPDATE SET
+  previous_size=excluded.previous_size,previous_source=excluded.previous_source
+ WHERE union_book_metadata_dirty.previous_source IS NULL;
+END;
 `

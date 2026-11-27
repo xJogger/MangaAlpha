@@ -54,6 +54,11 @@ func createShelfRevisions(db *sql.DB) error {
 		return err
 	}
 	needsRecreate := !triggerHasBulkGuard(db, "fk115_shelf_books_insert")
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	targets := []struct {
 		table, revision, update, condition string
 	}{
@@ -62,7 +67,7 @@ func createShelfRevisions(db *sql.DB) error {
 		{"series", "catalog", "", ""},
 		{"books", "catalog", "", ""},
 		{"book_metadata", "catalog", "", ""},
-		{"series_metadata", "catalog", " OF bgm_subject_id,scrape_status,bgm_score,bgm_rank,status,title,title_sort,publisher,is_nsfw,cover_source,genres_json,tags_json,authors_json,summary,alternate_titles_json,language", ""},
+		{"series_metadata", "catalog", "", ""},
 		{"series_tags", "catalog", "", ""},
 		{"series_genres", "catalog", "", ""},
 		{"series_authors", "catalog", "", ""},
@@ -74,11 +79,6 @@ func createShelfRevisions(db *sql.DB) error {
 	for _, t := range targets {
 		for _, op := range []string{"INSERT", "UPDATE", "DELETE"} {
 			trigName := fmt.Sprintf("fk115_shelf_%s_%s", t.table, strings.ToLower(op))
-			if needsRecreate {
-				if _, err := db.Exec("DROP TRIGGER IF EXISTS " + trigName); err != nil {
-					return err
-				}
-			}
 			suffix := ""
 			if op == "UPDATE" {
 				suffix = t.update
@@ -91,14 +91,66 @@ func createShelfRevisions(db *sql.DB) error {
 				}
 				cond += fmt.Sprintf(" AND %s.key='%s'", record, t.condition)
 			}
-			if _, err := db.Exec(fmt.Sprintf(
+			projectionCondition := shelfProjectionCondition(t.table, op)
+			rebuild := needsRecreate
+			if !rebuild && projectionCondition != "" {
+				var definition string
+				err := tx.QueryRow("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", trigName).Scan(&definition)
+				if err != nil && err != sql.ErrNoRows {
+					return err
+				}
+				rebuild = err == nil && !strings.Contains(definition, projectionCondition)
+			}
+			if rebuild {
+				if _, err := tx.Exec("DROP TRIGGER IF EXISTS " + trigName); err != nil {
+					return err
+				}
+			}
+			if _, err := tx.Exec(fmt.Sprintf(
 				"CREATE TRIGGER IF NOT EXISTS %s AFTER %s%s ON %s%s BEGIN UPDATE shelf_revision SET %s=%s+1 WHERE id=1; END",
-				trigName, op, suffix, t.table, cond, t.revision, t.revision)); err != nil {
+				trigName, op, suffix, t.table, cond+projectionCondition, t.revision, t.revision)); err != nil {
 				return err
 			}
 		}
 	}
-	return nil
+	return tx.Commit()
+}
+
+const shelfSeriesMetadataColumns = "bgm_subject_id,ext_source_id,ext_entry_id,ext_cover_url,ext_cover_path," +
+	"scrape_status,scrape_confidence,cover_source,bgm_cover_url,bgm_cover_path,bgm_score,bgm_rank,status,status_lock," +
+	"title,title_lock,title_sort,title_sort_lock,summary,summary_lock,reading_direction,reading_direction_lock," +
+	"publisher,publisher_lock,age_rating,age_rating_lock,language,language_lock,total_book_count,total_book_count_lock," +
+	"release_date,release_date_lock,genres_json,genres_lock,tags_json,tags_lock,authors_json,authors_lock," +
+	"alternate_titles_json,alternate_titles_lock,links_json,links_lock,sharing_labels_json,sharing_labels_lock,is_nsfw,nsfw_lock"
+const shelfBookMetadataColumns = "title,summary,number,release_date,isbn,authors_json,tags_json,links_json," +
+	"title_lock,summary_lock,number_lock,number_sort_lock,release_date_lock,isbn_lock,authors_lock,tags_lock,links_lock," +
+	"bgm_subject_id,bgm_cover_url,bgm_cover_path,bgm_is_nsfw,ext_source_id,ext_entry_id,ext_cover_url,ext_cover_path," +
+	"custom_cover_path,custom_cover_url,cover_source,series_group,story_arc,story_arc_number,explicit_empty"
+const shelfBookMetadataDefaults = "('','','','','','[]','[]','[]',0,0,0,0,0,0,0,0,0,0,'','',0,'','','','','','','auto','','','',0)"
+
+func shelfProjectionCondition(table, op string) string {
+	switch table {
+	case "books":
+		if op == "UPDATE" {
+			return " AND " + metadataTupleDiff("OLD", "NEW", "series_id,library_id,file_id,parent_cid,name,size,pick_code,sha1,"+
+				"file_created_at,file_modified_at,effective_number_sort,created_at,updated_at")
+		}
+	case "series_metadata":
+		if op == "UPDATE" {
+			return " AND " + metadataTupleDiff("OLD", "NEW", shelfSeriesMetadataColumns)
+		}
+	case "book_metadata":
+		if op == "UPDATE" {
+			return " AND " + metadataTupleDiff("OLD", "NEW", shelfBookMetadataColumns)
+		}
+		row := "NEW"
+		if op == "DELETE" {
+			row = "OLD"
+		}
+		return " AND (" + row + "." + strings.ReplaceAll(shelfBookMetadataColumns, ",", ","+row+".") +
+			") IS NOT " + shelfBookMetadataDefaults
+	}
+	return ""
 }
 
 func (s *Store) shelfRevision(ctx context.Context, includesProgress bool) (shelfRevision, error) {

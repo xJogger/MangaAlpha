@@ -45,6 +45,7 @@ WHERE (series.name,series.relative_path,series.one_shot,series.file_modified_at)
 	if err != nil {
 		return err
 	}
+	// Scan order supplies the base value. Metadata writes own number_sort_override.
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO books(id,series_id,library_id,file_id,parent_cid,name,size,pick_code,sha1,
  file_created_at,file_modified_at,number_sort,created_at,updated_at,seen_scan_id)

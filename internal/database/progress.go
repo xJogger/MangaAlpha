@@ -14,13 +14,12 @@ import (
 func (s *Store) SeriesReadProgress(ctx context.Context, seriesID string) (SeriesReadProgress, error) {
 	userID := UserIDFromContext(ctx)
 	rows, err := s.db.QueryContext(ctx, `
-SELECT COALESCE(bm.number_sort,b.number_sort), CASE WHEN p.book_id IS NULL THEN 0 ELSE 1 END AS has_progress,
+SELECT b.effective_number_sort, CASE WHEN p.book_id IS NULL THEN 0 ELSE 1 END AS has_progress,
  coalesce(p.completed,0)
 FROM books b
-LEFT JOIN book_metadata bm ON bm.book_id=b.id
 LEFT JOIN book_read_progress p ON p.user_id=? AND p.book_id=b.id
 WHERE b.series_id=?
-ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC`, userID, seriesID)
+ORDER BY b.effective_number_sort ASC,b.name COLLATE NOCASE ASC,b.id ASC`, userID, seriesID)
 	if err != nil {
 		return SeriesReadProgress{}, err
 	}
@@ -78,14 +77,13 @@ func (s *Store) SeriesReadProgresses(
 			args = append(args, id)
 		}
 		query := `
-SELECT b.series_id, COALESCE(bm.number_sort,b.number_sort),
+SELECT b.series_id, b.effective_number_sort,
  CASE WHEN p.book_id IS NULL THEN 0 ELSE 1 END AS has_progress,
  coalesce(p.completed,0)
 FROM books b
-LEFT JOIN book_metadata bm ON bm.book_id=b.id
 LEFT JOIN book_read_progress p ON p.user_id=? AND p.book_id=b.id
 WHERE b.series_id IN ` + Placeholders(len(chunk)) + `
-ORDER BY b.series_id ASC,COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC`
+ORDER BY b.series_id ASC,b.effective_number_sort ASC,b.name COLLATE NOCASE ASC,b.id ASC`
 		rows, err := s.db.QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, err
@@ -218,12 +216,12 @@ INSERT INTO book_read_progress_tombstones(user_id,book_id,series_id,deleted_at)
 SELECT p.user_id,p.book_id,p.series_id,?
 FROM book_read_progress p
 WHERE p.user_id=? AND p.book_id IN (
-  SELECT b.id FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id
-  WHERE b.series_id=? AND COALESCE(bm.number_sort,b.number_sort)>?
+  SELECT b.id FROM books b
+  WHERE b.series_id=? AND b.effective_number_sort>?
   UNION
   SELECT ubs.source_book_id FROM union_book_sources ubs
-  JOIN books ub ON ub.id=ubs.union_book_id LEFT JOIN book_metadata um ON um.book_id=ub.id
-  WHERE ub.series_id=? AND COALESCE(um.number_sort,ub.number_sort)>?
+  JOIN books ub ON ub.id=ubs.union_book_id
+  WHERE ub.series_id=? AND ub.effective_number_sort>?
 )
 ON CONFLICT(user_id,book_id) DO UPDATE SET
  series_id=excluded.series_id,
@@ -233,27 +231,26 @@ ON CONFLICT(user_id,book_id) DO UPDATE SET
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM book_read_progress
 WHERE user_id=? AND book_id IN (
-  SELECT b.id FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id
-  WHERE b.series_id=? AND COALESCE(bm.number_sort,b.number_sort)>?
+  SELECT b.id FROM books b
+  WHERE b.series_id=? AND b.effective_number_sort>?
   UNION
   SELECT ubs.source_book_id FROM union_book_sources ubs
-  JOIN books ub ON ub.id=ubs.union_book_id LEFT JOIN book_metadata um ON um.book_id=ub.id
-  WHERE ub.series_id=? AND COALESCE(um.number_sort,ub.number_sort)>?
+  JOIN books ub ON ub.id=ubs.union_book_id
+  WHERE ub.series_id=? AND ub.effective_number_sort>?
 )`, userID, seriesID, lastBookNumberSortRead, seriesID, lastBookNumberSortRead); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO book_read_progress(user_id,book_id,series_id,completed,read_date,completed_at,updated_at)
 SELECT ?,b.id,b.series_id,1,?,?,?
-FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id
-WHERE b.series_id=? AND COALESCE(bm.number_sort,b.number_sort)<=?
+FROM books b
+WHERE b.series_id=? AND b.effective_number_sort<=?
 UNION ALL
 SELECT ?,sb.id,sb.series_id,1,?,?,?
 FROM union_book_sources ubs
 JOIN books ub ON ub.id=ubs.union_book_id AND ub.series_id=?
 JOIN books sb ON sb.id=ubs.source_book_id
-LEFT JOIN book_metadata um ON um.book_id=ub.id
-WHERE COALESCE(um.number_sort,ub.number_sort)<=?
+WHERE ub.effective_number_sort<=?
 ON CONFLICT(user_id,book_id) DO UPDATE SET
  series_id=excluded.series_id,
  completed=1,
@@ -267,12 +264,12 @@ ON CONFLICT(user_id,book_id) DO UPDATE SET
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM book_read_progress_tombstones
 WHERE user_id=? AND book_id IN (
-  SELECT b.id FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id
-  WHERE b.series_id=? AND COALESCE(bm.number_sort,b.number_sort)<=?
+  SELECT b.id FROM books b
+  WHERE b.series_id=? AND b.effective_number_sort<=?
   UNION
   SELECT ubs.source_book_id FROM union_book_sources ubs
-  JOIN books ub ON ub.id=ubs.union_book_id LEFT JOIN book_metadata um ON um.book_id=ub.id
-  WHERE ub.series_id=? AND COALESCE(um.number_sort,ub.number_sort)<=?
+  JOIN books ub ON ub.id=ubs.union_book_id
+  WHERE ub.series_id=? AND ub.effective_number_sort<=?
 )`, userID, seriesID, lastBookNumberSortRead, seriesID, lastBookNumberSortRead); err != nil {
 		return err
 	}
@@ -625,12 +622,11 @@ func (s *Store) LatestBookPageProgressInSeries(
 	var updated string
 	err := s.db.QueryRowContext(ctx, `
 SELECT p.book_id,p.series_id,p.last_loaded_page,p.max_loaded_page,p.page_count,p.updated_at,
- b.name,COALESCE(bm.number_sort,b.number_sort)
+ b.name,b.effective_number_sort
 FROM book_page_progress p
 JOIN books b ON b.id=p.book_id
-LEFT JOIN book_metadata bm ON bm.book_id=b.id
 WHERE p.user_id=? AND p.series_id=?
-ORDER BY p.updated_at DESC,COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC
+ORDER BY p.updated_at DESC,b.effective_number_sort ASC,b.name COLLATE NOCASE ASC,b.id ASC
 LIMIT 1`, userID, seriesID).Scan(
 		&progress.BookID, &progress.SeriesID, &progress.LastLoadedPage,
 		&progress.MaxLoadedPage, &progress.PageCount, &updated,
@@ -748,14 +744,13 @@ selected AS (
 )
 SELECT totals.group_count,totals.book_count,g.day_key,g.group_key,b.id,
  coalesce(b.series_id,''),coalesce(b.library_id,''),coalesce(b.name,''),coalesce(b.size,0),coalesce(b.sha1,''),
- b.file_created_at,b.file_modified_at,coalesce(bm.number_sort,b.number_sort,0),coalesce(b.created_at,''),coalesce(b.updated_at,''),
+ b.file_created_at,b.file_modified_at,coalesce(b.effective_number_sort,0),coalesce(b.created_at,''),coalesce(b.updated_at,''),
  coalesce(z.page_count,0),coalesce(s.name,''),coalesce(s.one_shot,0),coalesce(s.one_shot_override,0),coalesce(s.books_count,0),coalesce(sm.title,''),sm.authors_json,sm.bgm_subject_id,
  coalesce(p.completed,0),p.page,p.read_date,p.completed_at,coalesce(p.updated_at,'')
 FROM (SELECT count(*) AS group_count,coalesce(sum(book_count),0) AS book_count FROM groups) totals
 LEFT JOIN selected g ON true
 LEFT JOIN activity a ON a.group_key=g.group_key AND a.day_key=g.day_key
 LEFT JOIN books b ON b.id=a.book_id
-LEFT JOIN book_metadata bm ON bm.book_id=b.id
 LEFT JOIN series s ON s.id=b.series_id
 LEFT JOIN series_metadata sm ON sm.series_id=s.id
 LEFT JOIN zip_indexes z ON z.book_id=b.id

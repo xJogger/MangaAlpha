@@ -1078,3 +1078,8 @@ INSERT INTO books_search_fts(rowid, name_fts) VALUES(?,?)`)
 	}
 	return tx.Commit()
 }
+
+// NotifyBookSearchDirty wakes the search worker after a committed batch of book metadata writes.
+func (s *Store) NotifyBookSearchDirty() {
+	s.wakeSearchFTSWorker()
+}

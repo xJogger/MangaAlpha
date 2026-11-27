@@ -54,6 +54,7 @@ type MetadataSource struct {
 	AutoUpdate      string `json:"autoUpdate"`
 	OnlineAPIURL    string `json:"onlineApiUrl"`
 	OnlineEnabled   bool   `json:"onlineEnabled"`
+	ImportCovers    bool   `json:"importCovers"`
 	Enabled         bool   `json:"enabled"`
 	Ready           bool   `json:"ready"`
 	EntryCount      int64  `json:"entryCount"`
@@ -130,7 +131,7 @@ download_url,manifest_url,release_api_url,asset_name,compression,
 local_path,sidecar_path,tag_dict_source_id,tag_display_mode,nsfw_rule,auto_update,
 online_api_url,online_enabled,enabled,ready,entry_count,file_size,
 remote_etag,remote_last_mod,remote_updated_at,local_sha256,
-last_checked_at,last_updated_at,last_error,created_at,updated_at`
+last_checked_at,last_updated_at,last_error,created_at,updated_at,import_covers`
 
 func scanMetadataRepoRow(scanner interface{ Scan(...any) error }) (MetadataRepo, error) {
 	var (
@@ -161,7 +162,7 @@ func scanMetadataSourceRow(scanner interface{ Scan(...any) error }) (MetadataSou
 		&item.LocalPath, &item.SidecarPath, &item.TagDictSourceID, &item.TagDisplayMode, &item.NSFWRule, &item.AutoUpdate,
 		&item.OnlineAPIURL, &onlineEnabledInt, &enabledInt, &readyInt, &item.EntryCount, &item.FileSize,
 		&item.RemoteETag, &item.RemoteLastMod, &item.RemoteUpdatedAt, &item.LocalSHA256,
-		&item.LastCheckedAt, &item.LastUpdatedAt, &item.LastError, &item.CreatedAt, &item.UpdatedAt,
+		&item.LastCheckedAt, &item.LastUpdatedAt, &item.LastError, &item.CreatedAt, &item.UpdatedAt, &item.ImportCovers,
 	); err != nil {
 		return MetadataSource{}, err
 	}
@@ -329,12 +330,22 @@ func (s *Store) DeleteMetadataRepo(ctx context.Context, id string) error {
 	}
 	defer tx.Rollback()
 
+	const repoSources = "IN (SELECT id FROM metadata_sources WHERE repo_id=?)"
+	var hasSources bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM metadata_sources WHERE repo_id=?)", id).Scan(&hasSources); err != nil {
+		return err
+	}
+	if hasSources {
+		if err := markLibrariesUsingSourceChainChanged(ctx, tx, repoSources, id, "delete"); err != nil {
+			return err
+		}
+		if err := clearMetadataSourceBindings(ctx, tx, repoSources, id); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM library_metadata_sources
 WHERE source_id IN (SELECT id FROM metadata_sources WHERE repo_id=?)`, id); err != nil {
-		return err
-	}
-	if err := clearMetadataSourceBindings(ctx, tx, "IN (SELECT id FROM metadata_sources WHERE repo_id=?)", id); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM metadata_sources WHERE repo_id=?`, id); err != nil {
@@ -383,6 +394,30 @@ func (s *Store) GetMetadataSource(ctx context.Context, id string) (MetadataSourc
 SELECT `+metadataSourceColumns+`
 FROM metadata_sources WHERE id=?`, strings.TrimSpace(id))
 	return scanMetadataSourceRow(row)
+}
+
+// CreateMetadataSource stores a source configuration, allocating an ID when needed.
+func (s *Store) CreateMetadataSource(ctx context.Context, src MetadataSource) (MetadataSource, error) {
+	return s.UpsertMetadataSource(ctx, src)
+}
+
+// UpdateMetadataSource saves the complete source configuration under its existing ID.
+func (s *Store) UpdateMetadataSource(ctx context.Context, src MetadataSource) (MetadataSource, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return MetadataSource{}, err
+	}
+	defer tx.Rollback()
+	src.ID = strings.TrimSpace(src.ID)
+	var id string
+	if err := tx.QueryRowContext(ctx, "SELECT id FROM metadata_sources WHERE id=?", src.ID).Scan(&id); err != nil {
+		return MetadataSource{}, err
+	}
+	saved, err := upsertMetadataSource(ctx, tx, src)
+	if err != nil {
+		return MetadataSource{}, err
+	}
+	return saved, tx.Commit()
 }
 
 // UpsertMetadataSource creates or updates a metadata source record.
@@ -452,6 +487,12 @@ func upsertMetadataSource(ctx context.Context, tx *sql.Tx, src MetadataSource) (
 		}
 	}
 
+	previous, err := metadataSourceChainVersion(ctx, tx, id)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return MetadataSource{}, err
+	}
+	missing := errors.Is(err, sql.ErrNoRows)
+
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO metadata_sources(
  `+metadataSourceColumns+`
@@ -461,7 +502,7 @@ INSERT INTO metadata_sources(
  ?,?,?,?,?,?,
  ?,?,?,?,?,?,
  ?,?,?,?,
- ?,?,?,?,?
+ ?,?,?,?,?,?
 )
 ON CONFLICT(id) DO UPDATE SET
  repo_id=excluded.repo_id,
@@ -484,6 +525,7 @@ ON CONFLICT(id) DO UPDATE SET
  online_api_url=excluded.online_api_url,
  online_enabled=excluded.online_enabled,
  enabled=excluded.enabled,
+ import_covers=excluded.import_covers,
  ready=excluded.ready,
  entry_count=excluded.entry_count,
  file_size=excluded.file_size,
@@ -505,11 +547,14 @@ ON CONFLICT(id) DO UPDATE SET
 		strings.TrimSpace(src.RemoteETag), strings.TrimSpace(src.RemoteLastMod),
 		strings.TrimSpace(src.RemoteUpdatedAt), strings.TrimSpace(src.LocalSHA256),
 		strings.TrimSpace(src.LastCheckedAt), strings.TrimSpace(src.LastUpdatedAt),
-		strings.TrimSpace(src.LastError), createdAt, now,
+		strings.TrimSpace(src.LastError), createdAt, now, src.ImportCovers,
 	); err != nil {
 		return MetadataSource{}, err
 	}
 
+	if err := markMetadataSourceVersionChange(ctx, tx, id, previous, missing); err != nil {
+		return MetadataSource{}, err
+	}
 	return scanMetadataSourceRow(tx.QueryRowContext(ctx, `
 SELECT `+metadataSourceColumns+` FROM metadata_sources WHERE id=?`, id))
 }
@@ -535,7 +580,16 @@ func (s *Store) UpdateMetadataSourceConfig(
 		normAuto = defaultAutoUpdate
 	}
 
-	res, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return MetadataSource{}, err
+	}
+	defer tx.Rollback()
+	previous, err := metadataSourceChainVersion(ctx, tx, id)
+	if err != nil {
+		return MetadataSource{}, err
+	}
+	res, err := tx.ExecContext(ctx, `
 UPDATE metadata_sources
 SET enabled=?,
     tag_dict_source_id=?,
@@ -564,7 +618,14 @@ WHERE id=?`,
 	if affected, _ := res.RowsAffected(); affected == 0 {
 		return MetadataSource{}, sql.ErrNoRows
 	}
-	return s.GetMetadataSource(ctx, id)
+	if err := markMetadataSourceVersionChange(ctx, tx, id, previous, false); err != nil {
+		return MetadataSource{}, err
+	}
+	src, err := scanMetadataSourceRow(tx.QueryRowContext(ctx, "SELECT "+metadataSourceColumns+" FROM metadata_sources WHERE id=?", id))
+	if err != nil {
+		return MetadataSource{}, err
+	}
+	return src, tx.Commit()
 }
 
 // UpdateMetadataSourceSyncState patches synchronization/index status fields on an existing metadata source.
@@ -636,7 +697,16 @@ func (s *Store) UpdateMetadataSourceSyncState(
 	sets = append(sets, "updated_at=?")
 	args = append(args, nowText(), id)
 
-	res, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return MetadataSource{}, err
+	}
+	defer tx.Rollback()
+	previous, err := metadataSourceChainVersion(ctx, tx, id)
+	if err != nil {
+		return MetadataSource{}, err
+	}
+	res, err := tx.ExecContext(ctx,
 		`UPDATE metadata_sources SET `+strings.Join(sets, ",")+` WHERE id=?`, args...)
 	if err != nil {
 		return MetadataSource{}, err
@@ -644,7 +714,14 @@ func (s *Store) UpdateMetadataSourceSyncState(
 	if affected, _ := res.RowsAffected(); affected == 0 {
 		return MetadataSource{}, sql.ErrNoRows
 	}
-	return s.GetMetadataSource(ctx, id)
+	if err := markMetadataSourceVersionChange(ctx, tx, id, previous, false); err != nil {
+		return MetadataSource{}, err
+	}
+	src, err := scanMetadataSourceRow(tx.QueryRowContext(ctx, "SELECT "+metadataSourceColumns+" FROM metadata_sources WHERE id=?", id))
+	if err != nil {
+		return MetadataSource{}, err
+	}
+	return src, tx.Commit()
 }
 
 // DeleteMetadataSource removes a metadata source and cleans up library_metadata_sources references atomically.
@@ -659,10 +736,14 @@ func (s *Store) DeleteMetadataSource(ctx context.Context, id string) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM library_metadata_sources WHERE source_id=?`, id); err != nil {
+	if err := markLibrariesUsingSourceChainChanged(ctx, tx, "= ?", id, "delete"); err != nil {
 		return err
 	}
 	if err := clearMetadataSourceBindings(ctx, tx, "= ?", id); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM library_metadata_sources WHERE source_id=?`, id); err != nil {
 		return err
 	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM metadata_sources WHERE id=?`, id)
@@ -673,17 +754,6 @@ func (s *Store) DeleteMetadataSource(ctx context.Context, id string) error {
 		return sql.ErrNoRows
 	}
 	return tx.Commit()
-}
-
-func clearMetadataSourceBindings(ctx context.Context, tx *sql.Tx, sourceFilter, id string) error {
-	_, err := tx.ExecContext(ctx, `
-UPDATE series_metadata SET ext_source_id='', ext_entry_id='', ext_cover_url='', ext_cover_path='',
- match_origin=CASE WHEN coalesce(bgm_subject_id,0)<=0 THEN '' ELSE match_origin END,
- scrape_status=CASE WHEN coalesce(bgm_subject_id,0)<=0 THEN 'none' ELSE scrape_status END,
- scrape_confidence=CASE WHEN coalesce(bgm_subject_id,0)<=0 THEN 0 ELSE scrape_confidence END,
- updated_at=?
-WHERE ext_source_id<>'' AND ext_source_id `+sourceFilter, nowText(), id)
-	return err
 }
 
 // ListLibraryMetadataSources returns the ordered metadata fallback chain configured for a library.
@@ -719,12 +789,28 @@ func (s *Store) SetLibraryMetadataSources(ctx context.Context, libraryID string,
 		return errors.New("libraryId is required")
 	}
 	cleanIDs := cleanStringSliceCaseSensitive(sourceIDs)
+	cleanIDsJSON, _ := json.Marshal(cleanIDs)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+
+	var unchanged bool
+	if err := tx.QueryRowContext(ctx, `
+SELECT NOT EXISTS (
+ SELECT source_id,priority,enabled FROM library_metadata_sources WHERE library_id=?
+ EXCEPT SELECT value,key+1,1 FROM json_each(?)
+) AND NOT EXISTS (
+ SELECT value,key+1,1 FROM json_each(?)
+ EXCEPT SELECT source_id,priority,enabled FROM library_metadata_sources WHERE library_id=?
+)`, libraryID, cleanIDsJSON, cleanIDsJSON, libraryID).Scan(&unchanged); err != nil {
+		return err
+	}
+	if unchanged {
+		return nil
+	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM library_metadata_sources WHERE library_id=?`, libraryID); err != nil {
 		return err
@@ -742,6 +828,13 @@ VALUES(?,?,?,1)`)
 				return err
 			}
 		}
+	}
+	version, err := randomHexID(16)
+	if err != nil {
+		return err
+	}
+	if err := markLibraryMetadataChainChanged(ctx, tx, libraryID, version); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

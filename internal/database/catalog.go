@@ -663,7 +663,7 @@ func (s *Store) queryBooksPage(ctx context.Context, q BookQuery) ([]Book, int64,
 			where += " AND p.completed=1"
 		}
 	}
-	order := "COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC"
+	order := bookNumberOrder
 	sortValue := strings.ToLower(strings.TrimSpace(q.Sort))
 	var orderArgs []any
 	switch {
@@ -679,15 +679,15 @@ func (s *Store) queryBooksPage(ctx context.Context, q BookQuery) ([]Book, int64,
  WHEN cjk_key(b.name) = ? THEN 0
  WHEN cjk_key(b.name) LIKE ? ESCAPE '\' THEN 1
  WHEN cjk_key(b.name) LIKE ? ESCAPE '\' THEN 2
- ELSE 3 END ASC, b.name COLLATE NOCASE ASC, COALESCE(bm.number_sort,b.number_sort) ASC, b.id ASC`
+ ELSE 3 END ASC, b.name COLLATE NOCASE ASC, b.effective_number_sort ASC, b.id ASC`
 			orderArgs = append(orderArgs, key, prefix, contains)
 		}
 	case strings.HasPrefix(sortValue, "readprogress.readdate"), strings.HasPrefix(sortValue, "readdate"):
 		if progMode != "" {
-			order = "p.updated_at " + sortDirection(sortValue) + ",COALESCE(bm.number_sort,b.number_sort) ASC,b.id ASC"
+			order = "p.updated_at " + sortDirection(sortValue) + ",b.effective_number_sort ASC,b.id ASC"
 		} else {
 			order = `COALESCE((SELECT p.updated_at FROM book_read_progress p WHERE p.user_id=? AND p.book_id=b.id), '') ` +
-				sortDirection(sortValue) + `,COALESCE(bm.number_sort,b.number_sort) ASC,b.id ASC`
+				sortDirection(sortValue) + `,b.effective_number_sort ASC,b.id ASC`
 			orderArgs = append(orderArgs, userID)
 		}
 	case strings.HasPrefix(sortValue, "lastmodifieddate"):
@@ -704,7 +704,7 @@ func (s *Store) queryBooksPage(ctx context.Context, q BookQuery) ([]Book, int64,
 	case strings.Contains(sortValue, "name,asc"):
 		order = "b.name COLLATE NOCASE ASC,b.id ASC"
 	case strings.Contains(sortValue, ",desc"):
-		order = "COALESCE(bm.number_sort,b.number_sort) DESC,b.name COLLATE NOCASE DESC,b.id DESC"
+		order = reverseBookNumberOrder
 	}
 
 	// For paged search queries, materialize matching 8-byte book rowids once (avoiding
@@ -728,10 +728,9 @@ func (s *Store) queryBooksPage(ctx context.Context, q BookQuery) ([]Book, int64,
 		}
 		query := candCTE + `, _tot AS (SELECT COUNT(*) AS n FROM _cand), _page AS (
 SELECT b.id,b.series_id,b.library_id,b.file_id,b.parent_cid,b.name,b.size,b.pick_code,b.sha1,
- b.file_created_at,b.file_modified_at,COALESCE(bm.number_sort,b.number_sort) AS number_sort,b.created_at,b.updated_at
+ b.file_created_at,b.file_modified_at,b.effective_number_sort AS number_sort,b.created_at,b.updated_at
 FROM _cand _c
 CROSS JOIN books b ON b.rowid=_c.book_rowid
-LEFT JOIN book_metadata bm ON bm.book_id=b.id
 ORDER BY ` + order + ` LIMIT ? OFFSET ?
 )
 SELECT p.id,p.series_id,p.library_id,p.file_id,p.parent_cid,p.name,p.size,p.pick_code,p.sha1,
@@ -770,10 +769,7 @@ LEFT JOIN zip_indexes z ON z.book_id=p.id`
 	if total == 0 {
 		return []Book{}, 0, nil
 	}
-	query := `
-SELECT b.id,b.series_id,b.library_id,b.file_id,b.parent_cid,b.name,b.size,b.pick_code,b.sha1,
- b.file_created_at,b.file_modified_at,COALESCE(bm.number_sort,b.number_sort),b.created_at,b.updated_at,
- coalesce(z.page_count,0)` + source + ` LEFT JOIN book_metadata bm ON bm.book_id=b.id LEFT JOIN zip_indexes z ON z.book_id=b.id` + where + ` ORDER BY ` + order
+	query := bookPageSelect(source, where, order, q.SeriesID != "")
 	queryArgs := make([]any, 0, len(sourceArgs)+len(args)+len(orderArgs)+2)
 	queryArgs = append(queryArgs, sourceArgs...)
 	queryArgs = append(queryArgs, args...)
@@ -789,6 +785,22 @@ SELECT b.id,b.series_id,b.library_id,b.file_id,b.parent_cid,b.name,b.size,b.pick
 	defer rows.Close()
 	items, err := scanBookRows(rows)
 	return items, total, err
+}
+
+// Keep the page in reading order using the corresponding index. The separate
+// count query can use the most selective index for its filters.
+func bookPageSelect(source, where, order string, singleSeries bool) string {
+	if source == " FROM books b" && (order == bookNumberOrder || order == reverseBookNumberOrder) {
+		index := "idx_books_eff_number"
+		if singleSeries {
+			index = "idx_books_series_eff_number"
+		}
+		source += " INDEXED BY " + index
+	}
+	return `
+SELECT b.id,b.series_id,b.library_id,b.file_id,b.parent_cid,b.name,b.size,b.pick_code,b.sha1,
+ b.file_created_at,b.file_modified_at,b.effective_number_sort,b.created_at,b.updated_at,
+ coalesce(z.page_count,0)` + source + ` LEFT JOIN zip_indexes z ON z.book_id=b.id` + where + ` ORDER BY ` + order
 }
 
 func (s *Store) queryProgressScopedBooks(
@@ -848,13 +860,12 @@ WHERE s.library_id IN ` + Placeholders(len(enabledLibs))
 		}
 		query := `
 SELECT b.id,b.series_id,b.library_id,b.file_id,b.parent_cid,b.name,b.size,b.pick_code,b.sha1,
- b.file_created_at,b.file_modified_at,COALESCE(bm.number_sort,b.number_sort),b.created_at,b.updated_at,
+ b.file_created_at,b.file_modified_at,b.effective_number_sort,b.created_at,b.updated_at,
  coalesce(z.page_count,0)
 FROM books b
-LEFT JOIN book_metadata bm ON bm.book_id=b.id
 LEFT JOIN zip_indexes z ON z.book_id=b.id
 WHERE b.series_id IN ` + Placeholders(len(chunk)) + `
-ORDER BY b.series_id ASC, COALESCE(bm.number_sort,b.number_sort) ASC, b.name COLLATE NOCASE ASC, b.id ASC`
+ORDER BY b.series_id ASC, b.effective_number_sort ASC, b.name COLLATE NOCASE ASC, b.id ASC`
 		rows, err := s.db.QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, 0, err
@@ -894,9 +905,9 @@ func (s *Store) bookByIDDirect(ctx context.Context, id string, includeHidden, ex
 	var created, updated string
 	query := `
 SELECT b.id,b.series_id,b.library_id,b.file_id,b.parent_cid,b.name,b.size,b.pick_code,b.sha1,
- b.file_created_at,b.file_modified_at,COALESCE(bm.number_sort,b.number_sort),b.created_at,b.updated_at,
+ b.file_created_at,b.file_modified_at,b.effective_number_sort,b.created_at,b.updated_at,
  coalesce(z.page_count,0)
-FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id`
+FROM books b`
 	if !includeHidden {
 		query += ` JOIN libraries l ON l.id=b.library_id AND l.enabled=1 AND NOT EXISTS (SELECT 1 FROM union_layers ul WHERE ul.member_library_id=l.id)`
 	}
@@ -984,13 +995,23 @@ WHERE id=? AND (NOT ? OR (one_shot=0 AND books_count=1))`, enabled, seriesID, en
 
 var ErrInvalidOneShotOverride = errors.New("one-shot override requires a regular series with exactly one book")
 
+const bookNumberOrder = "b.effective_number_sort ASC,b.name COLLATE NOCASE ASC,b.id ASC"
+const reverseBookNumberOrder = "b.effective_number_sort DESC,b.name COLLATE NOCASE DESC,b.id DESC"
+
 const effectiveOneShotSQL = "(s.one_shot = 1 OR (s.one_shot_override = 1 AND s.books_count = 1))"
+
+func oneShotPredicate(onlyOneShots bool) string {
+	if onlyOneShots {
+		return effectiveOneShotSQL
+	}
+	return "NOT " + effectiveOneShotSQL
+}
+
+const firstBookIDQuery = `SELECT b.id FROM books b WHERE b.series_id=? ORDER BY ` + bookNumberOrder + ` LIMIT 1`
 
 func (s *Store) FirstBookInSeries(ctx context.Context, seriesID string) (Book, error) {
 	var id string
-	err := s.db.QueryRowContext(ctx, `
-SELECT b.id FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id WHERE b.series_id=?
-ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC LIMIT 1`, seriesID).Scan(&id)
+	err := s.db.QueryRowContext(ctx, firstBookIDQuery, seriesID).Scan(&id)
 	if err != nil {
 		return Book{}, err
 	}
@@ -999,9 +1020,7 @@ ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.
 
 func (s *Store) FirstBookInSeriesAny(ctx context.Context, seriesID string) (Book, error) {
 	var id string
-	err := s.db.QueryRowContext(ctx, `
-SELECT b.id FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id WHERE b.series_id=?
-ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC LIMIT 1`, seriesID).Scan(&id)
+	err := s.db.QueryRowContext(ctx, firstBookIDQuery, seriesID).Scan(&id)
 	if err != nil {
 		return Book{}, err
 	}
@@ -1009,47 +1028,40 @@ ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.
 }
 
 func (s *Store) NextBookInSeries(ctx context.Context, current Book) (Book, error) {
-	var id string
-	err := s.db.QueryRowContext(ctx, `
-WITH ordered AS (
- SELECT b.id,
-  LEAD(b.id) OVER (
-   ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC
-  ) AS next_id
- FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id
- WHERE b.series_id=?
-)
-SELECT ordered.next_id
-FROM ordered
-JOIN series s ON s.id=?
-WHERE ordered.id=? AND ordered.next_id IS NOT NULL AND NOT `+effectiveOneShotSQL,
-		current.SeriesID, current.SeriesID, current.ID).Scan(&id)
-	if err != nil {
-		return Book{}, err
-	}
-	return s.BookByID(ctx, id)
+	return s.adjacentBookInSeries(ctx, current, ">", bookNumberOrder)
 }
 
 func (s *Store) PreviousBookInSeries(ctx context.Context, current Book) (Book, error) {
-	var id string
-	err := s.db.QueryRowContext(ctx, `
-WITH ordered AS (
- SELECT b.id,
-  LAG(b.id) OVER (
-   ORDER BY COALESCE(bm.number_sort,b.number_sort) ASC,b.name COLLATE NOCASE ASC,b.id ASC
-  ) AS previous_id
- FROM books b LEFT JOIN book_metadata bm ON bm.book_id=b.id
- WHERE b.series_id=?
-)
-SELECT ordered.previous_id
-FROM ordered
-JOIN series s ON s.id=?
-WHERE ordered.id=? AND ordered.previous_id IS NOT NULL AND NOT `+effectiveOneShotSQL,
-		current.SeriesID, current.SeriesID, current.ID).Scan(&id)
+	return s.adjacentBookInSeries(ctx, current, "<", reverseBookNumberOrder)
+}
+
+func siblingBookIDQuery(op, order string) string {
+	// Separate ranges let SQLite seek by name and ID when many books share a
+	// number. A row-value inequality only seeks by number with this collation.
+	seek := func(equal, field, current string) string {
+		return `(SELECT b.id FROM books b INDEXED BY idx_books_series_eff_number
+WHERE b.series_id=cur.series_id` + equal + ` AND ` + field + op + current +
+			` ORDER BY ` + order + ` LIMIT 1)`
+	}
+	sameNumber := " AND b.effective_number_sort=cur.effective_number_sort"
+	return `SELECT COALESCE(` +
+		seek(sameNumber+" AND b.name COLLATE NOCASE=cur.name", "b.id", "cur.id") + "," +
+		seek(sameNumber, "b.name COLLATE NOCASE", "cur.name") + "," +
+		seek("", "b.effective_number_sort", "cur.effective_number_sort") + `)
+FROM books cur JOIN series s ON s.id=cur.series_id
+WHERE cur.id=? AND cur.series_id=? AND NOT ` + effectiveOneShotSQL
+}
+
+func (s *Store) adjacentBookInSeries(ctx context.Context, current Book, op, order string) (Book, error) {
+	var id sql.NullString
+	err := s.db.QueryRowContext(ctx, siblingBookIDQuery(op, order), current.ID, current.SeriesID).Scan(&id)
 	if err != nil {
 		return Book{}, err
 	}
-	return s.BookByID(ctx, id)
+	if !id.Valid {
+		return Book{}, sql.ErrNoRows
+	}
+	return s.BookByID(ctx, id.String)
 }
 
 type countsResult struct {
@@ -1192,8 +1204,7 @@ func buildSeriesFilters(q SeriesQuery, enabledLibs []string, userID string, useF
 		args = append(args, searchArgs...)
 	}
 	if q.OneShot != nil {
-		clauses = append(clauses, effectiveOneShotSQL+"=?")
-		args = append(args, *q.OneShot)
+		clauses = append(clauses, oneShotPredicate(*q.OneShot))
 	}
 	if len(q.Statuses) > 0 {
 		var statusClauses []string
@@ -1376,8 +1387,11 @@ func buildBookFilters(q BookQuery, enabledLibs []string, excludeNSFW bool, userI
 	}
 	if q.OneShot != nil {
 		clauses = append(clauses,
-			"b.series_id IN (SELECT s.id FROM series s WHERE "+effectiveOneShotSQL+"=?)")
-		args = append(args, *q.OneShot)
+			"b.series_id IN (SELECT s.id FROM series s WHERE s.library_id IN "+Placeholders(len(libs))+
+				" AND "+oneShotPredicate(*q.OneShot)+")")
+		for _, id := range libs {
+			args = append(args, id)
+		}
 	}
 	if len(q.Tags) > 0 {
 		if sub, subArgs := buildFoldedTaxonomySeriesSubquery("st", "series_tags", "tag", "tags_fts", q.Tags, useSeriesFTS); sub != "" {

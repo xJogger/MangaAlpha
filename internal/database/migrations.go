@@ -139,6 +139,9 @@ func applyMigrations(db *sql.DB) error {
 	if err := ensureSearchFTSTables(db); err != nil {
 		return err
 	}
+	if err := ensureMetadataUnionSchema(db); err != nil {
+		return err
+	}
 	return createShelfRevisions(db)
 }
 
@@ -576,7 +579,7 @@ WHERE coalesce(match_origin, '') = ''
 }
 
 func columnExistsTx(tx *sql.Tx, table, column string) (bool, error) {
-	rows, err := tx.Query("PRAGMA table_info(" + table + ")")
+	rows, err := tx.Query("PRAGMA table_xinfo(" + table + ")")
 	if err != nil {
 		return false, err
 	}
@@ -589,8 +592,9 @@ func columnExistsTx(tx *sql.Tx, table, column string) (bool, error) {
 			notNull    int
 			defaultVal sql.NullString
 			primaryKey int
+			hidden     int
 		)
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &primaryKey); err != nil {
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &primaryKey, &hidden); err != nil {
 			return false, err
 		}
 		if name == column {
@@ -1410,4 +1414,58 @@ SELECT 'admin',bgm_subject_id,series_id,series_title,status,remote_type,remote_v
 		}
 	}
 	return nil
+}
+
+func ensureMetadataUnionSchema(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	beforeOverride, err := columnExistsTx(tx, "books", "number_sort_override")
+	if err != nil {
+		return err
+	}
+	for _, column := range []struct{ table, name, definition string }{
+		{"books", "number_sort_override", "REAL"},
+		{"books", "effective_number_sort", "REAL GENERATED ALWAYS AS (COALESCE(number_sort_override, number_sort)) VIRTUAL"},
+		{"metadata_sources", "import_covers", "INTEGER NOT NULL DEFAULT 0"},
+		{"bangumi_scrape_runs", "library_ids_json", "TEXT NOT NULL DEFAULT ''"},
+		{"libraries", "union_book_metadata_initialized", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := addColumnIfMissingTx(tx, column.table, column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if !beforeOverride {
+		if _, err := tx.Exec(`
+UPDATE books SET number_sort_override=bm.number_sort
+FROM book_metadata bm WHERE books.id=bm.book_id AND bm.number_sort IS NOT NULL`); err != nil {
+			return err
+		}
+	}
+
+	for _, ddl := range []string{effectiveBookNumberIndexes, bookNumberOverrideTriggers, legacyCoverRefIndexes, metadataUnionSchema, unionBookMetadataDirtySchema} {
+		if _, err := tx.Exec(ddl); err != nil {
+			return err
+		}
+	}
+	for _, op := range []struct{ name, record string }{
+		{"INSERT", "NEW"}, {"UPDATE", "NEW"}, {"DELETE", "OLD"},
+	} {
+		if _, err := tx.Exec(fmt.Sprintf(`
+CREATE TRIGGER IF NOT EXISTS trg_union_book_metadata_%[1]s AFTER %[1]s ON book_metadata BEGIN
+ INSERT INTO union_book_metadata_dirty(library_id,book_id)
+ SELECT ub.library_id, ub.id
+ FROM union_book_sources ubs CROSS JOIN books ub ON ub.id=ubs.union_book_id
+ WHERE ubs.source_book_id=%[2]s.book_id
+ UNION ALL
+ SELECT b.library_id,b.id FROM books b WHERE b.id=%[2]s.book_id
+ AND EXISTS (SELECT 1 FROM union_book_sources WHERE union_book_id=b.id) ON CONFLICT DO NOTHING;
+END;`, op.name, op.record)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }

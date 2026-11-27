@@ -113,30 +113,34 @@ type UnionRefreshStats struct {
 	RemovedStaleBooks   int    `json:"removedStaleBooks"`
 }
 
+// LibrarySummary is the library record returned by list queries.
+type LibrarySummary = Library
+
 type Library struct {
-	ID                  string       `json:"id"`
-	Name                string       `json:"name"`
-	ProviderType        string       `json:"providerType"`
-	RootCID             string       `json:"rootCid"`
-	WebDAVAccountID     string       `json:"webdavAccountId,omitempty"`
-	WebDAVAccountName   string       `json:"webdavAccountName,omitempty"`
-	RootPath            string       `json:"rootPath,omitempty"`
-	Enabled             bool         `json:"enabled"`
-	OneShot             bool         `json:"oneShot"`
-	OneshotsDirectory   string       `json:"oneshotsDirectory"`
-	UnionParentID       string       `json:"unionParentId,omitempty"`
-	UnionParentName     string       `json:"unionParentName,omitempty"`
-	UnionPriority       int          `json:"unionPriority,omitempty"`
-	UnionLayers         []UnionLayer `json:"unionLayers,omitempty"`
-	CreatedAt           string       `json:"createdAt"`
-	UpdatedAt           string       `json:"updatedAt"`
-	LastScanStartedAt   *string      `json:"lastScanStartedAt"`
-	LastScanCompletedAt *string      `json:"lastScanCompletedAt"`
-	LastScanStatus      string       `json:"lastScanStatus"`
-	LastScanError       string       `json:"lastScanError"`
-	SeriesCount         int64        `json:"seriesCount"`
-	BookCount           int64        `json:"bookCount"`
-	ComicBytes          int64        `json:"comicBytes"`
+	ID                        string       `json:"id"`
+	Name                      string       `json:"name"`
+	ProviderType              string       `json:"providerType"`
+	RootCID                   string       `json:"rootCid"`
+	WebDAVAccountID           string       `json:"webdavAccountId,omitempty"`
+	WebDAVAccountName         string       `json:"webdavAccountName,omitempty"`
+	RootPath                  string       `json:"rootPath,omitempty"`
+	Enabled                   bool         `json:"enabled"`
+	OneShot                   bool         `json:"oneShot"`
+	OneshotsDirectory         string       `json:"oneshotsDirectory"`
+	UnionParentID             string       `json:"unionParentId,omitempty"`
+	UnionParentName           string       `json:"unionParentName,omitempty"`
+	UnionPriority             int          `json:"unionPriority,omitempty"`
+	UnionLayers               []UnionLayer `json:"unionLayers,omitempty"`
+	CreatedAt                 string       `json:"createdAt"`
+	UpdatedAt                 string       `json:"updatedAt"`
+	LastScanStartedAt         *string      `json:"lastScanStartedAt"`
+	LastScanCompletedAt       *string      `json:"lastScanCompletedAt"`
+	LastScanStatus            string       `json:"lastScanStatus"`
+	LastScanError             string       `json:"lastScanError"`
+	SeriesCount               int64        `json:"seriesCount"`
+	BookCount                 int64        `json:"bookCount"`
+	ComicBytes                int64        `json:"comicBytes"`
+	MetadataChainNeedsRematch bool         `json:"metadataChainNeedsRematch"`
 }
 
 func (l Library) EffectiveProvider() string {
@@ -241,6 +245,7 @@ type BangumiScrapeRun struct {
 	ID              string   `json:"id"`
 	LibraryID       *string  `json:"libraryId"`
 	LibraryName     string   `json:"libraryName"`
+	LibraryIDs      []string `json:"libraryIds,omitempty"`
 	Mode            string   `json:"mode"`
 	Force           bool     `json:"force"`
 	Status          string   `json:"status"`

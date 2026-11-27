@@ -295,6 +295,8 @@ func TestOpenMigratesSparseBookMetadataAndOneShots(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := old.DB().ExecContext(ctx, `
+DROP INDEX idx_series_effective_oneshot;
+DROP TRIGGER trg_union_book_metadata_mapping_insert;
 DROP TABLE book_metadata;
 DROP TABLE book_thumbnails;
 ALTER TABLE libraries DROP COLUMN oneshots_directory;

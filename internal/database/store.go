@@ -249,11 +249,13 @@ func (s *Store) librariesBasic(ctx context.Context, enabledOnly, applyPersonalHi
 SELECT l.id,l.name,l.provider_type,l.root_cid,l.webdav_account_id,coalesce(w.name,''),l.root_path,
  l.enabled,l.one_shot,l.oneshots_directory,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
  l.created_at,l.updated_at,
- l.last_scan_started_at,l.last_scan_completed_at,l.last_scan_status,l.last_scan_error
+ l.last_scan_started_at,l.last_scan_completed_at,l.last_scan_status,l.last_scan_error,
+ ` + metadataChainNeedsRematchSQL + `
 FROM libraries l
 LEFT JOIN webdav_accounts w ON w.id=l.webdav_account_id
 LEFT JOIN union_layers ul ON ul.member_library_id=l.id
-LEFT JOIN libraries up ON up.id=ul.union_library_id`
+LEFT JOIN libraries up ON up.id=ul.union_library_id
+LEFT JOIN library_metadata_chain_state mcs ON mcs.library_id=l.id`
 	if enabledOnly {
 		query += ` WHERE l.enabled=1 AND ul.union_library_id IS NULL`
 	}
@@ -276,7 +278,7 @@ LEFT JOIN libraries up ON up.id=ul.union_library_id`
 			&item.WebDAVAccountID, &item.WebDAVAccountName, &item.RootPath,
 			&item.Enabled, &item.OneShot, &item.OneshotsDirectory, &item.UnionParentID, &item.UnionParentName, &item.UnionPriority,
 			&item.CreatedAt, &item.UpdatedAt,
-			&item.LastScanStartedAt, &item.LastScanCompletedAt, &item.LastScanStatus, &item.LastScanError,
+			&item.LastScanStartedAt, &item.LastScanCompletedAt, &item.LastScanStatus, &item.LastScanError, &item.MetadataChainNeedsRematch,
 		); err != nil {
 			return nil, err
 		}
@@ -301,6 +303,7 @@ SELECT l.id,l.name,l.provider_type,l.root_cid,l.webdav_account_id,coalesce(w.nam
  l.enabled,l.one_shot,l.oneshots_directory,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
  l.created_at,l.updated_at,
  l.last_scan_started_at,l.last_scan_completed_at,l.last_scan_status,l.last_scan_error,
+ ` + metadataChainNeedsRematchSQL + `,
  coalesce(sc.cnt,0),
  coalesce(bc.cnt,0),
  coalesce(bc.bytes,0)
@@ -308,6 +311,7 @@ FROM libraries l
 LEFT JOIN webdav_accounts w ON w.id=l.webdav_account_id
 LEFT JOIN union_layers ul ON ul.member_library_id=l.id
 LEFT JOIN libraries up ON up.id=ul.union_library_id
+LEFT JOIN library_metadata_chain_state mcs ON mcs.library_id=l.id
 LEFT JOIN (SELECT library_id, count(*) AS cnt FROM series GROUP BY library_id) sc ON sc.library_id=l.id
 LEFT JOIN (SELECT library_id, count(*) AS cnt, coalesce(sum(size),0) AS bytes FROM books GROUP BY library_id) bc ON bc.library_id=l.id`
 	if enabledOnly {
@@ -328,7 +332,7 @@ LEFT JOIN (SELECT library_id, count(*) AS cnt, coalesce(sum(size),0) AS bytes FR
 			&item.WebDAVAccountID, &item.WebDAVAccountName, &item.RootPath,
 			&item.Enabled, &item.OneShot, &item.OneshotsDirectory, &item.UnionParentID, &item.UnionParentName, &item.UnionPriority,
 			&item.CreatedAt, &item.UpdatedAt,
-			&item.LastScanStartedAt, &item.LastScanCompletedAt, &item.LastScanStatus, &item.LastScanError,
+			&item.LastScanStartedAt, &item.LastScanCompletedAt, &item.LastScanStatus, &item.LastScanError, &item.MetadataChainNeedsRematch,
 			&item.SeriesCount, &item.BookCount, &item.ComicBytes,
 		); err != nil {
 			return nil, err
@@ -439,6 +443,7 @@ SELECT l.id,l.name,l.provider_type,l.root_cid,l.webdav_account_id,coalesce(w.nam
  l.enabled,l.one_shot,l.oneshots_directory,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
  l.created_at,l.updated_at,
  l.last_scan_started_at,l.last_scan_completed_at,l.last_scan_status,l.last_scan_error,
+ `+metadataChainNeedsRematchSQL+`,
  (SELECT count(*) FROM series s WHERE s.library_id=l.id),
  (SELECT count(*) FROM books b WHERE b.library_id=l.id),
  (SELECT coalesce(sum(b.size),0) FROM books b WHERE b.library_id=l.id)
@@ -446,12 +451,13 @@ FROM libraries l
 LEFT JOIN webdav_accounts w ON w.id=l.webdav_account_id
 LEFT JOIN union_layers ul ON ul.member_library_id=l.id
 LEFT JOIN libraries up ON up.id=ul.union_library_id
+LEFT JOIN library_metadata_chain_state mcs ON mcs.library_id=l.id
 WHERE l.id=?`, id).Scan(
 		&item.ID, &item.Name, &item.ProviderType, &item.RootCID,
 		&item.WebDAVAccountID, &item.WebDAVAccountName, &item.RootPath,
 		&item.Enabled, &item.OneShot, &item.OneshotsDirectory, &item.UnionParentID, &item.UnionParentName, &item.UnionPriority,
 		&item.CreatedAt, &item.UpdatedAt,
-		&item.LastScanStartedAt, &item.LastScanCompletedAt, &item.LastScanStatus, &item.LastScanError,
+		&item.LastScanStartedAt, &item.LastScanCompletedAt, &item.LastScanStatus, &item.LastScanError, &item.MetadataChainNeedsRematch,
 		&item.SeriesCount, &item.BookCount, &item.ComicBytes,
 	)
 	if err != nil {
@@ -475,17 +481,19 @@ func (s *Store) LibraryBasic(ctx context.Context, id string) (Library, error) {
 SELECT l.id,l.name,l.provider_type,l.root_cid,l.webdav_account_id,coalesce(w.name,''),l.root_path,
  l.enabled,l.one_shot,l.oneshots_directory,coalesce(ul.union_library_id,''),coalesce(up.name,''),coalesce(ul.priority,0),
  l.created_at,l.updated_at,
- l.last_scan_started_at,l.last_scan_completed_at,l.last_scan_status,l.last_scan_error
+ l.last_scan_started_at,l.last_scan_completed_at,l.last_scan_status,l.last_scan_error,
+ `+metadataChainNeedsRematchSQL+`
 FROM libraries l
 LEFT JOIN webdav_accounts w ON w.id=l.webdav_account_id
 LEFT JOIN union_layers ul ON ul.member_library_id=l.id
 LEFT JOIN libraries up ON up.id=ul.union_library_id
+LEFT JOIN library_metadata_chain_state mcs ON mcs.library_id=l.id
 WHERE l.id=?`, id).Scan(
 		&item.ID, &item.Name, &item.ProviderType, &item.RootCID,
 		&item.WebDAVAccountID, &item.WebDAVAccountName, &item.RootPath,
 		&item.Enabled, &item.OneShot, &item.OneshotsDirectory, &item.UnionParentID, &item.UnionParentName, &item.UnionPriority,
 		&item.CreatedAt, &item.UpdatedAt,
-		&item.LastScanStartedAt, &item.LastScanCompletedAt, &item.LastScanStatus, &item.LastScanError,
+		&item.LastScanStartedAt, &item.LastScanCompletedAt, &item.LastScanStatus, &item.LastScanError, &item.MetadataChainNeedsRematch,
 	)
 	if err != nil {
 		return Library{}, err

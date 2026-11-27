@@ -326,6 +326,11 @@ func (s *Store) SeriesMetadatas(
 	return out, nil
 }
 
+// UpsertSeriesScrapedMetadata applies a scraped projection while respecting field locks.
+func (s *Store) UpsertSeriesScrapedMetadata(ctx context.Context, series Series, incoming ScrapedMetadata) (SeriesMetadata, error) {
+	return s.ApplyScrapedMetadata(ctx, series, incoming)
+}
+
 func (s *Store) ApplyScrapedMetadata(
 	ctx context.Context,
 	series Series,
@@ -813,9 +818,16 @@ func (s *Store) SaveSeriesMetadata(ctx context.Context, m SeriesMetadata) error 
 }
 
 func (s *Store) ClearSeriesExternalBinding(ctx context.Context, series Series) (SeriesMetadata, error) {
+	metadata, _, err := s.ClearSeriesExternalBindingWithCoverRefs(ctx, series)
+	return metadata, err
+}
+
+// ClearSeriesExternalBindingWithCoverRefs returns distinct imported references
+// removed from this series. Use IsImportedCoverRefReferenced before reclaiming a file.
+func (s *Store) ClearSeriesExternalBindingWithCoverRefs(ctx context.Context, series Series) (SeriesMetadata, []string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return SeriesMetadata{}, err
+		return SeriesMetadata{}, nil, err
 	}
 	defer tx.Rollback()
 
@@ -824,7 +836,7 @@ func (s *Store) ClearSeriesExternalBinding(ctx context.Context, series Series) (
 	if errors.Is(err, sql.ErrNoRows) {
 		current = defaultSeriesMetadata(series)
 	} else if err != nil {
-		return SeriesMetadata{}, err
+		return SeriesMetadata{}, nil, err
 	}
 	if strings.TrimSpace(current.Title) == "" {
 		current.Title = series.Name
@@ -845,7 +857,7 @@ func (s *Store) ClearSeriesExternalBinding(ctx context.Context, series Series) (
 		if !current.NSFWLock {
 			current.IsNSFW, err = queryUnionHasNSFWSource(ctx, tx, series.ID)
 			if err != nil {
-				return SeriesMetadata{}, err
+				return SeriesMetadata{}, nil, err
 			}
 		}
 		if !current.TitleLock {
@@ -857,10 +869,9 @@ func (s *Store) ClearSeriesExternalBinding(ctx context.Context, series Series) (
 	}
 	now := nowText()
 	if err := saveSeriesMetadataTx(ctx, tx, current, now); err != nil {
-		return SeriesMetadata{}, err
+		return SeriesMetadata{}, nil, err
 	}
-	if prevExtSourceID != "" {
-		if _, err := tx.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 UPDATE book_metadata
 SET ext_source_id='',
     ext_entry_id='',
@@ -869,15 +880,21 @@ SET ext_source_id='',
     cover_source=CASE WHEN cover_source='ext' THEN 'auto' ELSE cover_source END,
     match_origin=CASE WHEN bgm_subject_id<=0 THEN '' ELSE match_origin END,
     updated_at=?
-WHERE ext_source_id=? AND book_id IN (SELECT id FROM books WHERE series_id=?)`,
-			now, prevExtSourceID, series.ID); err != nil {
-			return SeriesMetadata{}, err
-		}
+WHERE book_id IN (SELECT id FROM books WHERE series_id=?)
+  AND ((ext_source_id<>'' AND ext_source_id=?) OR ext_cover_url GLOB 'sqlite-blob://*' OR EXISTS (
+   SELECT 1 FROM book_source_bindings sb WHERE sb.book_id=book_metadata.book_id AND sb.source_id=book_metadata.ext_source_id
+  ))`, now, series.ID, prevExtSourceID); err != nil {
+		return SeriesMetadata{}, nil, err
+	}
+	refs, err := clearSparseSeriesExternalBinding(ctx, tx, series.ID)
+	if err != nil {
+		return SeriesMetadata{}, nil, err
 	}
 	if err := tx.Commit(); err != nil {
-		return SeriesMetadata{}, err
+		return SeriesMetadata{}, nil, err
 	}
-	return s.SeriesMetadataByID(ctx, series)
+	metadata, err := s.SeriesMetadataByID(ctx, series)
+	return metadata, refs, err
 }
 
 type automaticMetadataKey struct{}
@@ -903,12 +920,6 @@ func (s *Store) saveSeriesMetadata(ctx context.Context, m SeriesMetadata, now st
 }
 
 func saveSeriesMetadataTx(ctx context.Context, tx *sql.Tx, m SeriesMetadata, now string) error {
-	genresJSON, _ := json.Marshal(cleanStringSlice(m.Genres))
-	tagsJSON, _ := json.Marshal(cleanStringSlice(m.Tags))
-	authorsJSON, _ := json.Marshal(cleanAuthors(m.Authors))
-	altTitlesJSON, _ := json.Marshal(cleanAlternateTitles(m.AlternateTitles))
-	linksJSON, _ := json.Marshal(cleanWebLinks(m.Links))
-	sharingJSON, _ := json.Marshal(cleanStringSlice(m.SharingLabels))
 
 	if automated, _ := ctx.Value(automaticMetadataKey{}).(bool); automated {
 		var origin, updatedAt, extEntryID string
@@ -931,7 +942,34 @@ WHERE s.id=? AND l.enabled=1 AND NOT EXISTS (
 		}
 	}
 
-	_, err := tx.ExecContext(ctx, `
+	genres := cleanStringSlice(m.Genres)
+	tags := cleanStringSlice(m.Tags)
+	authors := cleanAuthors(m.Authors)
+	genresJSON, _ := json.Marshal(genres)
+	tagsJSON, _ := json.Marshal(tags)
+	authorsJSON, _ := json.Marshal(authors)
+	altTitlesJSON, _ := json.Marshal(cleanAlternateTitles(m.AlternateTitles))
+	linksJSON, _ := json.Marshal(cleanWebLinks(m.Links))
+	sharingJSON, _ := json.Marshal(cleanStringSlice(m.SharingLabels))
+
+	var oldGenres, oldTags, oldAuthors string
+	err := tx.QueryRowContext(ctx, `
+SELECT genres_json,tags_json,authors_json FROM series_metadata WHERE series_id=?`, m.SeriesID).
+		Scan(&oldGenres, &oldTags, &oldAuthors)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if equivalentMetadataJSON(oldGenres, genres, cleanStringSlice) {
+		genresJSON = []byte(oldGenres)
+	}
+	if equivalentMetadataJSON(oldTags, tags, cleanStringSlice) {
+		tagsJSON = []byte(oldTags)
+	}
+	if equivalentMetadataJSON(oldAuthors, authors, cleanAuthors) {
+		authorsJSON = []byte(oldAuthors)
+	}
+
+	res, err := tx.ExecContext(ctx, `
 INSERT INTO series_metadata(
  `+seriesMetadataColumns+`
 ) VALUES(
@@ -979,7 +1017,8 @@ ON CONFLICT(series_id) DO UPDATE SET
  links_json=excluded.links_json,links_lock=excluded.links_lock,
  sharing_labels_json=excluded.sharing_labels_json,sharing_labels_lock=excluded.sharing_labels_lock,
  is_nsfw=excluded.is_nsfw,nsfw_lock=excluded.nsfw_lock,
- updated_at=excluded.updated_at`,
+ updated_at=excluded.updated_at
+WHERE `+seriesMetadataChangedSQL,
 		m.SeriesID, nullableInt64Ptr(m.BgmSubjectID),
 		strings.TrimSpace(m.ExtSourceID), strings.TrimSpace(m.ExtEntryID),
 		strings.TrimSpace(m.ExtCoverURL), strings.TrimSpace(m.ExtCoverPath), strings.TrimSpace(m.MatchOrigin),
@@ -999,38 +1038,78 @@ ON CONFLICT(series_id) DO UPDATE SET
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM series_genres WHERE series_id=?`, m.SeriesID); err != nil {
+	n, err := res.RowsAffected()
+	if err != nil || n == 0 {
 		return err
 	}
-	for _, genre := range cleanStringSlice(m.Genres) {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO series_genres(series_id,genre) VALUES(?,?)`, m.SeriesID, genre); err != nil {
+	for _, item := range []struct {
+		table, columns, values, matches, previous, current string
+	}{
+		{"series_genres", "genre", "j.value", "genre=j.value", oldGenres, string(genresJSON)},
+		{"series_tags", "tag", "j.value", "tag=j.value", oldTags, string(tagsJSON)},
+		{"series_authors", "name,role", "j.value->>'name',j.value->>'role'",
+			"name=j.value->>'name' AND role=j.value->>'role'", oldAuthors, string(authorsJSON)},
+	} {
+		if item.previous == item.current {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM "+item.table+" WHERE series_id=? AND NOT EXISTS ("+
+			"SELECT 1 FROM json_each(?) j WHERE "+item.matches+")", m.SeriesID, item.current); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO "+item.table+"(series_id,"+item.columns+") "+
+			"SELECT ?,"+item.values+" FROM json_each(?) j", m.SeriesID, item.current); err != nil {
 			return err
 		}
 	}
-
-	if _, err := tx.ExecContext(ctx, `DELETE FROM series_tags WHERE series_id=?`, m.SeriesID); err != nil {
-		return err
-	}
-	for _, tag := range cleanStringSlice(m.Tags) {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO series_tags(series_id,tag) VALUES(?,?)`, m.SeriesID, tag); err != nil {
-			return err
-		}
-	}
-
-	if _, err := tx.ExecContext(ctx, `DELETE FROM series_authors WHERE series_id=?`, m.SeriesID); err != nil {
-		return err
-	}
-	for _, author := range cleanAuthors(m.Authors) {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO series_authors(series_id,name,role) VALUES(?,?,?)`,
-			m.SeriesID, author.Name, author.Role); err != nil {
-			return err
-		}
-	}
-
 	return nil
+}
+
+var seriesMetadataChangedSQL = func() string {
+	columns := make([]string, 0)
+	for _, col := range strings.Split(seriesMetadataColumns, ",") {
+		col = strings.TrimSpace(col)
+		switch col {
+		case "series_id", "updated_at", "scrape_synced_at":
+			continue
+		}
+		columns = append(columns, col)
+	}
+	return metadataTupleDiff("series_metadata", "excluded", strings.Join(columns, ","))
+}()
+
+func metadataTupleDiff(left, right, columns string) string {
+	return "(" + left + "." + strings.ReplaceAll(columns, ",", ","+left+".") + ") IS NOT (" +
+		right + "." + strings.ReplaceAll(columns, ",", ","+right+".") + ")"
+}
+
+func metadataSetsEqual[T comparable](before, after []T) bool {
+	if len(before) != len(after) {
+		return false
+	}
+	set := make(map[T]struct{}, len(before))
+	for _, value := range before {
+		set[value] = struct{}{}
+	}
+	for _, value := range after {
+		if _, exists := set[value]; !exists {
+			return false
+		}
+	}
+	return true
+}
+
+func preserveMetadataSet[T comparable](before, after []T, clean func([]T) []T) []T {
+	after = clean(after)
+	if metadataSetsEqual(clean(before), after) {
+		return before
+	}
+	return after
+}
+
+func equivalentMetadataJSON[T comparable](raw string, values []T, clean func([]T) []T) bool {
+	var before []T
+	return json.Unmarshal([]byte(raw), &before) == nil && metadataSetsEqual(clean(before), values)
 }
 
 func (s *Store) Genres(ctx context.Context, libraryIDs []string) ([]string, error) {
