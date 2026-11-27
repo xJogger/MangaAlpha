@@ -213,6 +213,22 @@ func (a *ArchiveIndex) Status() ArchiveStatus {
 	return a.status
 }
 
+// NeedsLegacyFormatUpgrade reports whether a ready index predates tankobon
+// imports. A current snapshot may legitimately have no tankobon relations.
+func (a *ArchiveIndex) NeedsLegacyFormatUpgrade() (bool, string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	version, _ := strconv.Atoi(a.importFormatVersion)
+	if !a.status.Ready || version >= 5 {
+		return false, ""
+	}
+	signature := archiveDumpSignature(a.status)
+	if signature == "" {
+		signature = "legacy:" + strconv.FormatInt(a.status.SubjectCount, 10)
+	}
+	return true, signature
+}
+
 func (a *ArchiveIndex) Ready() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -234,6 +250,9 @@ func (a *ArchiveIndex) StartOnlineUpdateWithOptions(force bool) (ArchiveStatus, 
 func (a *ArchiveIndex) beginOnlineUpdate(parent context.Context) (context.Context, ArchiveStatus, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err := parent.Err(); err != nil {
+		return nil, a.status, err
+	}
 	if a.status.Updating {
 		return nil, a.status, errors.New("Bangumi archive update is already running")
 	}
@@ -1318,20 +1337,7 @@ func (a *ArchiveIndex) Tankobons(ctx context.Context, parentSubjectID int64) ([]
 		return nil, false, nil
 	}
 
-	isbnExpr := "''"
-	if hasISBN {
-		isbnExpr = "coalesce(s.isbn, '')"
-	}
-	query := `
-SELECT r.related_subject_id, coalesce(s.name,''), coalesce(s.name_cn,''),
-       coalesce(s.release_date,''), coalesce(s.summary,''), ` + isbnExpr + `,
-       r.sort_order, coalesce(s.is_nsfw, 0)
-FROM bgm_subject_relations r
-JOIN bgm_subjects s ON s.id = r.related_subject_id
-WHERE r.subject_id = ? AND r.relation_type = ?
-ORDER BY r.sort_order ASC, r.related_subject_id ASC`
-
-	rows, err := db.QueryContext(ctx, query, parentSubjectID, relationTypeTankobon)
+	items, err := loadArchiveTankobonsBatch(ctx, db, hasISBN, []int64{parentSubjectID})
 	if err != nil {
 		msg := strings.ToLower(err.Error())
 		if strings.Contains(msg, "no such table") || strings.Contains(msg, "no such column") {
@@ -1339,20 +1345,48 @@ ORDER BY r.sort_order ASC, r.related_subject_id ASC`
 		}
 		return nil, false, err
 	}
+	out := items[parentSubjectID]
+	return out, len(out) > 0, nil
+}
+
+func loadArchiveTankobonsBatch(ctx context.Context, db *sql.DB, hasISBN bool, parents []int64) (map[int64][]TankobonSubject, error) {
+	args := make([]any, 1, 1+len(parents))
+	args[0] = relationTypeTankobon
+	for _, id := range parents {
+		args = append(args, id)
+	}
+	isbnExpr := "''"
+	if hasISBN {
+		isbnExpr = "coalesce(s.isbn, '')"
+	}
+	query := `
+SELECT r.subject_id, r.related_subject_id, coalesce(s.name,''), coalesce(s.name_cn,''),
+       coalesce(s.release_date,''), coalesce(s.summary,''), ` + isbnExpr + `,
+       r.sort_order, coalesce(s.is_nsfw, 0)
+FROM bgm_subject_relations r
+JOIN bgm_subjects s ON s.id = r.related_subject_id
+WHERE r.relation_type = ? AND r.subject_id IN ` + database.Placeholders(len(parents)) + `
+ORDER BY r.subject_id, r.sort_order, r.related_subject_id`
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 
-	var out []TankobonSubject
+	out := make(map[int64][]TankobonSubject)
 	for rows.Next() {
 		var (
+			parent int64
 			item   TankobonSubject
 			isNSFW int
 		)
 		if err := rows.Scan(
-			&item.SubjectID, &item.Name, &item.NameCN,
+			&parent, &item.SubjectID, &item.Name, &item.NameCN,
 			&item.Date, &item.Summary, &item.ISBN,
 			&item.Order, &isNSFW,
 		); err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		item.Name = strings.TrimSpace(item.Name)
 		item.NameCN = strings.TrimSpace(item.NameCN)
@@ -1362,15 +1396,9 @@ ORDER BY r.sort_order ASC, r.related_subject_id ASC`
 		item.NSFW = isNSFW != 0
 		item.NSFWKnown = true
 		item.CoverURL = CoverEndpointURL(item.SubjectID)
-		out = append(out, item)
+		out[parent] = append(out[parent], item)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, false, err
-	}
-	if len(out) == 0 {
-		return nil, false, nil
-	}
-	return out, true, nil
+	return out, rows.Err()
 }
 
 func scanSubjectCandidateRow(scanner interface{ Scan(...any) error }) (SubjectCandidate, error) {

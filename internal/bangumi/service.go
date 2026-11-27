@@ -62,6 +62,7 @@ type Service struct {
 	nowFunc   func() time.Time
 
 	mu                    sync.Mutex
+	archiveWorkers        sync.WaitGroup
 	queued                map[string]string
 	activeRunID           string
 	activeStop            context.CancelFunc
@@ -161,6 +162,7 @@ func (s *Service) Close() error {
 		s.activeStop()
 	}
 	s.mu.Unlock()
+	s.archiveWorkers.Wait()
 	if s.schedDone != nil {
 		<-s.schedDone
 	}
@@ -294,25 +296,80 @@ func (s *Service) StartArchiveUpdate() (ArchiveStatus, error) {
 }
 
 func (s *Service) StartArchiveUpdateWithOptions(force bool) (ArchiveStatus, error) {
-	if !s.metadataManagesArchive(s.ctx) {
-		return s.archive.StartOnlineUpdateWithOptions(force)
-	}
+	managed := s.metadataManagesArchive(s.ctx)
 	s.mu.Lock()
-	factory := s.metadataArchiveClient
-	s.mu.Unlock()
-	if factory == nil {
+	defer s.mu.Unlock()
+	var factory func(context.Context) *http.Client
+	if managed {
+		factory = s.metadataArchiveClient
+	}
+	if managed && factory == nil {
 		return s.ArchiveStatus(), errors.New("metadata archive transport is unavailable")
 	}
 	ctx, status, err := s.archive.beginOnlineUpdate(s.ctx)
 	if err == nil {
 		metaURL := s.archive.MetaURL()
+		s.archiveWorkers.Add(1)
 		go func() {
-			client := factory(ctx)
-			defer client.CloseIdleConnections()
+			defer s.archiveWorkers.Done()
+			var client *http.Client
+			if factory != nil {
+				client = factory(ctx)
+				defer client.CloseIdleConnections()
+			}
 			_ = s.archive.runOnlineUpdate(ctx, force, metaURL, client)
 		}()
 	}
 	return status, err
+}
+
+const settingArchiveLegacyUpgradeAttempt = "bangumi_archive_auto_upgrade_attempted_v5"
+
+// StartLegacyArchiveAutoUpgrade gives each legacy dump one automatic upgrade
+// attempt across restarts, using the configured archive source and transport.
+func (s *Service) StartLegacyArchiveAutoUpgrade(delay time.Duration) {
+	needed, signature := s.archive.NeedsLegacyFormatUpgrade()
+	if !needed {
+		return
+	}
+	if attempted, _ := s.store.GetSetting(s.ctx, settingArchiveLegacyUpgradeAttempt); attempted == signature {
+		if s.logger != nil {
+			s.logger.Info("Bangumi legacy archive auto-upgrade already attempted")
+		}
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctx.Err() != nil {
+		return
+	}
+	s.archiveWorkers.Add(1)
+	go func() {
+		defer s.archiveWorkers.Done()
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if needed, current := s.archive.NeedsLegacyFormatUpgrade(); !needed || current != signature || s.archive.Status().Updating {
+			return
+		}
+		result, err := s.store.DB().ExecContext(s.ctx, `
+INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
+WHERE settings.value<>excluded.value`, settingArchiveLegacyUpgradeAttempt, signature, time.Now().UTC().Format(time.RFC3339Nano))
+		if err == nil {
+			if n, _ := result.RowsAffected(); n == 0 {
+				return
+			}
+			_, err = s.StartArchiveUpdateWithOptions(false)
+		}
+		if err != nil && s.ctx.Err() == nil && s.logger != nil {
+			s.logger.Warn("start Bangumi legacy archive auto-upgrade", "error", err)
+		}
+	}()
 }
 
 const settingArchiveMetadataManaged = "bangumi_archive_metadata_managed"

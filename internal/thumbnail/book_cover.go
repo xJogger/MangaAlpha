@@ -158,6 +158,20 @@ func (s *Service) resolveBookMetadataCover(ctx context.Context, item bookCoverCa
 	if err != nil {
 		return Data{}, true
 	}
+	// A backfilled Bangumi candidate can be the first chain row for a book
+	// whose older external cover is still stored in book_metadata.
+	if len(candidates) == 1 && candidates[0].SourceID == "bangumi" && candidates[0].RankOrder > 0 &&
+		mode != database.CoverSourceBangumi && item.meta.ExtSourceID != "" && item.meta.ExtCoverURL != "" {
+		chain, _ := s.store.ListLibraryMetadataSources(ctx, item.book.LibraryID)
+		for _, link := range chain[:min(len(chain), candidates[0].RankOrder)] {
+			if link.SourceID == item.meta.ExtSourceID && link.Enabled && link.SourceEnabled {
+				if data := s.fetchBookUserCover(ctx, item.book, item.meta, "ext"); len(data.Bytes) > 0 {
+					return data, true
+				}
+				break
+			}
+		}
+	}
 	preferred := func(c database.BookCoverCandidate) bool {
 		switch mode {
 		case database.CoverSourceBangumi:

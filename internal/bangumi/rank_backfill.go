@@ -12,7 +12,10 @@ import (
 	"github.com/xJogger/fake-komga-115/internal/diagnostics"
 )
 
-const settingArchiveSyncedDump = "bangumi_archive_synced_dump"
+const (
+	settingArchiveSyncedDump      = "bangumi_archive_synced_dump"
+	settingArchiveSyncedBooksDump = "bangumi_archive_synced_books_dump"
+)
 
 type syncRequest struct {
 	force bool
@@ -73,7 +76,8 @@ func (s *Service) syncOfflineMetadata(ctx context.Context, force bool) (int, err
 	dumpSig := archiveDumpSignature(status)
 	if !force && dumpSig != "" {
 		if prev, err := s.store.GetSetting(ctx, settingArchiveSyncedDump); err == nil && prev == dumpSig {
-			return 0, nil
+			_, err := s.syncOfflineTankobonBooks(ctx, force)
+			return 0, err
 		}
 	}
 
@@ -182,6 +186,9 @@ WHERE sm.bgm_subject_id > 0 AND l.enabled=1
 		updatedSeries += n
 	}
 
+	if err := ctx.Err(); err != nil {
+		return updatedSeries, err
+	}
 	nowStr := time.Now().UTC().Format(time.RFC3339)
 	if dumpSig != "" {
 		_ = s.store.SetSetting(ctx, settingArchiveSyncedDump, dumpSig)
@@ -211,7 +218,8 @@ WHERE sm.bgm_subject_id > 0 AND l.enabled=1
 			"updatedSeries": updatedSeries,
 		},
 	})
-	return updatedSeries, nil
+	_, err = s.syncOfflineTankobonBooks(ctx, force)
+	return updatedSeries, err
 }
 
 func archiveDumpSignature(st ArchiveStatus) string {

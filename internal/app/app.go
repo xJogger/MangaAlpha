@@ -276,6 +276,7 @@ func New(_ context.Context, options Options) (*App, error) {
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
+	bangumiService.StartLegacyArchiveAutoUpgrade(5 * time.Second)
 	return &App{
 		server: server, rawHandler: rawHandler, store: store, scanner: scanManager, pipelines: pipelineManager,
 		covers: coverManager, tasks: maintenanceManager, archive: archiveService, bangumi: bangumiService,

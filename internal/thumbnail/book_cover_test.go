@@ -68,6 +68,28 @@ func TestBookCoverPriorityAndSourceOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCover(second.ID, 24, 27)
+	if _, err := store.UpsertMetadataSource(ctx, database.MetadataSource{
+		ID: "catalog", Kind: "offline_sqlite", Name: "Catalog", Enabled: true, Ready: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetLibraryMetadataSources(ctx, second.LibraryID, []string{"catalog", "bangumi"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBookCoverCandidates(ctx, []database.BookCoverCandidate{{
+		BookID: second.ID, SourceID: "bangumi", EntryID: "42", RankOrder: 1,
+		CoverKind: database.CoverKindBangumi, CoverRef: "https://bgm.tv/subject/42", NSFWKnown: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	assertCover(second.ID, 24, 27)
+	if err := store.SetBookCoverSource(ctx, second.ID, "bangumi"); err != nil {
+		t.Fatal(err)
+	}
+	assertCover(second.ID, 33, 55)
+	if err := store.SetBookCoverSource(ctx, second.ID, "auto"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.SaveBookCustomCover(ctx, second.ID, custom); err != nil {
 		t.Fatal(err)
 	}

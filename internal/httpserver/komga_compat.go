@@ -19,11 +19,14 @@ const (
 
 // webUIClientSettingRanges keeps the built-in web UI's display preferences
 // inside sane bounds; arbitrary webui.* keys remain free-form for the reader.
-var webUIClientSettingRanges = map[string][2]int{
-	"webui.shelf.pageSize":    {12, 120},
-	"webui.home.continueSize": {4, 24},
-	"webui.home.updatedSize":  {4, 36},
-	"webui.home.addedSize":    {4, 36},
+var webUIClientSettingRanges = map[string]struct {
+	min, max  int
+	allowZero bool
+}{
+	"webui.shelf.pageSize":    {min: 12, max: 120},
+	"webui.home.continueSize": {min: 4, max: 24, allowZero: true},
+	"webui.home.updatedSize":  {min: 4, max: 36, allowZero: true},
+	"webui.home.addedSize":    {min: 4, max: 36, allowZero: true},
 }
 
 // webUIClientSettingEnums validates enumerated web UI settings stored as plain
@@ -170,8 +173,11 @@ func validateClientSetting(key string, value *string) error {
 			if err != nil {
 				return fmt.Errorf("%s must be an integer", key)
 			}
-			if n < limits[0] || n > limits[1] {
-				return fmt.Errorf("%s must be between %d and %d", key, limits[0], limits[1])
+			if (n < limits.min || n > limits.max) && !(n == 0 && limits.allowZero) {
+				if limits.allowZero {
+					return fmt.Errorf("%s must be 0 or between %d and %d", key, limits.min, limits.max)
+				}
+				return fmt.Errorf("%s must be between %d and %d", key, limits.min, limits.max)
 			}
 		}
 	}

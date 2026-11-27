@@ -21,13 +21,13 @@ func TestValidateClientSettingWebUIDisplayRanges(t *testing.T) {
 		{"page size min", "webui.shelf.pageSize", value("12"), false, ""},
 		{"page size max", "webui.shelf.pageSize", value("120"), false, ""},
 		{"page size default", "webui.shelf.pageSize", value("36"), false, ""},
+		{"page size cannot be disabled", "webui.shelf.pageSize", value("0"), true, ""},
 		{"page size below range", "webui.shelf.pageSize", value("11"), true, ""},
 		{"page size above range", "webui.shelf.pageSize", value("121"), true, ""},
 		{"page size not a number", "webui.shelf.pageSize", value("abc"), true, ""},
 		{"page size deletion", "webui.shelf.pageSize", nil, false, ""},
 		{"home updated in range", "webui.home.updatedSize", value("18"), false, ""},
-		{"home added above range", "webui.home.addedSize", value("37"), true, ""},
-		{"home continue below range", "webui.home.continueSize", value("3"), true, ""},
+		{"home continue above range", "webui.home.continueSize", value("25"), true, ""},
 		{"infinite scroll enabled", "webui.shelf.infiniteScroll", value("1"), false, ""},
 		{"infinite scroll disabled", "webui.shelf.infiniteScroll", value("0"), false, ""},
 		{"infinite scroll boolean text", "webui.shelf.infiniteScroll", value("true"), true, `"0" or "1"`},
@@ -56,6 +56,20 @@ func TestValidateClientSettingWebUIDisplayRanges(t *testing.T) {
 			}
 			if tc.errContain != "" && (err == nil || !strings.Contains(err.Error(), tc.errContain)) {
 				t.Fatalf("validateClientSetting(%q) error = %v, want substring %q", display, err, tc.errContain)
+			}
+		})
+	}
+	for _, key := range []string{"webui.home.continueSize", "webui.home.updatedSize", "webui.home.addedSize"} {
+		t.Run(key, func(t *testing.T) {
+			for _, n := range []string{"0", "4", "24"} {
+				if err := validateClientSetting(key, &n); err != nil {
+					t.Errorf("%s rejected %q: %v", key, n, err)
+				}
+			}
+			for _, n := range []string{"1", "3", "-1", "37"} {
+				if err := validateClientSetting(key, &n); err == nil {
+					t.Errorf("%s accepted %q", key, n)
+				}
 			}
 		})
 	}

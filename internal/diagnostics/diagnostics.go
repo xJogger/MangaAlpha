@@ -383,6 +383,8 @@ var allowedMetaKeys = map[string]bool{
 	"series":         true,
 	"books":          true,
 	"updatedSeries":  true,
+	"updatedBooks":   true,
+	"matchedSeries":  true,
 	"trigger":        true,
 	"port":           true,
 	"lanEnabled":     true,
