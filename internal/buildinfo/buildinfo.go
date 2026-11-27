@@ -3,7 +3,7 @@ package buildinfo
 import "strings"
 
 // Version is overridden by release builds with -ldflags -X.
-var Version = "v3.3.0"
+var Version = "v3.4.0"
 
 // Major-version codename metadata (displayed on 3.x footer & v3.0.0 release).
 const (
