@@ -2043,27 +2043,26 @@
 
   function openBatchMaintModal({ operation, targetType, targetId, targetName, onStarted }) {
     const isCovers = operation === 'batch_book_covers';
-    const title = isCovers ? `批量刮削卷封面 · ${targetName}` : `批量读取 ComicInfo · ${targetName}`;
+    const title = isCovers ? `提取归档卷封面 · ${targetName}` : `批量读取 ComicInfo · ${targetName}`;
     const desc = isCovers
-      ? '按各卷匹配元数据或离线库批量缓存单卷封面；默认严守零隐式拆包原则，不读取压缩包内部字节。'
+      ? '显式从漫画归档第 1 页提取并缓存单卷封面（默认跳过已有有效封面与自定义封面，自动跳过固实 RAR 与未解锁加密包）。离线数据库单卷封面请前往「元数据与刮削」按顺延链匹配。'
       : '显式按需流式读取漫画归档内的 ComicInfo.xml 并缓存卷元数据（自动跳过固实 RAR、加密包及手工锁定字段）。';
-    const extraLabel = isCovers
-      ? '对仍无封面卷顺带抽归档第 1 页（默认关）'
-      : '顺带补全第 1 页卷封面';
+    const extraLabel = '顺带补全第 1 页卷封面';
     const forceLabel = isCovers
-      ? '强制重刮（覆盖已缓存封面，保留自定义封面）'
+      ? '覆盖已缓存卷封面（保留自定义封面；默认跳过已有封面）'
       : '强制重读（重新解析已读过 ComicInfo 的卷）';
     openModal({
       title,
       maxWidth: '520px',
       bodyHTML: `
         <p style="margin:0 0 12px;font-size:13px;color:var(--text-secondary);line-height:1.6">${esc(desc)}</p>
+        ${isCovers ? '' : `
         <div class="field">
           <label class="check-row">
             <input type="checkbox" id="bm-job-extra">
             <span>${esc(extraLabel)}</span>
           </label>
-        </div>
+        </div>`}
         <div class="field" style="margin-bottom:0">
           <label class="check-row">
             <input type="checkbox" id="bm-job-force">
@@ -2071,7 +2070,7 @@
           </label>
         </div>
       `,
-      footHTML: `<button type="button" class="btn btn-primary" id="bm-job-start">开始执行</button>`,
+      footHTML: `<button type="button" class="btn btn-primary" id="bm-job-start">${isCovers ? '开始提取' : '开始执行'}</button>`,
       onMount: () => {
         const startBtn = document.getElementById('bm-job-start');
         if (!startBtn) return;
@@ -2086,11 +2085,11 @@
             targetId,
             force: forceChecked,
           };
-          if (isCovers) payload.fallbackPage1 = extraChecked;
+          if (isCovers) payload.fallbackPage1 = true;
           else payload.extractPage1 = extraChecked;
           try {
             await api('/admin/api/maintenance-jobs', { method: 'POST', body: payload });
-            toast(isCovers ? '批量刮削卷封面任务已加入队列' : '批量读取 ComicInfo 任务已加入队列');
+            toast(isCovers ? '提取归档卷封面任务已加入队列' : '批量读取 ComicInfo 任务已加入队列');
             closeModal();
             if (onStarted) onStarted();
           } catch (err) {
@@ -2279,7 +2278,7 @@
             ${startTarget ? `<a href="/reader/series/${encodeURIComponent(seriesID)}/book/${encodeURIComponent(startTarget.book.id)}?page=${startTarget.page}" class="btn btn-primary btn-lg btn-cta-read" title="${esc(startTarget.fullLabel)}"><span class="btn-part-fixed">▶\u00a0${esc(startTarget.prefix)}</span>${startTarget.middle ? `<span class="btn-part-ellipsis">${esc(startTarget.middle)}</span>` : ''}${startTarget.suffix ? `<span class="btn-part-fixed">${esc(startTarget.suffix)}</span>` : ''}</a>` : ''}
             ${admin ? `<button type="button" class="btn" id="series-generate-cover" data-maint="series_thumbnail" data-force="false"
               ${!books.length || maintJobs.some((j) => j.operation === 'series_thumbnail' && ['queued','running'].includes(j.status)) ? 'disabled' : ''}>生成首卷封面</button>
-            <button type="button" class="btn" id="btn-series-batch-covers" ${!books.length ? 'disabled' : ''}>批量刮削卷封面</button>
+            <button type="button" class="btn" id="btn-series-batch-covers" ${!books.length ? 'disabled' : ''}>提取归档卷封面</button>
             <button type="button" class="btn" id="btn-series-batch-comicinfo" ${!books.length ? 'disabled' : ''}>批量读取 ComicInfo</button>
             <button type="button" class="btn btn-bgm" id="btn-open-bgm">元数据匹配 / 绑定</button>
             ${hasExtBind ? `<button type="button" class="btn btn-sm btn-danger" id="btn-clear-ext-meta">解除扩展源绑定</button>` : ''}
@@ -4464,6 +4463,7 @@
               ${l.oneShot ? `<span class="badge badge-accent">单本 One-Shots</span>` : ''}
               ${l.oneshotsDirectory ? `<span class="badge badge-accent" title="单篇子目录：${esc(l.oneshotsDirectory)}">单篇目录：${esc(l.oneshotsDirectory)}</span>` : ''}
               ${isSub && !nested ? `<span class="badge">子库 · 归属：${esc(l.unionParentName)} (#${Number(l.unionPriority || 0) + 1})</span>` : ''}
+              ${!isSub && l.metadataChainNeedsRematch ? `<span class="badge badge-warn">顺延链已变更</span>` : ''}
               ${!l.enabled ? `<span class="badge badge-warn">已隐藏</span>` : ''}
               ${schedText ? `<span class="badge badge-success" title="服务器本机时区：${esc(serverTZ || 'Local')}">⏰ ${esc(schedText)}</span>` : ''}
             </div>
@@ -4486,9 +4486,10 @@
                 <button type="button" class="btn btn-primary btn-sm" data-lib-union-refresh="${esc(l.id)}">刷新合并</button>
                 <button type="button" class="btn btn-sm" data-lib-pipeline="${esc(l.id)}">跑流水线</button>
                 <button type="button" class="btn btn-sm" data-lib-schedule="${esc(l.id)}">定时…</button>
-                <button type="button" class="btn btn-bgm btn-sm" data-lib-bgm="${esc(l.id)}">刮削</button>
-                <button type="button" class="btn btn-sm" data-lib-cover="${esc(l.id)}" data-provider="union">补封面…</button>
-                <button type="button" class="btn btn-sm" data-lib-batch-covers="${esc(l.id)}" data-lib-name="${esc(l.name)}">批量刮削卷封面</button>
+                <button type="button" class="btn btn-bgm btn-sm" data-lib-bgm="${esc(l.id)}">匹配离线库</button>
+                ${l.metadataChainNeedsRematch ? `<button type="button" class="btn btn-sm btn-primary" data-lib-rematch="${esc(l.id)}">按新顺延链重匹配</button>` : ''}
+                <button type="button" class="btn btn-sm" data-lib-cover="${esc(l.id)}" data-provider="union">提取首卷作为系列封面…</button>
+                <button type="button" class="btn btn-sm" data-lib-batch-covers="${esc(l.id)}" data-lib-name="${esc(l.name)}">提取归档卷封面</button>
                 <button type="button" class="btn btn-sm" data-lib-batch-comicinfo="${esc(l.id)}" data-lib-name="${esc(l.name)}">批量读取 ComicInfo</button>
                 <button type="button" class="btn btn-sm" data-lib-toggle-hide="${esc(l.id)}" data-lib-name="${esc(l.name)}" data-lib-next-enabled="false">隐藏</button>
               ` : `
@@ -4508,9 +4509,10 @@
                 <button type="button" class="btn btn-primary btn-sm" data-lib-scan="${esc(l.id)}">扫描</button>
                 <button type="button" class="btn btn-sm" data-lib-pipeline="${esc(l.id)}">跑流水线</button>
                 <button type="button" class="btn btn-sm" data-lib-schedule="${esc(l.id)}">定时…</button>
-                <button type="button" class="btn btn-bgm btn-sm" data-lib-bgm="${esc(l.id)}">刮削</button>
-                <button type="button" class="btn btn-sm" data-lib-cover="${esc(l.id)}" data-provider="${esc(l.providerType)}">补齐首卷封面…</button>
-                <button type="button" class="btn btn-sm" data-lib-batch-covers="${esc(l.id)}" data-lib-name="${esc(l.name)}">批量刮削卷封面</button>
+                <button type="button" class="btn btn-bgm btn-sm" data-lib-bgm="${esc(l.id)}">匹配离线库</button>
+                ${l.metadataChainNeedsRematch ? `<button type="button" class="btn btn-sm btn-primary" data-lib-rematch="${esc(l.id)}">按新顺延链重匹配</button>` : ''}
+                <button type="button" class="btn btn-sm" data-lib-cover="${esc(l.id)}" data-provider="${esc(l.providerType)}">提取首卷作为系列封面…</button>
+                <button type="button" class="btn btn-sm" data-lib-batch-covers="${esc(l.id)}" data-lib-name="${esc(l.name)}">提取归档卷封面</button>
                 <button type="button" class="btn btn-sm" data-lib-batch-comicinfo="${esc(l.id)}" data-lib-name="${esc(l.name)}">批量读取 ComicInfo</button>
                 <button type="button" class="btn btn-sm" data-lib-toggle-hide="${esc(l.id)}" data-lib-name="${esc(l.name)}" data-lib-next-enabled="false">隐藏</button>
               ` : `
@@ -5050,28 +5052,47 @@
     });
     body.querySelectorAll('button[data-lib-bgm]').forEach((btn) => {
       btn.onclick = async () => {
+        const libID = btn.getAttribute('data-lib-bgm');
         try {
           await api('/admin/api/metadata/scrape', {
             method: 'POST',
-            body: { libraryId: btn.getAttribute('data-lib-bgm'), mode: 'retry_unmatched', allowOnline: false },
+            body: { libraryIds: [libID], libraryId: libID, mode: 'retry_unmatched', allowOnline: false },
           });
-          toast('已启动本库元数据刮削');
+          toast('已启动本库离线库匹配');
           navigate('/admin?tab=bangumi');
         } catch (err) { toast(err.message, 'error'); }
+      };
+    });
+    body.querySelectorAll('button[data-lib-rematch]').forEach((btn) => {
+      btn.onclick = async () => {
+        const libID = btn.getAttribute('data-lib-rematch');
+        if (!libID || btn.disabled) return;
+        btn.disabled = true;
+        try {
+          await api('/admin/api/metadata/scrape', {
+            method: 'POST',
+            body: { libraryIds: [libID], libraryId: libID, mode: 'force', allowOnline: false },
+          });
+          toast('已启动按新顺延链重匹配');
+          navigate('/admin?tab=bangumi');
+        } catch (err) {
+          if (btn.isConnected) btn.disabled = false;
+          toast(err.message, 'error');
+        }
       };
     });
     body.querySelectorAll('button[data-lib-cover]').forEach((btn) => {
       btn.onclick = () => {
         const local = btn.dataset.provider === 'local';
         openModal({
-          title: '批量补齐首卷封面',
+          title: '提取首卷作为系列封面',
           maxWidth: '520px',
-          bodyHTML: `<p>只读首卷第一页生成缩略图，不改变元数据绑定或封面显示偏好。</p>
-            <label class="check-row"><input id="cover-unbound" type="checkbox" checked>仅补未匹配元数据且缺有效封面的系列</label>
-            <label class="check-row"><input id="cover-all" type="checkbox" ${local ? 'checked' : ''}>全库处理</label>
+          bodyHTML: `<p style="margin:0 0 12px;font-size:13px;color:var(--text-secondary);line-height:1.6">显式读取系列首卷归档第 1 页生成系列缩略图，默认跳过已有数据库封面或缓存的系列；不改变元数据绑定或封面显示偏好。</p>
+            <label class="check-row"><input id="cover-unbound" type="checkbox" checked><span>仅提取未匹配元数据且缺有效封面的系列（跳过已有数据库封面或缓存）</span></label>
+            <label class="check-row"><input id="cover-all" type="checkbox" ${local ? 'checked' : ''}><span>全库处理</span></label>
             <div class="field"><label for="cover-limit">最多处理最近更新的系列数</label>
               <input id="cover-limit" type="number" min="1" max="10000" value="${local ? 50 : 5}" ${local ? 'disabled' : ''}></div>`,
-          footHTML: '<button type="button" class="btn btn-primary" id="cover-start">开始补齐</button>',
+          footHTML: '<button type="button" class="btn btn-primary" id="cover-start">开始提取</button>',
           onMount: () => {
             const all = document.getElementById('cover-all');
             const limit = document.getElementById('cover-limit');
@@ -5086,8 +5107,8 @@
               }
               if (all.checked) {
                 const confirmed = await confirmModal('确认处理全库？远程库可能产生网络流量，任务可在后台取消。', {
-                  title: '确认全库补齐封面',
-                  confirmText: '开始全库补齐',
+                  title: '确认全库提取首卷封面',
+                  confirmText: '开始全库提取',
                 });
                 if (!confirmed || !start.isConnected || start.disabled) return;
               }
@@ -5099,7 +5120,7 @@
                   all: all.checked,
                   limit: all.checked ? 0 : Number(limit.value),
                 } });
-                toast('封面补齐任务已启动');
+                toast('首卷封面提取任务已启动');
                 navigate('/admin?tab=jobs');
               } catch (err) { start.disabled = false; toast(err.message, 'error'); }
             };
@@ -5678,6 +5699,14 @@
             <option value="monthly" ${src.autoUpdate === 'monthly' ? 'selected' : ''}>每月自动更新 (monthly)</option>
           </select>
         </div>
+        ${isOfflineSQLite ? `
+        <div class="field" id="ems-import-covers-wrap">
+          <label class="check-row">
+            <input type="checkbox" id="ems-import-covers" ${src.importCovers ? 'checked' : ''}>
+            <span>匹配时同时导入内嵌封面到本地</span>
+          </label>
+          <div class="field-hint">开启后将命中作品的内嵌封面复制到本地缓存，后续删除或替换源库不影响已导入封面。</div>
+        </div>` : ''}
         <div id="ems-online-wrap">
           ${extOnlineApiDetailsHTML({
             detailsId: 'ems-online-details',
@@ -5726,6 +5755,7 @@
               ['tagDictSourceId', document.getElementById('ems-tag-dict')?.value || ''],
               ['tagDisplayMode', document.getElementById('ems-tag-mode')?.value || 'zh'],
               ['autoUpdate', document.getElementById('ems-auto-update')?.value || 'manual'],
+              ['importCovers', document.getElementById('ems-import-covers')?.checked ? 'true' : 'false'],
             ],
             onSuccess: () => { if (onSaved) onSaved(); },
           });
@@ -5745,6 +5775,7 @@
                 downloadUrl: document.getElementById('ems-download-url').value.trim(),
                 onlineApiUrl: document.getElementById('ems-online-url').value.trim(),
                 onlineEnabled: Boolean(document.getElementById('ems-online-enabled').checked),
+                importCovers: isOfflineSQLite ? Boolean(document.getElementById('ems-import-covers')?.checked) : false,
               },
             });
             toast('数据源配置已更新');
@@ -5842,6 +5873,13 @@
             </select>
           </div>
         </div>
+        <div class="field" id="emas-import-covers-wrap">
+          <label class="check-row">
+            <input type="checkbox" id="emas-import-covers">
+            <span>匹配时同时导入内嵌封面到本地</span>
+          </label>
+          <div class="field-hint">开启后将命中作品的内嵌封面复制到本地缓存，后续删除或替换源库不影响已导入封面。</div>
+        </div>
         <div class="field" style="margin-bottom:0">
           <label class="check-row">
             <input type="checkbox" id="emas-enabled" checked>
@@ -5861,7 +5899,14 @@
         const kindSel = document.getElementById('emas-kind');
         const schemaSel = document.getElementById('emas-schema');
         const nameInput = document.getElementById('emas-name');
+        const importCoversWrap = document.getElementById('emas-import-covers-wrap');
         let prevKind = kindSel ? kindSel.value : 'offline_sqlite';
+        const syncImportCoversWrap = () => {
+          const curKind = kindSel ? kindSel.value : 'offline_sqlite';
+          if (importCoversWrap) importCoversWrap.style.display = curKind === 'offline_sqlite' ? '' : 'none';
+        };
+        if (kindSel) kindSel.onchange = syncImportCoversWrap;
+        syncImportCoversWrap();
 
         document.querySelectorAll('button[data-emas-tab]').forEach((tabBtn) => {
           tabBtn.onclick = () => {
@@ -5887,6 +5932,7 @@
             if (nameInput) {
               nameInput.placeholder = isUpload ? '可选，留空则自动使用上传文件名' : '例如：本地社区离线图库';
             }
+            syncImportCoversWrap();
           };
         });
 
@@ -5900,6 +5946,7 @@
             ['tagDictSourceId', document.getElementById('emas-tag-dict')?.value || ''],
             ['tagDisplayMode', document.getElementById('emas-tag-mode')?.value || 'zh'],
             ['autoUpdate', document.getElementById('emas-auto-update')?.value || 'manual'],
+            ['importCovers', document.getElementById('emas-import-covers')?.checked ? 'true' : 'false'],
           ],
           onSuccess: () => { if (onSaved) onSaved(); },
         });
@@ -5912,12 +5959,13 @@
           }
           const btn = document.getElementById('emas-create-btn');
           btn.disabled = true;
+          const kind = document.getElementById('emas-kind').value;
           try {
             await api('/admin/api/metadata/sources', {
               method: 'POST',
               body: {
                 name,
-                kind: document.getElementById('emas-kind').value,
+                kind,
                 schemaType: document.getElementById('emas-schema').value,
                 downloadUrl: document.getElementById('emas-download-url').value.trim(),
                 localPath: document.getElementById('emas-local-path').value.trim(),
@@ -5926,6 +5974,7 @@
                 tagDisplayMode: document.getElementById('emas-tag-mode').value,
                 autoUpdate: document.getElementById('emas-auto-update').value,
                 enabled: Boolean(document.getElementById('emas-enabled').checked),
+                importCovers: kind === 'offline_sqlite' ? Boolean(document.getElementById('emas-import-covers')?.checked) : false,
               },
             });
             toast('自定义数据源已添加');
@@ -6026,7 +6075,7 @@
               method: 'PUT',
               body: { sourceIds: selected.slice() },
             });
-            toast(`已保存「${lib.name}」的元数据顺延链`);
+            toast('顺延链已保存，请点击「按新顺延链重匹配」或使用下方全量重匹配应用新优先级');
             closeModal();
             if (onSaved) onSaved();
           } catch (err) {
@@ -6162,6 +6211,12 @@
     const repos = Array.isArray(ov.repos) ? ov.repos : [];
     const extSources = Array.isArray(ov.sources) ? ov.sources : [];
     const libraryChains = (ov.libraryChains && typeof ov.libraryChains === 'object') ? ov.libraryChains : {};
+    const chainStates = (ov.libraryChainStates && typeof ov.libraryChainStates === 'object') ? ov.libraryChainStates : {};
+    const ovArch = (ov.archive && typeof ov.archive === 'object') ? ov.archive : {};
+    const archReady = Boolean(arch.ready !== undefined ? arch.ready : ovArch.ready);
+    const archNeedsTankobonReimport = Boolean(
+      archReady && (arch.needsTankobonReimport || st.needsTankobonReimport || ovArch.needsTankobonReimport)
+    );
     const activeSyncs = Array.isArray(ov.syncs) ? ov.syncs : (Array.isArray(ov.activeSyncs) ? ov.activeSyncs : []);
     const onlineEnrich = ov.onlineEnrich || ov.onlineEnrichStatus || null;
     const scrapeRuns = Array.isArray(extScrapeRuns) ? extScrapeRuns : ((extScrapeRuns && Array.isArray(extScrapeRuns.runs)) ? extScrapeRuns.runs : (Array.isArray(ov.scrapeRuns) ? ov.scrapeRuns : []));
@@ -6182,13 +6237,22 @@
     const sourceByID = new Map(extSources.map((s) => [s.id, s]));
     const tagDictSources = extSources.filter((s) => s.kind === 'tag_dictionary');
     const chainCandidates = [
-      { id: 'bangumi', name: '内置 Bangumi 源', kind: 'bangumi_archive', ready: Boolean(arch.ready), enabled: true },
+      { id: 'bangumi', name: '内置 Bangumi 源', kind: 'bangumi_archive', ready: archReady, enabled: true },
       ...extSources.filter((s) => s.kind === 'offline_sqlite'),
     ];
     const hasOnlineCapableSource = extSources.some((s) => s && s.kind === 'offline_sqlite' && s.enabled && s.onlineEnabled && String(s.onlineApiUrl || '').trim() !== '');
     const topLevelLibs = (libs || []).filter((l) => !l.unionParentId);
     const selectableLibs = (libs || []).filter((l) => l.enabled !== false && !l.unionParentId);
     const libMap = new Map((libs || []).map((l) => [l.id, l]));
+    const chainNeedsRematchForLib = (lib) => {
+      if (!lib) return false;
+      const cs = chainStates[lib.id];
+      if (cs && typeof cs === 'object' && cs.needsRematch !== undefined) {
+        return Boolean(cs.needsRematch);
+      }
+      return Boolean(lib.metadataChainNeedsRematch);
+    };
+    const rematchLibsCount = topLevelLibs.filter(chainNeedsRematchForLib).length;
     const mergedRuns = [];
     const seenRunIDs = new Set();
     const pushUnifiedRun = (raw, engine) => {
@@ -6241,18 +6305,32 @@
     const repoSelStart = editingRepo ? prevRepoEl.selectionStart : null;
     const repoSelEnd = editingRepo ? prevRepoEl.selectionEnd : null;
 
-    const prevBatchLib = document.getElementById('extmeta-batch-lib');
-    const prevBatchMode = document.getElementById('extmeta-batch-mode');
+    const prevBatchLibEls = Array.from(document.querySelectorAll('input[data-extmeta-batch-lib]'));
     const prevBatchOnline = document.getElementById('extmeta-batch-online');
+    const prevBatchDraft = (typeof state === 'object' && state && state.extMetaBatchDraft) ? state.extMetaBatchDraft : null;
+    const selectableIDs = selectableLibs.map((l) => l.id);
+    const selectableSet = new Set(selectableIDs);
+    let selectedBatchLibIDs;
+    if (prevBatchLibEls.length > 0) {
+      selectedBatchLibIDs = prevBatchLibEls.filter((c) => c.checked).map((c) => c.value).filter((id) => selectableSet.has(id));
+    } else if (prevBatchDraft && Array.isArray(prevBatchDraft.libraryIds)) {
+      selectedBatchLibIDs = prevBatchDraft.libraryIds.filter((id) => selectableSet.has(id));
+    } else {
+      selectedBatchLibIDs = selectableIDs.slice();
+    }
     const batchDraft = {
-      libraryId: prevBatchLib ? prevBatchLib.value : ((state && state.extMetaBatchDraft && state.extMetaBatchDraft.libraryId) || ''),
-      mode: prevBatchMode ? prevBatchMode.value : ((state && state.extMetaBatchDraft && state.extMetaBatchDraft.mode) || 'incremental'),
+      libraryIds: selectableLibs.length > 0
+        ? selectedBatchLibIDs.slice()
+        : (prevBatchDraft && Array.isArray(prevBatchDraft.libraryIds) ? [] : null),
       allowOnline: hasOnlineCapableSource
-        ? (prevBatchOnline ? Boolean(prevBatchOnline.checked) : Boolean(state && state.extMetaBatchDraft && state.extMetaBatchDraft.allowOnline))
+        ? (prevBatchOnline ? Boolean(prevBatchOnline.checked) : Boolean(prevBatchDraft && prevBatchDraft.allowOnline))
         : false,
     };
-    if (!hasOnlineCapableSource && typeof state === 'object' && state && state.extMetaBatchDraft) {
-      state.extMetaBatchDraft.allowOnline = false;
+    if (typeof state === 'object' && state) {
+      state.extMetaBatchDraft = {
+        libraryIds: Array.isArray(batchDraft.libraryIds) ? batchDraft.libraryIds.slice() : null,
+        allowOnline: batchDraft.allowOnline,
+      };
     }
 
     const prevGuideEl = document.getElementById('extmeta-guide-details');
@@ -6405,7 +6483,7 @@
             ${archSrc.metaUrl ? `<div style="margin-top:6px;font-size:11.5px;color:var(--text-muted);word-break:break-all">当前元数据地址：<code>${esc(archSrc.metaUrl)}</code></div>` : ''}
           </form>
           <div style="font-size:13px;margin:12px 0;display:grid;gap:4px">
-            <div>状态：${arch.ready ? `<span class="badge badge-success">已就绪 · ${Number(arch.subjectCount || 0).toLocaleString()} 条书籍条目</span>` : `<span class="badge badge-warn">尚未建立离线索引</span>`}</div>
+            <div>状态：${archReady ? `<span class="badge badge-success">已就绪 · ${Number(arch.subjectCount || 0).toLocaleString()} 条书籍条目</span>` : `<span class="badge badge-warn">尚未建立离线索引</span>`}</div>
             ${arch.dumpName ? `<div style="color:var(--text-muted);font-size:12px">快照版本：${esc(arch.dumpName)} · 导入于 ${fmtTime(arch.importedAt)}</div>` : ''}
             ${(arch.lastCheckAt || sched.lastCheckedAt) ? `<div style="color:var(--text-muted);font-size:12px">最近检查：${fmtTime(arch.lastCheckAt || sched.lastCheckedAt)}${checkResultLabel(arch.lastCheckResult || sched.lastResult) ? ` · ${esc(checkResultLabel(arch.lastCheckResult || sched.lastResult))}` : ''}</div>` : ''}
             ${arch.lastSyncAt ? `<div style="color:var(--text-muted);font-size:12px">最近元数据自动同步：${fmtTime(arch.lastSyncAt)} · 增量更新 ${Number(arch.lastSyncUpdatedSeries || 0).toLocaleString()} 部作品</div>` : ''}
@@ -6417,8 +6495,16 @@
             ${arch.lastError ? `<div style="color:var(--danger);font-size:12px">最近错误：${esc(arch.lastError)}</div>` : ''}
             ${arch.lastSyncError ? `<div style="color:var(--danger);font-size:12px">最近同步错误：${esc(arch.lastSyncError)}</div>` : ''}
           </div>
+          ${archNeedsTankobonReimport ? `
+          <div class="extmeta-warn-banner" id="bgm-arch-tankobon-banner" role="alert">
+            <div class="extmeta-warn-banner-body">
+              <strong>⚠ 需要重新导入：</strong>
+              <span>当前 Bangumi 离线库为旧版本（缺少单行本分卷关系索引），重新导入后即可自动匹配并显示单卷封面。</span>
+            </div>
+            <button type="button" class="btn btn-sm btn-primary" id="bgm-arch-reimport-tankobon-btn" ${arch.updating ? 'disabled' : ''}>重新导入离线库</button>
+          </div>` : ''}
           <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button type="button" class="btn btn-primary" id="bgm-arch-update" ${arch.updating ? 'disabled' : ''}>${arch.ready ? '检查并更新离线索引库' : '一键下载并构建离线索引库'}</button>
+            <button type="button" class="btn btn-primary" id="bgm-arch-update" ${arch.updating ? 'disabled' : ''}>${archReady ? '检查并更新离线索引库' : '一键下载并构建离线索引库'}</button>
             ${arch.updating ? `<button type="button" class="btn btn-danger" id="bgm-arch-cancel">取消下载</button>` : ''}
           </div>
 
@@ -6455,22 +6541,27 @@
         <div class="card" id="extmeta-batch-card">
           <h3>启动批量自动刮削</h3>
           <p style="font-size:12.5px;color:var(--text-secondary);margin-top:0">
-            按各书库配置的顺延链依次匹配本地离线索引与社区映射包（默认使用内置 Bangumi 源）；支持 <code>[标题][作者]</code> 与 <code>[作者][标题]</code> 双序识别、通用子目录（如 <code>台版</code>/<code>特别篇</code>）自动回溯父目录、繁简异体字归一与作者交叉打分，不会覆盖已手动绑定或锁定的字段。
+            按各书库顺延链执行<strong>多源顺延链全链并集匹配</strong>：查询链中所有已启用离线源（默认使用内置 Bangumi 源），按 <code>#1 → #2 → ...</code> 优先级合并系列与分卷元数据及封面，自动保护手动绑定与锁定字段；支持 <code>[标题][作者]</code> 与 <code>[作者][标题]</code> 双序识别、通用子目录回溯与繁简异体字归一。
           </p>
           <div class="field">
-            <label for="extmeta-batch-lib">选择目标书库</label>
-            <select id="extmeta-batch-lib">
-              <option value="" ${batchDraft.libraryId === '' ? 'selected' : ''}>全部未隐藏书库</option>
-              ${selectableLibs.map((l) => `<option value="${esc(l.id)}" ${batchDraft.libraryId === l.id ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}
-            </select>
-          </div>
-          <div class="field">
-            <label for="extmeta-batch-mode">刮削范围模式</label>
-            <select id="extmeta-batch-mode">
-              <option value="incremental" ${batchDraft.mode === 'incremental' ? 'selected' : ''}>增量刮削（仅处理尚未刮削的新作品）</option>
-              <option value="retry_unmatched" ${batchDraft.mode === 'retry_unmatched' ? 'selected' : ''}>重试未匹配（处理“未匹配”与新作品，规则或源更新后推荐）</option>
-              <option value="force" ${batchDraft.mode === 'force' ? 'selected' : ''}>全量强制重刮（重新匹配全部作品，保留手动绑定与锁定字段）</option>
-            </select>
+            <label>选择目标书库</label>
+            <div class="extmeta-batch-select-all-row">
+              <label class="check-row">
+                <input type="checkbox" id="extmeta-batch-select-all" ${selectableLibs.length > 0 && selectedBatchLibIDs.length === selectableLibs.length ? 'checked' : ''} ${selectableLibs.length === 0 ? 'disabled' : ''}>
+                <span><strong>全选</strong></span>
+              </label>
+              <span class="extmeta-batch-count" id="extmeta-batch-selected-count">已选 ${selectedBatchLibIDs.length} / ${selectableLibs.length}</span>
+            </div>
+            <div class="extmeta-export-checks" id="extmeta-batch-libs">
+              ${selectableLibs.length === 0
+                ? `<div class="empty-box" style="padding:10px 12px;width:100%">暂无未隐藏的顶层书库，请先在「书库管理」创建或取消隐藏书库。</div>`
+                : selectableLibs.map((l) => `
+                  <label class="check-row">
+                    <input type="checkbox" data-extmeta-batch-lib="${esc(l.id)}" value="${esc(l.id)}" ${selectedBatchLibIDs.includes(l.id) ? 'checked' : ''}>
+                    <span>${esc(l.name)}</span>
+                  </label>`).join('')}
+            </div>
+            <div class="field-hint extmeta-batch-empty-hint" id="extmeta-batch-empty-hint" ${selectedBatchLibIDs.length > 0 ? 'style="display:none"' : ''}>请至少勾选一个目标书库</div>
           </div>
           ${hasOnlineCapableSource ? `
           <div class="field">
@@ -6480,7 +6571,14 @@
             </label>
             <div class="field-hint">默认关闭（纯离线极速匹配）；仅当开启后，对离线未命中作品才调用已启用在线 API 的数据源，单线程限速并在 403/429/503 时自动熔断冷却。</div>
           </div>` : ''}
-          <button type="button" class="btn btn-primary" id="extmeta-batch-start">开始批量刮削</button>
+          <div class="extmeta-batch-actions">
+            <button type="button" class="btn btn-primary" id="extmeta-batch-start-incremental" data-extmeta-batch-mode="incremental" ${selectedBatchLibIDs.length === 0 ? 'disabled' : ''}>增量匹配</button>
+            <button type="button" class="btn" id="extmeta-batch-start-retry" data-extmeta-batch-mode="retry_unmatched" ${selectedBatchLibIDs.length === 0 ? 'disabled' : ''}>重试未命中</button>
+            <button type="button" class="btn" id="extmeta-batch-start-force" data-extmeta-batch-mode="force" ${selectedBatchLibIDs.length === 0 ? 'disabled' : ''}>全量重匹配</button>
+          </div>
+          <div class="field-hint" style="margin-top:8px">
+            增量匹配仅处理尚未匹配的新作品；重试未命中额外重查之前未匹配的作品；全量重匹配对所选书库全部作品按当前顺延链重新合并（保留手动绑定与锁定字段）。
+          </div>
           ${showOnlineEnrichBanner ? `
             <div class="extmeta-enrich-banner">
               <span class="badge ${onlineEnrichCooldown ? 'badge-danger' : onlineEnrichRunning ? 'badge-accent' : ''}">
@@ -6579,6 +6677,7 @@
                             ${sf.label ? `<span class="badge ${sf.cls}" title="${esc(sf.raw)}">${esc(sf.label)}</span>` : ''}
                             <span class="badge ${s.ready ? 'badge-success' : 'badge-warn'}">${s.ready ? '已就绪' : '未就绪'}</span>
                             <span class="badge ${s.enabled ? 'badge-accent' : ''}">${s.enabled ? '已启用' : '已停用'}</span>
+                            ${s.kind === 'offline_sqlite' && s.importCovers ? `<span class="badge badge-accent">匹配时导入内嵌封面</span>` : ''}
                             ${s.onlineEnabled ? `<span class="badge badge-warn">在线补全已开</span>` : ''}
                           </div>
                           ${s.description ? `<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">${esc(s.description)}</div>` : ''}
@@ -6629,11 +6728,19 @@
         <p style="font-size:12.5px;color:var(--text-secondary);margin-top:0">
           每个顶层书库（含联合书库）默认使用内置 Bangumi 源；可自定义多个离线源按 <code>#1 → #2 → ...</code> 顺序匹配，<strong>离线源全部未命中时自动由已启用的社区映射包兜底</strong>。
         </p>
+        ${rematchLibsCount > 0 ? `
+          <div class="extmeta-warn-banner" id="extmeta-chains-rematch-banner" role="alert">
+            <div class="extmeta-warn-banner-body">
+              <strong>⚠ 顺延链变更提醒：</strong>
+              <span>有 ${rematchLibsCount} 个书库的顺延链或源数据已变更，建议点击「按新顺延链重匹配」合并最新元数据与封面。</span>
+            </div>
+          </div>` : ''}
         ${topLevelLibs.length === 0
           ? `<div class="empty-box" style="padding:18px">暂无顶层书库。</div>`
           : `<div class="extmeta-chain-list">
               ${topLevelLibs.map((l) => {
                 const chainIDs = extNormalizeChain(libraryChains[l.id]);
+                const needsRematch = chainNeedsRematchForLib(l);
                 return `
                   <div class="extmeta-chain-row">
                     <div class="extmeta-chain-info">
@@ -6642,6 +6749,7 @@
                         <span class="badge">${esc(providerLabel(l.providerType, l.webdavAccountName))}</span>
                         ${l.unionParentId ? `<span class="badge">联合子库</span>` : ''}
                         ${l.enabled === false ? `<span class="badge badge-warn">已隐藏</span>` : ''}
+                        ${needsRematch ? `<span class="badge badge-warn">顺延链已变更 · 待重匹配</span>` : ''}
                       </div>
                       <div class="extmeta-chain-steps">
                         ${chainIDs.length === 0
@@ -6655,6 +6763,7 @@
                       </div>
                     </div>
                     <div class="extmeta-chain-actions">
+                      ${needsRematch ? `<button type="button" class="btn btn-sm btn-primary" data-extmeta-chain-rematch="${esc(l.id)}"${l.enabled === false ? ' disabled title="书库已隐藏，取消隐藏后可执行重匹配"' : ''}>按新顺延链重匹配</button>` : ''}
                       <button type="button" class="btn btn-sm" data-extmeta-chain-edit="${esc(l.id)}">调整顺延链</button>
                     </div>
                   </div>`;
@@ -6679,7 +6788,13 @@
                   const pct = total > 0 ? Math.min(100, Math.round((proc / total) * 100)) : 0;
                   const active = r.status === 'queued' || r.status === 'running';
                   const errText = r.error || (Array.isArray(r.errors) && r.errors[0]) || '';
-                  const targetName = (r.libraryId && libMap.get(r.libraryId) && libMap.get(r.libraryId).name) || r.libraryName || r.libraryId || '全部未隐藏书库';
+                  const targetName = r.libraryName
+                    || (Array.isArray(r.libraryIds) && r.libraryIds.length > 0
+                      ? r.libraryIds.map((id) => (libMap.get(id) && libMap.get(id).name) || id).join('、')
+                      : '')
+                    || (r.libraryId && libMap.get(r.libraryId) && libMap.get(r.libraryId).name)
+                    || r.libraryId
+                    || '全部未隐藏书库';
                   const engineBadge = r._engine === 'bangumi'
                     ? `<span class="badge badge-bgm">Bangumi</span>`
                     : (r.allowOnline
@@ -6920,6 +7035,7 @@
               downloadUrl: src.downloadUrl || '',
               onlineApiUrl: src.onlineApiUrl || '',
               onlineEnabled: Boolean(src.onlineEnabled),
+              importCovers: src.kind === 'offline_sqlite' ? Boolean(src.importCovers) : false,
             },
           });
           toast(nextEnabled ? `已启用数据源「${src.name}」` : `已停用数据源「${src.name}」`);
@@ -6982,43 +7098,99 @@
       };
     });
 
-    const extBatchLibEl = document.getElementById('extmeta-batch-lib');
-    const extBatchModeEl = document.getElementById('extmeta-batch-mode');
-    const extBatchOnlineEl = document.getElementById('extmeta-batch-online');
-    const syncBatchDraft = () => {
-      if (typeof state === 'object' && state) {
-        state.extMetaBatchDraft = {
-          libraryId: extBatchLibEl ? extBatchLibEl.value : '',
-          mode: extBatchModeEl ? extBatchModeEl.value : 'incremental',
-          allowOnline: extBatchOnlineEl ? Boolean(extBatchOnlineEl.checked) : false,
-        };
-      }
-    };
-    if (extBatchLibEl) extBatchLibEl.onchange = syncBatchDraft;
-    if (extBatchModeEl) extBatchModeEl.onchange = syncBatchDraft;
-    if (extBatchOnlineEl) extBatchOnlineEl.onchange = syncBatchDraft;
-
-    const extBatchStartBtn = document.getElementById('extmeta-batch-start');
-    if (extBatchStartBtn) {
-      extBatchStartBtn.onclick = async () => {
-        syncBatchDraft();
-        const libraryId = extBatchLibEl ? extBatchLibEl.value : '';
-        const mode = extBatchModeEl ? extBatchModeEl.value : 'incremental';
-        const allowOnline = extBatchOnlineEl ? Boolean(extBatchOnlineEl.checked) : false;
-        extBatchStartBtn.disabled = true;
+    body.querySelectorAll('button[data-extmeta-chain-rematch]').forEach((btn) => {
+      btn.onclick = async () => {
+        const libID = btn.getAttribute('data-extmeta-chain-rematch');
+        if (!libID || btn.disabled) return;
+        btn.disabled = true;
         try {
           await api('/admin/api/metadata/scrape', {
             method: 'POST',
-            body: { libraryId, mode, allowOnline },
+            body: { libraryIds: [libID], libraryId: libID, mode: 'force', allowOnline: false },
           });
-          toast('多源批量刮削任务已启动');
+          toast('已启动按新顺延链重匹配');
           renderAdminBangumi(body);
         } catch (err) {
-          extBatchStartBtn.disabled = false;
+          if (btn.isConnected) btn.disabled = false;
           toast(err.message, 'error');
         }
       };
+    });
+
+    const batchSelectAllEl = document.getElementById('extmeta-batch-select-all');
+    const batchLibCbs = Array.from(body.querySelectorAll('input[data-extmeta-batch-lib]'));
+    const batchCountEl = document.getElementById('extmeta-batch-selected-count');
+    const batchEmptyHintEl = document.getElementById('extmeta-batch-empty-hint');
+    const batchOnlineEl = document.getElementById('extmeta-batch-online');
+    const batchActionBtns = Array.from(body.querySelectorAll('button[data-extmeta-batch-mode]'));
+    const syncBatchDraft = () => {
+      const picked = batchLibCbs.filter((c) => c.checked).map((c) => c.value);
+      if (typeof state === 'object' && state) {
+        state.extMetaBatchDraft = {
+          libraryIds: batchLibCbs.length > 0 ? picked.slice() : null,
+          allowOnline: batchOnlineEl ? Boolean(batchOnlineEl.checked) : false,
+        };
+      }
+      return picked;
+    };
+    const updateBatchControls = (disableActions = false) => {
+      const picked = syncBatchDraft();
+      const total = batchLibCbs.length;
+      const count = picked.length;
+      if (batchSelectAllEl) {
+        batchSelectAllEl.checked = total > 0 && count === total;
+        batchSelectAllEl.indeterminate = count > 0 && count < total;
+      }
+      if (batchCountEl) batchCountEl.textContent = `已选 ${count} / ${total}`;
+      if (batchEmptyHintEl) batchEmptyHintEl.style.display = count === 0 ? '' : 'none';
+      batchActionBtns.forEach((b) => { b.disabled = disableActions || count === 0; });
+    };
+    if (batchSelectAllEl) {
+      batchSelectAllEl.indeterminate = selectableLibs.length > 0 && selectedBatchLibIDs.length > 0 && selectedBatchLibIDs.length < selectableLibs.length;
+      batchSelectAllEl.onchange = () => {
+        const nextChecked = Boolean(batchSelectAllEl.checked);
+        batchLibCbs.forEach((c) => { c.checked = nextChecked; });
+        updateBatchControls(false);
+      };
     }
+    batchLibCbs.forEach((cb) => {
+      cb.onchange = () => updateBatchControls(false);
+    });
+    if (batchOnlineEl) {
+      batchOnlineEl.onchange = () => syncBatchDraft();
+    }
+    batchActionBtns.forEach((btn) => {
+      btn.onclick = async () => {
+        const picked = syncBatchDraft();
+        if (picked.length === 0) {
+          toast('请至少勾选一个目标书库', 'error');
+          updateBatchControls(false);
+          return;
+        }
+        if (btn.disabled) return;
+        const mode = btn.getAttribute('data-extmeta-batch-mode') || 'incremental';
+        const allowOnline = batchOnlineEl ? Boolean(batchOnlineEl.checked) : false;
+        const isAll = selectableLibs.length > 0 && picked.length === selectableLibs.length;
+        const payload = {
+          libraryIds: isAll ? [] : picked,
+          libraryId: !isAll && picked.length === 1 ? picked[0] : '',
+          mode,
+          allowOnline,
+        };
+        updateBatchControls(true);
+        try {
+          await api('/admin/api/metadata/scrape', {
+            method: 'POST',
+            body: payload,
+          });
+          toast('多源批量匹配任务已启动');
+          renderAdminBangumi(body);
+        } catch (err) {
+          if (btn.isConnected) updateBatchControls(false);
+          toast(err.message, 'error');
+        }
+      };
+    });
 
     const extRunsRefreshBtn = document.getElementById('extmeta-runs-refresh');
     if (extRunsRefreshBtn) extRunsRefreshBtn.onclick = () => renderAdminBangumi(body);
@@ -7167,6 +7339,21 @@
         renderAdminBangumi(body);
       } catch (err) { toast(err.message, 'error'); }
     };
+    const archReimportBtn = document.getElementById('bgm-arch-reimport-tankobon-btn');
+    if (archReimportBtn) {
+      archReimportBtn.onclick = async () => {
+        if (archReimportBtn.disabled) return;
+        archReimportBtn.disabled = true;
+        try {
+          await api('/admin/api/bangumi/archive/sync', { method: 'POST', body: { force: true } });
+          toast('已开始重新导入 Bangumi 离线索引库');
+          renderAdminBangumi(body);
+        } catch (err) {
+          if (archReimportBtn.isConnected) archReimportBtn.disabled = false;
+          toast(err.message, 'error');
+        }
+      };
+    }
     const archSchedFreq = document.getElementById('bgm-arch-sched-freq');
     if (archSchedFreq) {
       archSchedFreq.onchange = () => {

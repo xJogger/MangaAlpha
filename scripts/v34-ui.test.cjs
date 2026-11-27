@@ -1172,11 +1172,14 @@ test('series detail exposes One-shot toggle when canToggleOneShot=true, read-onl
   assert.equal(h.doc.getElementById('series-oneshot-toggle'), null);
   assert.match(h.doc.getElementById('page-content').innerHTML, /文件型单篇/);
 
-  // 3. Batch book covers modal (fallbackPage1 defaults false) & Batch ComicInfo modal
-  h.doc.getElementById('btn-series-batch-covers').onclick();
-  const extraCb1 = h.doc.getElementById('bm-job-extra');
+  // 3. Batch book covers modal (archive page-1 extraction decoupled from metadata matching) & Batch ComicInfo modal
+  const batchCoverBtn = h.doc.getElementById('btn-series-batch-covers');
+  assert.equal(batchCoverBtn.textContent, '提取归档卷封面');
+  batchCoverBtn.onclick();
+  assert.match(h.modalRoot.innerHTML, /提取归档卷封面 · 文件单篇/);
+  assert.match(h.modalRoot.innerHTML, /离线数据库单卷封面请前往「元数据与刮削」按顺延链匹配/);
+  assert.equal(h.doc.getElementById('bm-job-extra'), null, 'archive cover extraction modal must not render fallback toggle');
   const forceCb1 = h.doc.getElementById('bm-job-force');
-  assert.equal(extraCb1.checked, false, 'fallbackPage1 must default to false');
   assert.equal(forceCb1.checked, false);
   forceCb1.checked = true;
   await h.doc.getElementById('bm-job-start').onclick();
@@ -1186,7 +1189,7 @@ test('series detail exposes One-shot toggle when canToggleOneShot=true, read-onl
     operation: 'batch_book_covers',
     targetType: 'series',
     targetId: 's-file',
-    fallbackPage1: false,
+    fallbackPage1: true,
     force: true,
   });
 
@@ -1520,15 +1523,20 @@ test('admin libraries supports oneshotsDirectory quick-fill, create/edit payload
     oneshotsDirectory: 'shorts',
   });
 
-  // Library-level batch cover job
-  body.querySelector('button[data-lib-batch-covers="lib-1"]').onclick();
+  // Library-level batch cover job (explicit archive page-1 extraction)
+  const libBatchCoverBtn = body.querySelector('button[data-lib-batch-covers="lib-1"]');
+  assert.equal(libBatchCoverBtn.textContent, '提取归档卷封面');
+  assert.equal(body.querySelector('button[data-lib-bgm="lib-1"]').textContent, '匹配离线库');
+  assert.equal(body.querySelector('button[data-lib-cover="lib-1"]').textContent, '提取首卷作为系列封面…');
+  libBatchCoverBtn.onclick();
+  assert.match(h.modalRoot.innerHTML, /离线数据库单卷封面请前往「元数据与刮削」按顺延链匹配/);
   await h.doc.getElementById('bm-job-start').onclick();
   const libBatchCall = h.apiCalls.find((c) => c.url === '/admin/api/maintenance-jobs' && c.method === 'POST');
   assert.deepEqual(JSON.parse(JSON.stringify(libBatchCall.opts.body)), {
     operation: 'batch_book_covers',
     targetType: 'library',
     targetId: 'lib-1',
-    fallbackPage1: false,
+    fallbackPage1: true,
     force: false,
   });
 });
@@ -1643,12 +1651,18 @@ test('metadata center renders schemaFormat badges, -wal warnings, and streams SQ
   // 1. Add source modal: path tab shows -wal hint; upload tab uses XHR + FormData with metadata fields before file
   h.doc.getElementById('extmeta-source-add-btn').onclick();
   assert.match(h.doc.getElementById('emas-pane-path').innerHTML, /请先停止 Komga 或执行 WAL Checkpoint，勿遗漏 -wal/);
+  const emasImportCovers = h.doc.getElementById('emas-import-covers');
+  assert.ok(emasImportCovers);
+  assert.equal(emasImportCovers.checked, false);
+  assert.doesNotMatch(h.modalRoot.innerHTML, /原图不压缩/);
+  assert.doesNotMatch(h.modalRoot.innerHTML, /默认不选/);
 
   const uploadTabBtn = h.modalRoot.querySelector('button[data-emas-tab="upload"]');
   uploadTabBtn.onclick();
   assert.match(h.doc.getElementById('emas-pane-upload').innerHTML, /client_max_body_size/);
 
   h.doc.getElementById('emas-name').value = '我的 Komga DB';
+  emasImportCovers.checked = true;
   const fakeDbFile = { name: 'database.sqlite', size: 1024 * 1024 };
   h.doc.getElementById('emas-upload-file').files = [fakeDbFile];
   await h.doc.getElementById('emas-upload-btn').onclick();
@@ -1663,6 +1677,7 @@ test('metadata center renders schemaFormat badges, -wal warnings, and streams SQ
   assert.equal(addXhr.headers['X-FK115-UI'], '1');
   const addEntries = addXhr.body.entries();
   assert.equal(addEntries[0][0], 'name', 'metadata fields must precede file part for direct streaming');
+  assert.equal(addXhr.body.get('importCovers'), 'true');
   assert.equal(addEntries[addEntries.length - 1][0], 'file');
   assert.equal(addEntries[addEntries.length - 1][1], fakeDbFile);
   assert.match(progressSnapshots[0], /50%/);
@@ -1671,6 +1686,7 @@ test('metadata center renders schemaFormat badges, -wal warnings, and streams SQ
   body.querySelector('button[data-extmeta-src-edit="src-komga"]').onclick();
   assert.match(h.doc.getElementById('modal-body').innerHTML, /未 Checkpoint 的 -wal 日志/);
   assert.match(h.doc.getElementById('ems-pane-path').innerHTML, /请先停止 Komga 或执行 WAL Checkpoint/);
+  assert.equal(h.doc.getElementById('ems-import-covers').checked, false);
 
   h.modalRoot.querySelector('button[data-ems-tab="upload"]').onclick();
   const dict = h.doc.getElementById('ems-tag-dict');
@@ -1685,6 +1701,7 @@ test('metadata center renders schemaFormat badges, -wal warnings, and streams SQ
   assert.deepEqual(editEntries[0], ['sourceId', 'src-komga']);
   assert.equal(editEntries[editEntries.length - 1][0], 'file');
   assert.equal(h.xhrCalls[1].body.get('tagDictSourceId'), '');
+  assert.equal(h.xhrCalls[1].body.get('importCovers'), 'false');
 
   body.querySelector('button[data-extmeta-src-edit="src-v2"]').onclick();
   h.modalRoot.querySelector('button[data-ems-tab="upload"]').onclick();
