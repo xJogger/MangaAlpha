@@ -141,6 +141,19 @@ INSERT INTO series_metadata(series_id,is_nsfw,nsfw_lock,updated_at) VALUES ('wor
 			return true
 		})
 	}
+	assertBookCoverSummary := func(want bool) {
+		t.Helper()
+		book := decodeMetadataFixture[struct {
+			RawBookMeta struct{ HasExtCover bool }
+		}](t, request(readerKey, http.MethodGet, "/admin/api/books/volume/detail", "", http.StatusOK))
+		series := decodeMetadataFixture[struct {
+			BookExtras map[string]struct{ HasExtCover bool }
+		}](t, request(readerKey, http.MethodGet, "/admin/api/series/work/detail", "", http.StatusOK))
+		extra, ok := series.BookExtras["volume"]
+		if !ok || book.RawBookMeta.HasExtCover != want || extra.HasExtCover != want {
+			t.Fatalf("cover summary: book=%+v series=%+v want=%v", book, series, want)
+		}
+	}
 	scrape()
 	series, err := store.SeriesMetadataByID(ctx, database.Series{ID: "work", Name: "Fixture Work"})
 	if err != nil || series.ExtEntryID != "s" || series.ExtCoverURL != "" {
@@ -152,6 +165,7 @@ INSERT INTO series_metadata(series_id,is_nsfw,nsfw_lock,updated_at) VALUES ('wor
 	if rows, err := store.ListBookCoverCandidates(ctx, "volume"); err != nil || len(rows) != 0 {
 		t.Fatalf("disabled book import: %+v %v", rows, err)
 	}
+	assertBookCoverSummary(false)
 	if _, err := os.Stat(filepath.Join(srv.runtime.DataDir, "imported-covers")); !os.IsNotExist(err) {
 		t.Fatalf("disabled import wrote files: %v", err)
 	}
@@ -210,6 +224,7 @@ INSERT INTO series_metadata(series_id,is_nsfw,nsfw_lock,updated_at) VALUES ('wor
 	if _, err := store.SetUserShowNSFW(ctx, reader.ID, true); err != nil {
 		t.Fatal(err)
 	}
+	assertBookCoverSummary(true)
 	for _, path := range []string{"/api/v1/series/work/thumbnail", "/api/v1/books/volume/thumbnail"} {
 		cover := request(readerKey, http.MethodGet, path, "", http.StatusOK)
 		if !bytes.Equal(cover.Body.Bytes(), raw) || cover.Header().Get("Content-Type") != "image/png" ||

@@ -1367,6 +1367,12 @@ func (s *Server) seriesRichDetail(w http.ResponseWriter, r *http.Request) {
 		s.writeDBError(w, r, err)
 		return
 	}
+	coverCandidates, err := s.store.ListBookCoverCandidatesBySeries(r.Context(), series.ID)
+	if err != nil {
+		s.writeDBError(w, r, err)
+		return
+	}
+	showNSFW := s.store.ShowNSFW(r.Context())
 	bookProgresses, err := s.store.BookReadProgresses(r.Context(), bookIDs)
 	if err != nil {
 		s.writeDBError(w, r, err)
@@ -1393,7 +1399,7 @@ func (s *Server) seriesRichDetail(w http.ResponseWriter, r *http.Request) {
 		bm := bookMetas[b.ID]
 		bookProgress, hasProgress := bookProgresses[b.ID]
 		bookDTOList = append(bookDTOList, bookDTOWithProgressAndMeta(b, series, meta, bookProgress, hasProgress, bm))
-		extra := bookMetadataSummary(bm)
+		extra := bookMetadataSummary(bm, coverCandidates[b.ID], showNSFW)
 		extra["inferredProgress"] = pageProgressInline(pageProgresses[b.ID])
 		extra["indexStatus"] = indexStatusInline(indexStats[b.ID], ver)
 		extra["downloadStat"] = downloadStatInline(downloadStats[b.ID])
@@ -1537,7 +1543,12 @@ func (s *Server) bookRichDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	rawBookMeta := bookMetadataSummary(bookMeta)
+	coverCandidates, err := s.store.ListBookCoverCandidates(r.Context(), book.ID)
+	if err != nil {
+		s.writeDBError(w, r, err)
+		return
+	}
+	rawBookMeta := bookMetadataSummary(bookMeta, coverCandidates, s.store.ShowNSFW(r.Context()))
 	rawBookMeta["customCoverUrl"] = ""
 	rawBookMeta["extSourceId"] = ""
 	rawBookMeta["extEntryId"] = ""

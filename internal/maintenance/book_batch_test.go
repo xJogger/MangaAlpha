@@ -63,6 +63,59 @@ func TestBatchBookCoversOnlyReadsPageWhenRequested(t *testing.T) {
 	}
 }
 
+func TestBatchPageOneSkipsExistingBookCoversUnlessForced(t *testing.T) {
+	const coverURL = "https://covers.example.test/volume.jpg"
+	for _, tc := range []struct {
+		name, metadata, kind, ref, source string
+		userCover                         bool
+	}{
+		{name: "custom cover", metadata: "custom_cover_url", ref: coverURL, userCover: true},
+		{name: "Bangumi binding", metadata: "bgm_subject_id", ref: "41"},
+		{name: "Bangumi candidate", kind: database.CoverKindBangumi, ref: coverURL, source: "bangumi"},
+		{name: "external candidate", kind: database.CoverKindHTTPURL, ref: coverURL, source: "external", userCover: true},
+		{name: "imported candidate", kind: database.CoverKindImportedFile, ref: strings.Repeat("a", 64) + ".png", source: "import", userCover: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, thumbs, manager, _ := bookBatchFixture(t)
+			ctx := t.Context()
+			switch {
+			case tc.metadata != "":
+				if _, err := store.DB().ExecContext(ctx, "INSERT INTO book_metadata(book_id,"+tc.metadata+") VALUES('book-1',?)", tc.ref); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				if err := store.UpsertBookCoverCandidates(ctx, []database.BookCoverCandidate{{
+					BookID: "book-1", SourceID: tc.source, EntryID: "41", CoverKind: tc.kind, CoverRef: tc.ref, NSFWKnown: true,
+				}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			book, err := store.BookByID(ctx, "book-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := thumbs.HasBookUserCover(ctx, book); err != nil || got != tc.userCover {
+				t.Fatalf("user cover=%v want=%v err=%v", got, tc.userCover, err)
+			}
+			run := startBookBatch(t, manager, OperationBatchBookCovers, TargetSeries, "series", JobOptions{FallbackPage1: true})
+			if run.GeneratedCount != 1 || run.SkippedCount != 1 {
+				t.Fatalf("page-one batch: %+v", run)
+			}
+			assertBatchTableCount(t, store, "zip_indexes", 1)
+			run = startBookBatch(t, manager, OperationBatchBookCovers, TargetSeries, "series", JobOptions{FallbackPage1: true})
+			if run.GeneratedCount != 0 || run.SkippedCount != 2 {
+				t.Fatalf("repeat page-one batch: %+v", run)
+			}
+			assertBatchTableCount(t, store, "zip_indexes", 1)
+			run = startBookBatch(t, manager, OperationBatchBookCovers, TargetSeries, "series", JobOptions{FallbackPage1: true, Force: true})
+			if run.GeneratedCount != 2 || run.SkippedCount != 0 {
+				t.Fatalf("forced page-one batch: %+v", run)
+			}
+			assertBatchTableCount(t, store, "zip_indexes", 2)
+		})
+	}
+}
+
 func TestBatchComicInfoSeriesAndLibraryResume(t *testing.T) {
 	store, _, manager, _ := bookBatchFixture(t)
 	run := startBookBatch(t, manager, OperationBatchComicInfo, TargetSeries, "series", JobOptions{})
@@ -195,7 +248,19 @@ func startBookBatch(t *testing.T, manager *Manager, op, target, id string, optio
 	if run.Status != "success" || run.ProcessedItems != 2 {
 		t.Fatalf("batch failed: %+v", run)
 	}
-	return run
+	key := op + ":" + target + ":" + id
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.Lock()
+		pending := manager.queued[key] == run.ID
+		manager.mu.Unlock()
+		if !pending {
+			return run
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("completed batch %s still holds its queue slot", run.ID)
+	return Run{}
 }
 
 func assertBatchTableCount(t *testing.T, store *database.Store, table string, want int) {

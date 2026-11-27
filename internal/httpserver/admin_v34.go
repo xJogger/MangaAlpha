@@ -266,11 +266,15 @@ func bookCoverSource(bm database.BookMetadata) string {
 	return bm.CoverSource
 }
 
-func bookMetadataSummary(bm database.BookMetadata) map[string]any {
+func bookMetadataSummary(bm database.BookMetadata, candidates []database.BookCoverCandidate, showNSFW bool) map[string]any {
+	hasExtCover := bm.ExtCoverPath != "" || bm.ExtCoverURL != ""
+	for _, candidate := range candidates {
+		hasExtCover = hasExtCover || candidate.IsExternalCover(showNSFW)
+	}
 	return map[string]any{
 		"coverSource":        bookCoverSource(bm),
 		"hasCustomCover":     bm.CustomCoverPath != "" || bm.CustomCoverURL != "",
-		"hasExtCover":        bm.ExtCoverPath != "" || bm.ExtCoverURL != "",
+		"hasExtCover":        hasExtCover,
 		"bgmSubjectId":       bm.BgmSubjectID,
 		"comicInfoStatus":    bm.ComicInfoStatus,
 		"numberSortExplicit": bm.NumberSort != nil,

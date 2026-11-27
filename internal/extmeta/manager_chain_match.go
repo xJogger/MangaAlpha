@@ -82,9 +82,6 @@ func (m *Manager) matchOffline(ctx context.Context, target scrapeSeries, plan sc
 		}
 		if found {
 			meta.MatchOrigin = "auto"
-			if len(hits) == 0 {
-				return nil, nil
-			}
 			hits = append(hits, offlineHit{sourceID: TargetSourceBangumi, rank: -1, meta: meta})
 		}
 	}

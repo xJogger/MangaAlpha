@@ -390,14 +390,43 @@ func (s *Service) HasSourceBookBangumiCover(ctx context.Context, book database.B
 }
 
 func (s *Service) HasBookUserCover(ctx context.Context, book database.Book) (bool, error) {
+	return s.hasBookMetadataCover(ctx, book, false)
+}
+
+// HasBookMetadataCover checks configured covers without fetching an image.
+func (s *Service) HasBookMetadataCover(ctx context.Context, book database.Book) (bool, error) {
+	return s.hasBookMetadataCover(ctx, book, true)
+}
+
+func (s *Service) hasBookMetadataCover(ctx context.Context, book database.Book, includeBangumi bool) (bool, error) {
 	candidates, err := s.bookCoverCandidates(ctx, book)
 	if err != nil {
 		return false, err
 	}
+	showNSFW := s.store.ShowNSFW(ctx)
 	for _, candidate := range candidates {
+		if !candidate.allowed {
+			continue
+		}
 		m := candidate.meta
-		if m.CustomCoverPath != "" || m.CustomCoverURL != "" || m.ExtCoverURL != "" {
+		if m.CustomCoverPath != "" || m.CustomCoverURL != "" || m.ExtCoverPath != "" || m.ExtCoverURL != "" ||
+			(includeBangumi && m.BgmSubjectID > 0 && (showNSFW || !m.BgmIsNSFW)) {
 			return true, nil
+		}
+		covers, err := s.store.ListBookCoverCandidates(ctx, candidate.book.ID)
+		if err != nil {
+			return false, err
+		}
+		for _, cover := range covers {
+			if cover.IsExternalCover(showNSFW) {
+				return true, nil
+			}
+			if includeBangumi && cover.CoverKind == database.CoverKindBangumi && cover.CoverRef != "" &&
+				(showNSFW || (cover.NSFWKnown && !cover.IsNSFW)) {
+				if id, err := strconv.ParseInt(cover.EntryID, 10, 64); err == nil && id > 0 {
+					return true, nil
+				}
+			}
 		}
 	}
 	return false, nil

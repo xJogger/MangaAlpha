@@ -194,6 +194,11 @@ type BookCoverCandidate struct {
 	UpdatedAt        string `json:"updatedAt"`
 }
 
+func (c BookCoverCandidate) IsExternalCover(showNSFW bool) bool {
+	return c.CoverRef != "" && (showNSFW || (c.NSFWKnown && !c.IsNSFW)) &&
+		(c.CoverKind == CoverKindImportedFile || (c.CoverKind == CoverKindHTTPURL && c.SourceID != "bangumi"))
+}
+
 const bookCoverCandidateColumns = "book_id,source_id,series_entry_id,entry_id,cover_kind,cover_ref,is_nsfw,nsfw_known,rank_order,source_generation,updated_at"
 
 func scanBookCoverCandidate(rows *sql.Rows) (BookCoverCandidate, error) {
@@ -348,13 +353,22 @@ func prepareMetadataUpsert(ctx context.Context, tx *sql.Tx, table, columns strin
 
 const automaticSeriesCoverCandidates = "source_id NOT IN ('manual','agent')"
 
+const bangumiBindingSource = "(source_id='bangumi' OR source_id IN (SELECT id FROM metadata_sources WHERE kind='bangumi_archive'))"
+const externalBindingSource = "NOT " + bangumiBindingSource
+const booksInMetadataSeries = "book_id IN (SELECT id FROM books WHERE series_id=?)"
+const unprotectedBookMetadata = `NOT EXISTS (
+SELECT 1 FROM book_metadata m WHERE m.book_id=target.book_id AND m.match_origin IN ('manual','agent'))`
+const removableExternalBookCovers = externalBindingSource + " AND " + automaticSeriesCoverCandidates + " AND " + unprotectedBookMetadata + `
+AND NOT EXISTS (SELECT 1 FROM book_source_bindings sb WHERE sb.book_id=target.book_id
+AND sb.source_id=target.source_id AND sb.match_origin IN ('manual','agent'))`
+
 func clearSparseSeriesExternalBinding(ctx context.Context, tx *sql.Tx, seriesID string) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, `
 SELECT cover_ref FROM series_cover_candidates
-WHERE series_id=? AND cover_kind='imported_file' AND `+automaticSeriesCoverCandidates+`
+WHERE series_id=? AND cover_kind='imported_file' AND `+automaticSeriesCoverCandidates+" AND "+externalBindingSource+`
 UNION
-SELECT c.cover_ref FROM books b CROSS JOIN book_cover_candidates c ON c.book_id=b.id
-WHERE b.series_id=? AND c.cover_kind='imported_file'
+SELECT cover_ref FROM book_cover_candidates AS target
+WHERE `+booksInMetadataSeries+" AND cover_kind='imported_file' AND "+removableExternalBookCovers+`
 ORDER BY cover_ref`, seriesID, seriesID)
 	if err != nil {
 		return nil, err
@@ -374,16 +388,31 @@ ORDER BY cover_ref`, seriesID, seriesID)
 		return nil, err
 	}
 	for _, query := range []string{
-		"DELETE FROM series_source_bindings WHERE series_id=?",
-		"DELETE FROM series_cover_candidates WHERE series_id=? AND " + automaticSeriesCoverCandidates,
-		"DELETE FROM book_source_bindings WHERE book_id IN (SELECT id FROM books WHERE series_id=?)",
-		"DELETE FROM book_cover_candidates WHERE book_id IN (SELECT id FROM books WHERE series_id=?)",
+		"DELETE FROM series_source_bindings WHERE series_id=? AND " + externalBindingSource,
+		"DELETE FROM series_cover_candidates WHERE series_id=? AND " + automaticSeriesCoverCandidates + " AND " + externalBindingSource,
+		"DELETE FROM book_cover_candidates AS target WHERE " + booksInMetadataSeries + " AND " + removableExternalBookCovers,
+		"DELETE FROM book_source_bindings AS target WHERE " + booksInMetadataSeries + " AND " + externalBindingSource +
+			" AND match_origin NOT IN ('manual','agent') AND " + unprotectedBookMetadata,
 	} {
 		if _, err := tx.ExecContext(ctx, query, seriesID); err != nil {
 			return nil, err
 		}
 	}
 	return refs, nil
+}
+
+func clearSparseSeriesBangumiBinding(ctx context.Context, tx *sql.Tx, seriesID string) error {
+	for _, query := range []string{
+		"DELETE FROM series_source_bindings WHERE series_id=? AND " + bangumiBindingSource,
+		"DELETE FROM series_cover_candidates WHERE series_id=? AND " + bangumiBindingSource,
+		"DELETE FROM book_source_bindings WHERE " + booksInMetadataSeries + " AND " + bangumiBindingSource,
+		"DELETE FROM book_cover_candidates WHERE " + booksInMetadataSeries + " AND " + bangumiBindingSource,
+	} {
+		if _, err := tx.ExecContext(ctx, query, seriesID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // These column lists use newlines only for SQL formatting.

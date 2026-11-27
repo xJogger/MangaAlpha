@@ -91,7 +91,9 @@ AND (NOT EXISTS (SELECT 1 FROM library_metadata_sources lc WHERE lc.library_id=l
 func (s *Store) MarkLibraryMetadataChainApplied(ctx context.Context, libraryID, appliedVersion string) error {
 	_, err := s.db.ExecContext(ctx, `
 UPDATE library_metadata_chain_state SET applied_chain_version=?,updated_at=?
-WHERE library_id=? AND chain_version=? AND applied_chain_version<>?`,
+WHERE library_id=? AND chain_version=? AND applied_chain_version<>?
+AND EXISTS (SELECT 1 FROM libraries l WHERE l.id=library_metadata_chain_state.library_id AND l.enabled=1)
+AND NOT EXISTS (SELECT 1 FROM union_layers ul WHERE ul.member_library_id=library_metadata_chain_state.library_id)`,
 		appliedVersion, nowText(), libraryID, appliedVersion, appliedVersion)
 	return err
 }

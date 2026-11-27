@@ -378,7 +378,8 @@ func (s *Store) applyScrapedMetadataTx(ctx context.Context, tx *sql.Tx, series S
 	extCoverPath := strings.TrimSpace(incoming.ExtCoverPath)
 	matchOrigin := strings.TrimSpace(incoming.MatchOrigin)
 
-	legacy := chain && current.MatchOrigin == "" && (prevSubjectID > 0 || current.ExtEntryID != "")
+	automated, _ := ctx.Value(automaticMetadataKey{}).(bool)
+	legacy := automated && chain && current.MatchOrigin == "" && (prevSubjectID > 0 || current.ExtEntryID != "")
 	if legacy {
 		matchOrigin = ""
 		if current.ExtEntryID != "" {
@@ -572,10 +573,6 @@ func applySeriesList[T any](dst *[]T, values []T, locked, onlyEmpty bool, clean 
 	return true
 }
 
-func (s *Store) unionHasNSFWSource(ctx context.Context, seriesID string) (bool, error) {
-	return queryUnionHasNSFWSource(ctx, s.db, seriesID)
-}
-
 func queryUnionHasNSFWSource(ctx context.Context, db interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, seriesID string) (bool, error) {
@@ -621,8 +618,16 @@ func (s *Store) MarkSeriesScrapeStatusWithNSFW(
 }
 
 func (s *Store) ClearSeriesBangumiBinding(ctx context.Context, series Series) (SeriesMetadata, error) {
-	current, err := s.SeriesMetadataByID(ctx, series)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return SeriesMetadata{}, err
+	}
+	defer tx.Rollback()
+	current, err := scanSeriesMetadataRow(tx.QueryRowContext(ctx,
+		`SELECT `+seriesMetadataColumns+` FROM series_metadata WHERE series_id=?`, series.ID))
+	if errors.Is(err, sql.ErrNoRows) {
+		current = defaultSeriesMetadata(series)
+	} else if err != nil {
 		return SeriesMetadata{}, err
 	}
 	current.BgmSubjectID = nil
@@ -636,7 +641,7 @@ func (s *Store) ClearSeriesBangumiBinding(ctx context.Context, series Series) (S
 		current.MatchOrigin = ""
 	}
 	if !current.NSFWLock {
-		current.IsNSFW, err = s.unionHasNSFWSource(ctx, series.ID)
+		current.IsNSFW, err = queryUnionHasNSFWSource(ctx, tx, series.ID)
 		if err != nil {
 			return SeriesMetadata{}, err
 		}
@@ -647,7 +652,13 @@ func (s *Store) ClearSeriesBangumiBinding(ctx context.Context, series Series) (S
 	if !current.TitleSortLock {
 		current.TitleSort = series.Name
 	}
-	if err := s.saveSeriesMetadata(ctx, current, nowText()); err != nil {
+	if err := saveSeriesMetadataTx(ctx, tx, current, nowText()); err != nil {
+		return SeriesMetadata{}, err
+	}
+	if err := clearSparseSeriesBangumiBinding(ctx, tx, series.ID); err != nil {
+		return SeriesMetadata{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return SeriesMetadata{}, err
 	}
 	return s.SeriesMetadataByID(ctx, series)
@@ -924,6 +935,11 @@ SET ext_source_id='',
     match_origin=CASE WHEN bgm_subject_id<=0 THEN '' ELSE match_origin END,
     updated_at=?
 WHERE book_id IN (SELECT id FROM books WHERE series_id=?)
+  AND match_origin NOT IN ('manual','agent')
+  AND ext_source_id<>'bangumi'
+  AND ext_source_id NOT IN (SELECT id FROM metadata_sources WHERE kind='bangumi_archive')
+  AND NOT EXISTS (SELECT 1 FROM book_source_bindings sb WHERE sb.book_id=book_metadata.book_id
+   AND sb.source_id=book_metadata.ext_source_id AND sb.match_origin IN ('manual','agent'))
   AND ((ext_source_id<>'' AND ext_source_id=?) OR ext_cover_url GLOB 'sqlite-blob://*' OR EXISTS (
    SELECT 1 FROM book_source_bindings sb WHERE sb.book_id=book_metadata.book_id AND sb.source_id=book_metadata.ext_source_id
   ))`, now, series.ID, prevExtSourceID); err != nil {

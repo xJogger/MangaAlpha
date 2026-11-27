@@ -394,6 +394,153 @@ func TestCancelSelectedLibraryKeepsForceReminder(t *testing.T) {
 	}
 }
 
+func TestForceSkipsUnreadyLibraryChain(t *testing.T) {
+	ctx := t.Context()
+	store, m, root := newTestManager(t, ManagerOptions{})
+	path := filepath.Join(root, "ready.sqlite")
+	createManagerGallery(t, path, "Blue River")
+	ready := addManagerSource(t, m, database.MetadataSource{Name: "Ready", Kind: KindOfflineSQLite, LocalPath: path})
+	syncManagerFixture(t, m, ready, false, "success")
+	for id, source := range map[string]string{"ready": ready.ID, "unready": TargetSourceBangumi, "empty": TargetSourceBangumi} {
+		seedMetadataLibrary(t, store, id, true)
+		if _, err := m.SetLibrarySources(ctx, id, []string{source}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedMetadataSeries(t, store, "new", "ready", "Blue River")
+	seedMetadataSeries(t, store, "old", "unready", "Blue River")
+	execManagerFixture(t, store.DB(), `
+INSERT INTO series_metadata(series_id,ext_source_id,ext_entry_id,match_origin,scrape_status,updated_at)
+VALUES('old',?,'101','auto','matched','')`, ready.ID)
+	run := runChainFixture(t, m, "", "force", nil)
+	if run.Status != "success" || run.Matched != 1 || run.Skipped != 1 {
+		t.Fatalf("force: %+v", run)
+	}
+	if meta := readMetadata(t, store, "old"); meta.ExtEntryID != "101" || meta.MatchOrigin != "auto" || meta.ScrapeStatus != "matched" {
+		t.Fatalf("unready library lost its binding: %+v", meta)
+	}
+	for id, want := range map[string]bool{"ready": false, "unready": true, "empty": true} {
+		state, err := store.GetLibraryMetadataChainState(ctx, id)
+		if err != nil || state.NeedsRematch != want {
+			t.Fatalf("%s chain: %+v, %v", id, state, err)
+		}
+	}
+}
+
+func TestAllLibraryForceKeepsReminderAfterOnlineWriteSkipped(t *testing.T) {
+	for _, tc := range []struct {
+		name, change string
+	}{
+		{"hidden", "UPDATE libraries SET enabled=0 WHERE id='changed'"},
+		{"edited", `INSERT INTO series_metadata(series_id,bgm_subject_id,match_origin,updated_at) VALUES('work',100,'manual','')`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			var store *database.Store
+			client := &http.Client{Transport: managerTransport(func(r *http.Request) (*http.Response, error) {
+				// Change the library or binding while the request is in flight.
+				if _, err := store.DB().ExecContext(r.Context(), "UPDATE libraries SET enabled=0 WHERE id='empty-hidden'"); err != nil {
+					return nil, err
+				}
+				if _, err := store.DB().ExecContext(r.Context(), tc.change); err != nil {
+					return nil, err
+				}
+				return managerResponse(r, http.StatusNoContent, strings.NewReader("")), nil
+			})}
+			var m *Manager
+			store, m, _ = newTestManager(t, ManagerOptions{HTTPClient: client})
+			source := addManagerSource(t, m, database.MetadataSource{
+				Name: "Online", Kind: KindOfflineSQLite, OnlineEnabled: true, OnlineAPIURL: "https://source.example.test/suggest",
+			})
+			for _, id := range []string{"changed", "ready", "empty-hidden"} {
+				seedMetadataLibrary(t, store, id, true)
+				if _, err := m.SetLibrarySources(ctx, id, []string{source.ID}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			seedMetadataSeries(t, store, "work", "changed", "Blue River")
+			run, err := m.StartMultiScrape(ctx, "", "force", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitForManager(t, func() bool {
+				run, err = m.ScrapeRunByID(ctx, run.ID)
+				return err == nil && run.CompletedAt != ""
+			})
+			if run.Status != "success" || run.Skipped != 1 {
+				t.Fatalf("force: %+v", run)
+			}
+			for id, want := range map[string]bool{"changed": true, "ready": false, "empty-hidden": true} {
+				state, err := store.GetLibraryMetadataChainState(ctx, id)
+				if err != nil || state.NeedsRematch != want {
+					t.Fatalf("%s chain: %+v, %v", id, state, err)
+				}
+			}
+		})
+	}
+}
+
+func TestForceKeepsBangumiAnchorWhenReplacementChainMisses(t *testing.T) {
+	ctx := t.Context()
+	store, m, root := newTestManager(t, ManagerOptions{})
+	bgm, err := bangumi.NewService(store, filepath.Join(root, "bangumi"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { m.Close(); bgm.Close() })
+	m.bangumi = bgm
+	importChainBangumi(t, bgm, root)
+
+	path := filepath.Join(root, "replacement.sqlite")
+	createManagerGallery(t, path, "Blue River")
+	src := addManagerSource(t, m, database.MetadataSource{Name: "Replacement", Kind: KindOfflineSQLite, LocalPath: path})
+	syncManagerFixture(t, m, src, false, "success")
+	seedMetadataLibrary(t, store, "lib", true)
+	seedMetadataSeries(t, store, "work", "lib", "Aria Official")
+	seedWave2BBook(t, store, "vol", "work", "lib", "Aria Official Vol.01.cbz", 1)
+	if _, err := m.SetLibrarySources(ctx, "lib", []string{TargetSourceBangumi}); err != nil {
+		t.Fatal(err)
+	}
+	execManagerFixture(t, store.DB(), `
+INSERT INTO series_metadata(series_id,bgm_subject_id,ext_source_id,ext_entry_id,ext_cover_url,match_origin,updated_at)
+VALUES('work',100,'old','entry','https://covers.example.test/old.jpg','auto','');
+INSERT INTO book_metadata(book_id,bgm_subject_id,ext_source_id,ext_entry_id,ext_cover_url,match_origin)
+VALUES('vol',101,'old','volume','https://covers.example.test/old-vol.jpg','auto');
+INSERT INTO series_source_bindings(series_id,source_id,entry_id,updated_at) VALUES('work','old','entry','');
+INSERT INTO book_source_bindings(book_id,source_id,entry_id,updated_at) VALUES('vol','old','volume','');
+INSERT INTO series_cover_candidates(series_id,source_id,cover_kind,cover_ref,updated_at)
+VALUES('work','old','http_url','https://covers.example.test/old.jpg',''),('work','import','imported_file',?,'');
+INSERT INTO book_cover_candidates(book_id,source_id,cover_kind,cover_ref,updated_at)
+VALUES('vol','old','http_url','https://covers.example.test/old-vol.jpg',''),('vol','import','imported_file',?,'');`,
+		strings.Repeat("a", 64)+".png", strings.Repeat("b", 64)+".png")
+	if _, err := m.SetLibrarySources(ctx, "lib", []string{src.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if run := runChainFixture(t, m, "lib", "force", nil); run.Status != "success" || run.Matched != 1 {
+		t.Fatalf("force: %+v", run)
+	}
+	meta := readMetadata(t, store, "work")
+	if meta.BgmSubjectID == nil || *meta.BgmSubjectID != 100 || meta.ExtSourceID != "" || meta.ExtEntryID != "" || meta.ExtCoverURL != "" {
+		t.Fatalf("series binding: %+v", meta)
+	}
+	book, _, err := store.BookMetadataByID(ctx, "vol")
+	if err != nil || book.BgmSubjectID != 101 || book.ExtSourceID != "" || book.ExtEntryID != "" || book.ExtCoverURL != "" {
+		t.Fatalf("volume binding: %+v, %v", book, err)
+	}
+	for _, table := range []string{"series_source_bindings", "book_source_bindings", "series_cover_candidates", "book_cover_candidates"} {
+		var count int
+		if err := store.DB().QueryRowContext(ctx, "SELECT count(*) FROM "+table+" WHERE source_id='old'").Scan(&count); err != nil || count != 0 {
+			t.Fatalf("%s retained %d stale rows: %v", table, count, err)
+		}
+	}
+	for _, table := range []string{"series_cover_candidates", "book_cover_candidates"} {
+		var count int
+		if err := store.DB().QueryRowContext(ctx, "SELECT count(*) FROM "+table+" WHERE cover_kind='imported_file'").Scan(&count); err != nil || count != 1 {
+			t.Fatalf("%s imported cover count = %d: %v", table, count, err)
+		}
+	}
+}
+
 func TestKomgaSidecarDoesNotRequireBookColumns(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "upstream.sqlite")

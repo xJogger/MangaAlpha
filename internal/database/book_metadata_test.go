@@ -339,7 +339,7 @@ func TestClearSeriesExternalBindingClearsChildBooksSafely(t *testing.T) {
 	if err := store.UpsertBookScrapedMetadata(ctx, "work-book-a", BookScrapedMetadata{
 		ExtSourceID: "ext-src-1", ExtEntryID: "e1",
 		ExtCoverURL: "https://ext.example.test/b1.jpg", ExtCoverPath: "ext1.jpg",
-		MatchOrigin: "manual", ComicInfoVersion: "v1", ComicInfoStatus: "parsed",
+		MatchOrigin: "auto", ComicInfoVersion: "v1", ComicInfoStatus: "parsed",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +354,7 @@ func TestClearSeriesExternalBindingClearsChildBooksSafely(t *testing.T) {
 		BgmSubjectID: 101, BgmCoverURL: "https://bgm.example.test/101.jpg",
 		ExtSourceID: "ext-src-1", ExtEntryID: "e2",
 		ExtCoverURL: "https://ext.example.test/b2.jpg", ExtCoverPath: "ext2.jpg",
-		MatchOrigin: "manual",
+		MatchOrigin: "auto",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -391,10 +391,13 @@ func TestClearSeriesExternalBindingClearsChildBooksSafely(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("auto-scrape after clear was still blocked: %v", err)
 	}
+	if mA, _, err = store.BookMetadataByID(ctx, "work-book-a"); err != nil || mA.Summary != "Re-scraped summary" {
+		t.Fatalf("work-book-a after re-scrape = %+v, err=%v", mA, err)
+	}
 
 	mB, _, err := store.BookMetadataByID(ctx, "work-book-b")
 	if err != nil || mB.ExtSourceID != "" || mB.ExtEntryID != "" || mB.ExtCoverURL != "" || mB.ExtCoverPath != "" ||
-		mB.BgmSubjectID != 101 || mB.MatchOrigin != "manual" ||
+		mB.BgmSubjectID != 101 || mB.MatchOrigin != "auto" ||
 		mB.CoverSource != "custom" || mB.CustomCoverPath != "custom2.jpg" {
 		t.Fatalf("work-book-b after ClearSeriesExternalBinding = %+v, err=%v", mB, err)
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"slices"
 	"time"
 
 	"github.com/xJogger/fake-komga-115/internal/archive"
@@ -108,13 +107,6 @@ func (m *Manager) batchSeries(ctx context.Context, run *Run, seriesID string, op
 	}
 	var matches map[string]thumbnail.VolumeMatchResult
 	var matchErr error
-	var coverCandidates map[string][]database.BookCoverCandidate
-	if run.Operation == OperationBatchBookCovers && options.FallbackPage1 && !options.Force {
-		coverCandidates, err = m.store.ListBookCoverCandidatesBySeries(ctx, seriesID)
-		if err != nil {
-			return err
-		}
-	}
 	if run.Operation == OperationBatchBookCovers && !options.FallbackPage1 {
 		matches, matchErr = m.matchSeriesVolumes(ctx, series)
 	}
@@ -137,7 +129,11 @@ func (m *Manager) batchSeries(ctx context.Context, run *Run, seriesID string, op
 			switch run.Operation {
 			case OperationBatchBookCovers:
 				if options.FallbackPage1 {
-					if options.Force || !slices.ContainsFunc(coverCandidates[book.ID], func(c database.BookCoverCandidate) bool { return c.CoverKind == database.CoverKindImportedFile }) {
+					var hasCover bool
+					if !options.Force {
+						hasCover, err = m.thumbs.HasBookMetadataCover(ctx, book)
+					}
+					if err == nil && !hasCover {
 						generated, err = m.batchPageOne(ctx, book, options.Force)
 					}
 					break

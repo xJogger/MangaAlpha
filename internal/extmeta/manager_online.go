@@ -51,7 +51,7 @@ func (m *Manager) setOnlineStatus(status OnlineStatus) {
 	m.online = status
 }
 
-func (m *Manager) enrichOnline(ctx context.Context, run *ScrapeRun, sources []database.MetadataSource, pending []scrapeSeries) error {
+func (m *Manager) enrichOnline(ctx context.Context, run *ScrapeRun, sources []database.MetadataSource, pending []scrapeSeries, skippedLibraries map[string]bool) error {
 	if len(pending) == 0 {
 		return nil
 	}
@@ -100,7 +100,7 @@ func (m *Manager) enrichOnline(ctx context.Context, run *ScrapeRun, sources []da
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := m.finishSeries(ctx, run, target, meta, found, failed)
+		err := m.finishSeries(ctx, run, target, meta, found, failed, skippedLibraries)
 		status.Processed++
 		switch {
 		case errors.Is(err, database.ErrMetadataChanged):
@@ -140,7 +140,7 @@ func (m *Manager) onlineMatch(ctx context.Context, client *http.Client, sourceID
 		}
 		source, err := m.store.GetMetadataSource(ctx, sourceID)
 		if err != nil || !source.Enabled || !source.OnlineEnabled || source.OnlineAPIURL == "" {
-			return empty, false, nil
+			return empty, false, database.ErrMetadataChanged
 		}
 		entry, code, retry, err := requestOnlineEntry(ctx, client, source.OnlineAPIURL, query)
 		m.nextOnline = time.Now().Add(5*time.Second + rand.N(3*time.Second+1))

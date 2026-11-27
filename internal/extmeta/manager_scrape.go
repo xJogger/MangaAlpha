@@ -89,6 +89,11 @@ func (p scrapePlan) hasReadyChain(libraryID string, bgmReady bool) bool {
 	return false
 }
 
+func (p scrapePlan) hasReadySources(libraryID string, bgmReady, allowOnline bool) bool {
+	// Mapping records resolve through a ready index in the library's chain.
+	return p.hasReadyChain(libraryID, bgmReady) || (allowOnline && len(p.online) > 0)
+}
+
 func (m *Manager) HasReadySourcesForLibrary(ctx context.Context, libraryID string, allowOnline bool) (bool, error) {
 	var ids []string
 	if libraryID != "" {
@@ -105,13 +110,10 @@ func (m *Manager) HasReadySourcesForLibraries(ctx context.Context, ids []string,
 	if err != nil {
 		return false, err
 	}
-	if allowOnline && len(plan.online) > 0 {
-		return true, nil
-	}
 	bgmReady := m.bangumi != nil && m.bangumi.ArchiveStatus().Ready
 	if len(ids) != 0 {
 		for _, id := range ids {
-			if plan.hasReadyChain(id, bgmReady) {
+			if plan.hasReadySources(id, bgmReady, allowOnline) {
 				return true, nil
 			}
 		}
@@ -129,14 +131,14 @@ func (m *Manager) HasReadySourcesForLibraries(ctx context.Context, ids []string,
 			return false, err
 		}
 		hasLibraries = true
-		if plan.hasReadyChain(id, bgmReady) {
+		if plan.hasReadySources(id, bgmReady, allowOnline) {
 			return true, nil
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
-	return !hasLibraries && (bgmReady || len(plan.readySidecars) > 0), nil
+	return !hasLibraries && (bgmReady || len(plan.readySidecars) > 0 || (allowOnline && len(plan.online) > 0)), nil
 }
 
 type scrapeLibrary struct{ id, name string }
@@ -306,7 +308,12 @@ func (m *Manager) executeScrape(ctx context.Context, run ScrapeRun, flush <-chan
 		m.flushScrapeProgress(flushCtx, initial, flush)
 	}()
 
-	err := m.multiScrape(database.WithAutomaticMetadata(ctx), &run, selected)
+	skippedLibraries := make(map[string]bool)
+	err := m.multiScrape(database.WithAutomaticMetadata(ctx), &run, selected, skippedLibraries)
+	var readyLibraries map[string]bool
+	if err == nil && run.Failed == 0 && run.Mode == bangumi.ScrapeModeForce {
+		readyLibraries, err = m.readyScrapeLibraries(ctx, run.AllowOnline)
+	}
 	stopFlush()
 	<-flushed
 	m.mu.Lock()
@@ -330,6 +337,9 @@ func (m *Manager) executeScrape(ctx context.Context, run ScrapeRun, flush <-chan
 	}
 	if run.Status == "success" && run.Mode == bangumi.ScrapeModeForce {
 		for id, version := range versions {
+			if skippedLibraries[id] || !readyLibraries[id] {
+				continue
+			}
 			if err := m.store.MarkLibraryMetadataChainApplied(context.Background(), id, version); err != nil && m.logger != nil {
 				m.logger.Warn("could not mark metadata chain applied", "libraryId", id)
 			}
@@ -563,10 +573,37 @@ WHERE ` + topLevelLibraryFilter + `
 	return out, rows.Err()
 }
 
-func (m *Manager) multiScrape(ctx context.Context, run *ScrapeRun, selected []string) error {
+func (m *Manager) readyScrapeLibraries(ctx context.Context, allowOnline bool) (map[string]bool, error) {
+	plan, err := m.scrapePlan(ctx)
+	if err != nil {
+		return nil, err
+	}
+	libraries, err := m.topLevelLibraries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	bgmReady := m.bangumi != nil && m.bangumi.ArchiveStatus().Ready
+	ready := make(map[string]bool, len(libraries))
+	for _, library := range libraries {
+		ready[library.id] = plan.hasReadySources(library.id, bgmReady, allowOnline)
+	}
+	return ready, nil
+}
+
+func (m *Manager) multiScrape(ctx context.Context, run *ScrapeRun, selected []string, skippedLibraries map[string]bool) error {
 	plan, err := m.scrapePlan(ctx)
 	if err != nil {
 		return err
+	}
+	bgmReady := m.bangumi != nil && m.bangumi.ArchiveStatus().Ready
+	allowOnline := run.AllowOnline && len(plan.online) > 0
+	force := run.Mode == bangumi.ScrapeModeForce
+	readyOffline := make(map[string]bool, len(selected))
+	for _, id := range selected {
+		readyOffline[id] = plan.hasReadyChain(id, bgmReady)
+		if !readyOffline[id] && !allowOnline {
+			skippedLibraries[id] = true
+		}
 	}
 	targets, err := m.scrapeTargets(ctx, selected, run.Mode)
 	if err != nil {
@@ -581,15 +618,20 @@ func (m *Manager) multiScrape(ctx context.Context, run *ScrapeRun, selected []st
 		}
 		run.CurrentSeries = target.series.Name
 		m.publishScrapeProgress(run)
-		hits, err := m.matchOffline(ctx, target, plan, run.Mode == bangumi.ScrapeModeForce)
-		if err == nil && len(hits) == 0 && !target.bound && run.AllowOnline && len(plan.online) > 0 {
+		// Online enrichment handles unbound series only.
+		if !readyOffline[target.series.LibraryID] && (!allowOnline || target.bound) {
+			m.recordScrapeResult(run, target.series.LibraryID, skippedLibraries, database.ScrapedMetadata{}, false, database.ErrMetadataChanged)
+			continue
+		}
+		hits, err := m.matchOffline(ctx, target, plan, force)
+		if err == nil && len(hits) == 0 && !target.bound && allowOnline {
 			pending = append(pending, target)
 			continue
 		}
 		var incoming database.ScrapedMetadata
 		if err == nil && len(hits) > 0 {
-			incoming, _, err = m.applyOfflineHits(ctx, target.series, hits, run.Mode == bangumi.ScrapeModeForce, &target.subjectID)
-		} else if err == nil && run.Mode == bangumi.ScrapeModeForce && target.bound && target.subjectID == 0 && target.origin != "" {
+			incoming, _, err = m.applyOfflineHits(ctx, target.series, hits, force, &target.subjectID)
+		} else if err == nil && force && target.bound && target.subjectID == 0 && target.origin != "" {
 			inferred := bangumi.InferPathNSFW(target.series.Name, target.series.RelativePath)
 			_, _, err = m.store.ApplyMetadataChain(ctx, target.series, database.ChainSeriesMatch{
 				Metadata: database.ScrapedMetadata{IsNSFW: inferred}, Replace: true, MarkUnmatched: true, ExpectedSubjectID: &target.subjectID,
@@ -598,12 +640,12 @@ func (m *Manager) multiScrape(ctx context.Context, run *ScrapeRun, selected []st
 			inferred := bangumi.InferPathNSFW(target.series.Name, target.series.RelativePath)
 			err = m.store.MarkSeriesScrapeStatusWithNSFW(ctx, target.series, database.ScrapeStatusUnmatched, 0, inferred)
 		}
-		m.recordScrapeResult(run, incoming, len(hits) > 0, err)
+		m.recordScrapeResult(run, target.series.LibraryID, skippedLibraries, incoming, len(hits) > 0, err)
 	}
-	return m.enrichOnline(ctx, run, plan.online, pending)
+	return m.enrichOnline(ctx, run, plan.online, pending, skippedLibraries)
 }
 
-func (m *Manager) finishSeries(ctx context.Context, run *ScrapeRun, target scrapeSeries, incoming database.ScrapedMetadata, matched bool, err error) error {
+func (m *Manager) finishSeries(ctx context.Context, run *ScrapeRun, target scrapeSeries, incoming database.ScrapedMetadata, matched bool, err error, skippedLibraries map[string]bool) error {
 	if err == nil {
 		switch {
 		case matched:
@@ -614,14 +656,15 @@ func (m *Manager) finishSeries(ctx context.Context, run *ScrapeRun, target scrap
 			err = m.store.MarkSeriesScrapeStatusWithNSFW(ctx, target.series, database.ScrapeStatusUnmatched, 0, inferred)
 		}
 	}
-	m.recordScrapeResult(run, incoming, matched, err)
+	m.recordScrapeResult(run, target.series.LibraryID, skippedLibraries, incoming, matched, err)
 	return err
 }
 
-func (m *Manager) recordScrapeResult(run *ScrapeRun, incoming database.ScrapedMetadata, matched bool, err error) {
+func (m *Manager) recordScrapeResult(run *ScrapeRun, libraryID string, skippedLibraries map[string]bool, incoming database.ScrapedMetadata, matched bool, err error) {
 	run.Processed++
 	switch {
 	case errors.Is(err, database.ErrMetadataChanged):
+		skippedLibraries[libraryID] = true
 		run.Skipped++
 	case err != nil:
 		run.Failed++
@@ -655,7 +698,7 @@ func (m *Manager) matchSidecar(ctx context.Context, id string, titles, authors [
 	defer m.mu.RUnlock()
 	sidecar := m.sidecars[id]
 	if sidecar == nil {
-		return nil, 0, nil
+		return nil, 0, database.ErrMetadataChanged
 	}
 	if embedded != nil {
 		if sidecar.Schema() == SchemaGalleryV1 {

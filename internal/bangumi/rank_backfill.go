@@ -450,6 +450,10 @@ func diffOfflineMetadataRow(cur storedSeriesMetaRow, cand SubjectCandidate) (pen
 	}
 
 	if cur.KeepChainFields {
+		if !cur.NSFWLock && (inc.IsNSFW || cur.NSFWUnionMember) && !cur.IsNSFW {
+			upd.isNSFW = 1
+			changed = true
+		}
 		return upd, changed
 	}
 	// Unlocked scalar fields (non-empty guard: never wipe existing values with blanks).

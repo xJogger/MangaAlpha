@@ -33,6 +33,93 @@ func r1aLibrary(t *testing.T, store *Store, id string, enabled bool) {
 	}
 }
 
+func TestClearSeriesBindingsSeparatesBangumiAndExternalRows(t *testing.T) {
+	ctx := t.Context()
+	store := openR1AStore(t)
+	r1aLibrary(t, store, "lib", true)
+	insertCatalogSeries(t, store, "lib", "work", "Work", make([]catalogBookTime, 2))
+	if _, err := store.CreateMetadataSource(ctx, MetadataSource{ID: "archive", Kind: "bangumi_archive", Name: "Archive"}); err != nil {
+		t.Fatal(err)
+	}
+	subject := int64(42)
+	if err := store.SaveSeriesMetadata(ctx, SeriesMetadata{
+		SeriesID: "work", BgmSubjectID: &subject, ExtSourceID: "external", ExtEntryID: "entry", MatchOrigin: "auto",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r1aExec(t, store, `
+INSERT INTO book_metadata(book_id,ext_source_id,ext_entry_id,match_origin)
+VALUES('work-book-a','external','auto-volume','auto'),('work-book-b','external','manual-volume','manual')`)
+	var seriesBindings []SeriesSourceBinding
+	var bookBindings []BookSourceBinding
+	var seriesCovers []SeriesCoverCandidate
+	var bookCovers []BookCoverCandidate
+	importedRef := strings.Repeat("a", 64) + ".png"
+	protectedRef := strings.Repeat("b", 64) + ".png"
+	for _, src := range []string{"bangumi", "archive", "external", "agent-source"} {
+		kind, ref, origin := CoverKindBangumi, "https://covers.example.test/image.jpg", "auto"
+		switch src {
+		case "external":
+			kind, ref = CoverKindImportedFile, importedRef
+		case "agent-source":
+			kind, ref, origin = CoverKindImportedFile, protectedRef, "agent"
+		}
+		bookBindings = append(bookBindings, BookSourceBinding{BookID: "work-book-a", SourceID: src, EntryID: "42", MatchOrigin: origin})
+		bookCovers = append(bookCovers, BookCoverCandidate{BookID: "work-book-a", SourceID: src, EntryID: "42", CoverKind: kind, CoverRef: ref})
+		if src != "agent-source" {
+			seriesBindings = append(seriesBindings, SeriesSourceBinding{SeriesID: "work", SourceID: src, EntryID: "42"})
+			seriesCovers = append(seriesCovers, SeriesCoverCandidate{SeriesID: "work", SourceID: src, EntryID: "42", CoverKind: kind, CoverRef: ref})
+		}
+	}
+	bookBindings = append(bookBindings, BookSourceBinding{BookID: "work-book-b", SourceID: "external", EntryID: "42"})
+	bookCovers = append(bookCovers, BookCoverCandidate{BookID: "work-book-b", SourceID: "external", CoverKind: CoverKindImportedFile, CoverRef: protectedRef})
+	for _, err := range []error{
+		store.UpsertSeriesSourceBindings(ctx, seriesBindings), store.UpsertSeriesCoverCandidates(ctx, seriesCovers),
+		store.UpsertBookSourceBindings(ctx, bookBindings), store.UpsertBookCoverCandidates(ctx, bookCovers),
+	} {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertSources := func(table, column, id, want string) {
+		t.Helper()
+		var got string
+		query := "SELECT coalesce(group_concat(source_id ORDER BY source_id),'') FROM " + table + " WHERE " + column + "=?"
+		if err := store.DB().QueryRowContext(ctx, query, id).Scan(&got); err != nil || got != want {
+			t.Fatalf("%s %s sources = %q, want %q, err %v", table, id, got, want, err)
+		}
+	}
+	series := Series{ID: "work", Name: "Work"}
+	meta, refs, err := store.ClearSeriesExternalBindingWithCoverRefs(ctx, series)
+	if err != nil || !slices.Equal(refs, []string{importedRef}) || meta.ExtEntryID != "" ||
+		meta.BgmSubjectID == nil || *meta.BgmSubjectID != subject {
+		t.Fatalf("clear external: %+v, %q, %v", meta, refs, err)
+	}
+	for _, table := range []string{"series_source_bindings", "series_cover_candidates"} {
+		assertSources(table, "series_id", "work", "archive,bangumi")
+	}
+	for _, table := range []string{"book_source_bindings", "book_cover_candidates"} {
+		assertSources(table, "book_id", "work-book-a", "agent-source,archive,bangumi")
+		assertSources(table, "book_id", "work-book-b", "external")
+	}
+	for id, want := range map[string]string{"work-book-a": "", "work-book-b": "manual-volume"} {
+		meta, _, err := store.BookMetadataByID(ctx, id)
+		if err != nil || meta.ExtEntryID != want {
+			t.Fatalf("%s: %+v, %v", id, meta, err)
+		}
+	}
+	if meta, err = store.ClearSeriesBangumiBinding(ctx, series); err != nil || meta.BgmSubjectID != nil {
+		t.Fatalf("clear Bangumi: %+v, %v", meta, err)
+	}
+	for _, table := range []string{"series_source_bindings", "series_cover_candidates"} {
+		assertSources(table, "series_id", "work", "")
+	}
+	for _, table := range []string{"book_source_bindings", "book_cover_candidates"} {
+		assertSources(table, "book_id", "work-book-a", "agent-source")
+		assertSources(table, "book_id", "work-book-b", "external")
+	}
+}
+
 func explainR1A(t *testing.T, store *Store, query string, args ...any) string {
 	t.Helper()
 	rows, err := store.DB().QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query, args...)

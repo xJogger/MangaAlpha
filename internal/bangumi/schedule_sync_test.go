@@ -45,6 +45,32 @@ func buildMockArchiveZip(t *testing.T, subjectJSONLines string) ([]byte, string)
 	return data, "sha256:" + hex.EncodeToString(sum[:])
 }
 
+func TestOfflineSyncRaisesNSFWOnMixedChain(t *testing.T) {
+	for _, tc := range []struct {
+		name                        string
+		current, locked, bgm, union bool
+		want                        int
+	}{
+		{name: "Bangumi marks adult", bgm: true, want: 1},
+		{name: "union member marks adult", union: true, want: 1},
+		{name: "retain current adult rating", current: true, want: 1},
+		{name: "respect rating lock", locked: true, bgm: true, union: true},
+		{name: "retain safe rating"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			current := storedSeriesMetaRow{
+				SeriesName: "Work", Title: "External title", Summary: "External summary",
+				KeepChainFields: true, IsNSFW: tc.current, NSFWLock: tc.locked, NSFWUnionMember: tc.union,
+			}
+			update, changed := diffOfflineMetadataRow(current, SubjectCandidate{ID: 100, Name: "Bangumi title", Summary: "Bangumi summary", NSFW: tc.bgm})
+			if update.isNSFW != tc.want || changed != (tc.want != boolToInt(tc.current)) ||
+				update.title != current.Title || update.summary != current.Summary {
+				t.Fatalf("mixed chain sync: %+v, changed=%v", update, changed)
+			}
+		})
+	}
+}
+
 func TestArchiveScheduleValidationAndDueSlot(t *testing.T) {
 	if _, err := ValidateArchiveSchedule(ArchiveScheduleUpdate{Enabled: true, Frequency: "daily", TimeOfDay: "06:00"}); err == nil {
 		t.Fatal("expected error for unsupported frequency")

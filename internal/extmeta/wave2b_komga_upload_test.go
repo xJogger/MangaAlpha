@@ -537,12 +537,17 @@ func TestMangaAlphaMetaV2ExtendedColsBooksAndImportedCovers(t *testing.T) {
 	seedMetadataSeries(t, store, "galaxy-series", "open-lib", "Galaxy Folder")
 	// Single unmatched book (One-shot fallback Tier 3a) aligns cleanly to s1:vol-1.
 	seedWave2BBook(t, store, "gb1", "galaxy-series", "open-lib", "Single Archive.cbz", 1)
+	execManagerFixture(t, store.DB(), `
+INSERT INTO series_metadata(series_id,bgm_subject_id,ext_source_id,ext_entry_id,title,title_lock,updated_at)
+VALUES('galaxy-series',100,'previous','legacy','Locked title',1,'')`)
 
 	saved, err := m.BindSeriesExternal(ctx, "galaxy-series", src.ID, "s1", "manual")
 	if err != nil {
 		t.Fatalf("BindSeriesExternal(open-v2): %v", err)
 	}
-	if saved.Status != "ENDED" || saved.TitleSort != "Ginga Tetsudou" || saved.Publisher != "少年画報社" ||
+	if saved.MatchOrigin != "manual" || saved.ExtSourceID != src.ID || saved.ExtEntryID != "s1" ||
+		saved.BgmSubjectID == nil || *saved.BgmSubjectID != 100 || saved.Title != "Locked title" ||
+		saved.Status != "ENDED" || saved.TitleSort != "Ginga Tetsudou" || saved.Publisher != "少年画報社" ||
 		saved.TotalBookCount == nil || *saved.TotalBookCount != 18 || saved.AgeRating == nil || *saved.AgeRating != 12 ||
 		len(saved.Links) != 1 || len(saved.SharingLabels) != 1 ||
 		saved.ExtCoverURL != "" {
@@ -570,12 +575,14 @@ func TestMangaAlphaMetaV2ExtendedColsBooksAndImportedCovers(t *testing.T) {
 	if _, err := m.ClearSeriesExternal(ctx, "galaxy-series"); err != nil {
 		t.Fatal(err)
 	}
-	for _, ref := range []string{candidates[0].CoverRef, books[0].CoverRef} {
-		if _, _, err := importedcover.Read(m.importedCovers, ref); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("unreferenced import survived unbind: %v", err)
-		}
+	if _, _, err := importedcover.Read(m.importedCovers, candidates[0].CoverRef); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unreferenced series import survived unbind: %v", err)
 	}
-
+	assertImportedTestCover(t, m.importedCovers, books[0].CoverRef, "image/png", pngBytes)
+	if meta, ok, err := store.BookMetadataByID(ctx, "gb1"); err != nil || !ok ||
+		meta.MatchOrigin != "manual" || meta.ExtEntryID != "vol-1" {
+		t.Fatalf("series unbind changed the manual volume binding: %+v, %v", meta, err)
+	}
 }
 
 func assertImportedTestCover(t *testing.T, root, ref, mime string, expected []byte) {

@@ -169,11 +169,14 @@ func applyChainBooks(ctx context.Context, tx *sql.Tx, seriesID string, match Cha
 	}
 	if match.Replace {
 		for _, current := range existing {
-			if current.ExtEntryID == "" || current.BgmSubjectID != 0 ||
-				current.MatchOrigin == "" || current.MatchOrigin == "manual" || current.MatchOrigin == "agent" {
+			if current.ExtEntryID == "" || current.MatchOrigin == "" || current.MatchOrigin == "manual" || current.MatchOrigin == "agent" {
 				continue
 			}
-			resetBookMatchFields(&current)
+			if current.BgmSubjectID > 0 {
+				current.ExtSourceID, current.ExtEntryID, current.ExtCoverURL, current.ExtCoverPath = "", "", "", ""
+			} else {
+				resetBookMatchFields(&current)
+			}
 			if err := execBookMetadataUpsert(ctx, stmt, current, now); err != nil {
 				return err
 			}
