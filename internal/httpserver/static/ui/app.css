@@ -23,6 +23,7 @@
   --success: #2cc98d;
   --success-soft: rgba(44, 201, 141, 0.15);
   --warn: #f5a623;
+  --warn-text: var(--warn);
   --warn-soft: rgba(245, 166, 35, 0.16);
   --danger: #f25f5c;
   --danger-soft: rgba(242, 95, 92, 0.16);
@@ -52,6 +53,7 @@
   --accent: #2563eb;
   --accent-hover: #1d4ed8;
   --accent-soft: rgba(37, 99, 235, 0.11);
+  --warn-text: #92400e;
   --bgm: #e05268;
   --bgm-soft: rgba(224, 82, 104, 0.12);
   --shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
@@ -3512,7 +3514,7 @@ table.data-table .btn {
 }
 
 .extmeta-batch-empty-hint {
-  color: var(--warn);
+  color: var(--warn-text);
   margin-top: 6px;
 }
 
@@ -3539,7 +3541,7 @@ table.data-table .btn {
 }
 
 .extmeta-warn-banner-body strong {
-  color: var(--warn);
+  color: var(--warn-text);
 }
 
 .extmeta-export-preview-meta {
@@ -3836,7 +3838,7 @@ table.data-table .btn {
   border-radius: var(--radius-sm);
   background: var(--warn-soft);
   border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
-  color: var(--warn);
+  color: var(--warn-text);
   font-size: 12px;
   line-height: 1.5;
   overflow-wrap: anywhere;
@@ -3855,7 +3857,7 @@ table.data-table .btn {
 }
 
 .extmeta-local-wal-hint {
-  color: var(--warn);
+  color: var(--warn-text);
   margin-top: 4px;
   line-height: 1.45;
   overflow-wrap: anywhere;

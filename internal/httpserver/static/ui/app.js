@@ -106,6 +106,7 @@
     extMetaGuideOpen: false,
     extMetaRepoDraft: null,
     extMetaBatchDraft: null,
+    extMetaBatchSubmitting: false,
     extMetaExportDraft: null,
     shelfObserver: null,
     shelfAbort: null,
@@ -4448,6 +4449,7 @@
     const renderLibCardHTML = (l, nested = false, layerRank = 0) => {
       const isUnion = l.providerType === 'union';
       const isSub = Boolean(l.unionParentId);
+      const batchSubmitting = Boolean(typeof state === 'object' && state && state.extMetaBatchSubmitting);
       const sched = schedulesMap[l.id];
       const schedText = formatScheduleSummary(sched);
       const subChildren = isUnion ? (subsByUnion.get(l.id) || []) : [];
@@ -4486,8 +4488,8 @@
                 <button type="button" class="btn btn-primary btn-sm" data-lib-union-refresh="${esc(l.id)}">刷新合并</button>
                 <button type="button" class="btn btn-sm" data-lib-pipeline="${esc(l.id)}">跑流水线</button>
                 <button type="button" class="btn btn-sm" data-lib-schedule="${esc(l.id)}">定时…</button>
-                <button type="button" class="btn btn-bgm btn-sm" data-lib-bgm="${esc(l.id)}">匹配离线库</button>
-                ${l.metadataChainNeedsRematch ? `<button type="button" class="btn btn-sm btn-primary" data-lib-rematch="${esc(l.id)}">按新顺延链重匹配</button>` : ''}
+                <button type="button" class="btn btn-bgm btn-sm" data-lib-bgm="${esc(l.id)}"${batchSubmitting ? ' disabled' : ''}>匹配离线库</button>
+                ${l.metadataChainNeedsRematch ? `<button type="button" class="btn btn-sm btn-primary" data-lib-rematch="${esc(l.id)}"${batchSubmitting ? ' disabled' : ''}>按新顺延链重匹配</button>` : ''}
                 <button type="button" class="btn btn-sm" data-lib-cover="${esc(l.id)}" data-provider="union">提取首卷作为系列封面…</button>
                 <button type="button" class="btn btn-sm" data-lib-batch-covers="${esc(l.id)}" data-lib-name="${esc(l.name)}">提取归档卷封面</button>
                 <button type="button" class="btn btn-sm" data-lib-batch-comicinfo="${esc(l.id)}" data-lib-name="${esc(l.name)}">批量读取 ComicInfo</button>
@@ -4509,8 +4511,8 @@
                 <button type="button" class="btn btn-primary btn-sm" data-lib-scan="${esc(l.id)}">扫描</button>
                 <button type="button" class="btn btn-sm" data-lib-pipeline="${esc(l.id)}">跑流水线</button>
                 <button type="button" class="btn btn-sm" data-lib-schedule="${esc(l.id)}">定时…</button>
-                <button type="button" class="btn btn-bgm btn-sm" data-lib-bgm="${esc(l.id)}">匹配离线库</button>
-                ${l.metadataChainNeedsRematch ? `<button type="button" class="btn btn-sm btn-primary" data-lib-rematch="${esc(l.id)}">按新顺延链重匹配</button>` : ''}
+                <button type="button" class="btn btn-bgm btn-sm" data-lib-bgm="${esc(l.id)}"${batchSubmitting ? ' disabled' : ''}>匹配离线库</button>
+                ${l.metadataChainNeedsRematch ? `<button type="button" class="btn btn-sm btn-primary" data-lib-rematch="${esc(l.id)}"${batchSubmitting ? ' disabled' : ''}>按新顺延链重匹配</button>` : ''}
                 <button type="button" class="btn btn-sm" data-lib-cover="${esc(l.id)}" data-provider="${esc(l.providerType)}">提取首卷作为系列封面…</button>
                 <button type="button" class="btn btn-sm" data-lib-batch-covers="${esc(l.id)}" data-lib-name="${esc(l.name)}">提取归档卷封面</button>
                 <button type="button" class="btn btn-sm" data-lib-batch-comicinfo="${esc(l.id)}" data-lib-name="${esc(l.name)}">批量读取 ComicInfo</button>
@@ -5050,36 +5052,37 @@
         } catch (err) { toast(err.message, 'error'); }
       };
     });
+    const syncLibScrapeButtons = () => {
+      const busy = Boolean(typeof state === 'object' && state && state.extMetaBatchSubmitting);
+      body.querySelectorAll('button[data-lib-bgm], button[data-lib-rematch]').forEach((b) => {
+        b.disabled = busy;
+      });
+    };
+    const triggerLibScrape = async (btn, libID, mode, okMsg) => {
+      if (!libID || btn.disabled || (typeof state === 'object' && state && state.extMetaBatchSubmitting)) return;
+      if (typeof state === 'object' && state) state.extMetaBatchSubmitting = true;
+      syncLibScrapeButtons();
+      let started = false;
+      try {
+        await api('/admin/api/metadata/scrape', {
+          method: 'POST',
+          body: { libraryIds: [libID], libraryId: libID, mode, allowOnline: false },
+        });
+        toast(okMsg);
+        started = true;
+      } catch (err) {
+        toast(err.message, 'error');
+      } finally {
+        if (typeof state === 'object' && state) state.extMetaBatchSubmitting = false;
+        syncLibScrapeButtons();
+      }
+      if (started) navigate('/admin?tab=bangumi');
+    };
     body.querySelectorAll('button[data-lib-bgm]').forEach((btn) => {
-      btn.onclick = async () => {
-        const libID = btn.getAttribute('data-lib-bgm');
-        try {
-          await api('/admin/api/metadata/scrape', {
-            method: 'POST',
-            body: { libraryIds: [libID], libraryId: libID, mode: 'retry_unmatched', allowOnline: false },
-          });
-          toast('已启动本库离线库匹配');
-          navigate('/admin?tab=bangumi');
-        } catch (err) { toast(err.message, 'error'); }
-      };
+      btn.onclick = () => triggerLibScrape(btn, btn.getAttribute('data-lib-bgm'), 'retry_unmatched', '已启动本库离线库匹配');
     });
     body.querySelectorAll('button[data-lib-rematch]').forEach((btn) => {
-      btn.onclick = async () => {
-        const libID = btn.getAttribute('data-lib-rematch');
-        if (!libID || btn.disabled) return;
-        btn.disabled = true;
-        try {
-          await api('/admin/api/metadata/scrape', {
-            method: 'POST',
-            body: { libraryIds: [libID], libraryId: libID, mode: 'force', allowOnline: false },
-          });
-          toast('已启动按新顺延链重匹配');
-          navigate('/admin?tab=bangumi');
-        } catch (err) {
-          if (btn.isConnected) btn.disabled = false;
-          toast(err.message, 'error');
-        }
-      };
+      btn.onclick = () => triggerLibScrape(btn, btn.getAttribute('data-lib-rematch'), 'force', '已启动按新顺延链重匹配');
     });
     body.querySelectorAll('button[data-lib-cover]').forEach((btn) => {
       btn.onclick = () => {
@@ -5900,6 +5903,7 @@
         const schemaSel = document.getElementById('emas-schema');
         const nameInput = document.getElementById('emas-name');
         const importCoversWrap = document.getElementById('emas-import-covers-wrap');
+        let activeTab = 'path';
         let prevKind = kindSel ? kindSel.value : 'offline_sqlite';
         const syncImportCoversWrap = () => {
           const curKind = kindSel ? kindSel.value : 'offline_sqlite';
@@ -5910,7 +5914,10 @@
 
         document.querySelectorAll('button[data-emas-tab]').forEach((tabBtn) => {
           tabBtn.onclick = () => {
-            const isUpload = tabBtn.getAttribute('data-emas-tab') === 'upload';
+            const nextTab = tabBtn.getAttribute('data-emas-tab') === 'upload' ? 'upload' : 'path';
+            const prevTab = activeTab;
+            activeTab = nextTab;
+            const isUpload = nextTab === 'upload';
             document.querySelectorAll('button[data-emas-tab]').forEach((other) => {
               if (other.classList) other.classList.toggle('active', other === tabBtn);
             });
@@ -5920,12 +5927,16 @@
             if (uploadBtn) uploadBtn.style.display = isUpload ? '' : 'none';
             if (kindSel) {
               if (isUpload) {
-                prevKind = kindSel.value || 'offline_sqlite';
+                if (prevTab !== 'upload') {
+                  prevKind = kindSel.value || 'offline_sqlite';
+                }
                 kindSel.value = 'offline_sqlite';
                 kindSel.disabled = true;
               } else {
                 kindSel.disabled = false;
-                kindSel.value = prevKind;
+                if (prevTab === 'upload') {
+                  kindSel.value = prevKind;
+                }
               }
             }
             if (schemaSel) schemaSel.disabled = isUpload;
@@ -6071,11 +6082,14 @@
           const btn = document.getElementById('mchain-save');
           btn.disabled = true;
           try {
-            await api(`/admin/api/libraries/${encodeURIComponent(lib.id)}/metadata-sources`, {
+            const res = await api(`/admin/api/libraries/${encodeURIComponent(lib.id)}/metadata-sources`, {
               method: 'PUT',
               body: { sourceIds: selected.slice() },
             });
-            toast('顺延链已保存，请点击「按新顺延链重匹配」或使用下方全量重匹配应用新优先级');
+            const needsRematch = Boolean(res && res.chainState && res.chainState.needsRematch);
+            toast(needsRematch
+              ? '顺延链已保存，请点击「按新顺延链重匹配」或使用下方全量重匹配应用新优先级'
+              : '顺延链已保存');
             closeModal();
             if (onSaved) onSaved();
           } catch (err) {
@@ -6318,10 +6332,12 @@
     } else {
       selectedBatchLibIDs = selectableIDs.slice();
     }
+    const hadBatchSelectionInit = prevBatchLibEls.length > 0 || Boolean(prevBatchDraft && Array.isArray(prevBatchDraft.libraryIds));
+    const batchSubmitting = Boolean(typeof state === 'object' && state && state.extMetaBatchSubmitting);
     const batchDraft = {
       libraryIds: selectableLibs.length > 0
         ? selectedBatchLibIDs.slice()
-        : (prevBatchDraft && Array.isArray(prevBatchDraft.libraryIds) ? [] : null),
+        : (hadBatchSelectionInit ? [] : null),
       allowOnline: hasOnlineCapableSource
         ? (prevBatchOnline ? Boolean(prevBatchOnline.checked) : Boolean(prevBatchDraft && prevBatchDraft.allowOnline))
         : false,
@@ -6499,7 +6515,7 @@
           <div class="extmeta-warn-banner" id="bgm-arch-tankobon-banner" role="alert">
             <div class="extmeta-warn-banner-body">
               <strong>⚠ 需要重新导入：</strong>
-              <span>当前 Bangumi 离线库为旧版本（缺少单行本分卷关系索引），重新导入后即可自动匹配并显示单卷封面。</span>
+              <span>当前 Bangumi 离线库缺少单行本分卷关系索引（旧版或不含关系表的快照），重新导入包含单行本关系的新版离线库后即可自动匹配并显示单卷封面。</span>
             </div>
             <button type="button" class="btn btn-sm btn-primary" id="bgm-arch-reimport-tankobon-btn" ${arch.updating ? 'disabled' : ''}>重新导入离线库</button>
           </div>` : ''}
@@ -6572,9 +6588,9 @@
             <div class="field-hint">默认关闭（纯离线极速匹配）；仅当开启后，对离线未命中作品才调用已启用在线 API 的数据源，单线程限速并在 403/429/503 时自动熔断冷却。</div>
           </div>` : ''}
           <div class="extmeta-batch-actions">
-            <button type="button" class="btn btn-primary" id="extmeta-batch-start-incremental" data-extmeta-batch-mode="incremental" ${selectedBatchLibIDs.length === 0 ? 'disabled' : ''}>增量匹配</button>
-            <button type="button" class="btn" id="extmeta-batch-start-retry" data-extmeta-batch-mode="retry_unmatched" ${selectedBatchLibIDs.length === 0 ? 'disabled' : ''}>重试未命中</button>
-            <button type="button" class="btn" id="extmeta-batch-start-force" data-extmeta-batch-mode="force" ${selectedBatchLibIDs.length === 0 ? 'disabled' : ''}>全量重匹配</button>
+            <button type="button" class="btn btn-primary" id="extmeta-batch-start-incremental" data-extmeta-batch-mode="incremental" ${(batchSubmitting || selectedBatchLibIDs.length === 0) ? 'disabled' : ''}>增量匹配</button>
+            <button type="button" class="btn" id="extmeta-batch-start-retry" data-extmeta-batch-mode="retry_unmatched" ${(batchSubmitting || selectedBatchLibIDs.length === 0) ? 'disabled' : ''}>重试未命中</button>
+            <button type="button" class="btn" id="extmeta-batch-start-force" data-extmeta-batch-mode="force" ${(batchSubmitting || selectedBatchLibIDs.length === 0) ? 'disabled' : ''}>全量重匹配</button>
           </div>
           <div class="field-hint" style="margin-top:8px">
             增量匹配仅处理尚未匹配的新作品；重试未命中额外重查之前未匹配的作品；全量重匹配对所选书库全部作品按当前顺延链重新合并（保留手动绑定与锁定字段）。
@@ -6763,7 +6779,7 @@
                       </div>
                     </div>
                     <div class="extmeta-chain-actions">
-                      ${needsRematch ? `<button type="button" class="btn btn-sm btn-primary" data-extmeta-chain-rematch="${esc(l.id)}"${l.enabled === false ? ' disabled title="书库已隐藏，取消隐藏后可执行重匹配"' : ''}>按新顺延链重匹配</button>` : ''}
+                      ${needsRematch ? `<button type="button" class="btn btn-sm btn-primary" data-extmeta-chain-rematch="${esc(l.id)}"${l.enabled === false ? ' data-lib-hidden="true" title="书库已隐藏，取消隐藏后可执行重匹配"' : ''}${(l.enabled === false || batchSubmitting) ? ' disabled' : ''}>按新顺延链重匹配</button>` : ''}
                       <button type="button" class="btn btn-sm" data-extmeta-chain-edit="${esc(l.id)}">调整顺延链</button>
                     </div>
                   </div>`;
@@ -7098,36 +7114,35 @@
       };
     });
 
-    body.querySelectorAll('button[data-extmeta-chain-rematch]').forEach((btn) => {
-      btn.onclick = async () => {
-        const libID = btn.getAttribute('data-extmeta-chain-rematch');
-        if (!libID || btn.disabled) return;
-        btn.disabled = true;
-        try {
-          await api('/admin/api/metadata/scrape', {
-            method: 'POST',
-            body: { libraryIds: [libID], libraryId: libID, mode: 'force', allowOnline: false },
-          });
-          toast('已启动按新顺延链重匹配');
-          renderAdminBangumi(body);
-        } catch (err) {
-          if (btn.isConnected) btn.disabled = false;
-          toast(err.message, 'error');
-        }
-      };
-    });
-
     const batchSelectAllEl = document.getElementById('extmeta-batch-select-all');
     const batchLibCbs = Array.from(body.querySelectorAll('input[data-extmeta-batch-lib]'));
     const batchCountEl = document.getElementById('extmeta-batch-selected-count');
     const batchEmptyHintEl = document.getElementById('extmeta-batch-empty-hint');
     const batchOnlineEl = document.getElementById('extmeta-batch-online');
     const batchActionBtns = Array.from(body.querySelectorAll('button[data-extmeta-batch-mode]'));
+    const chainRematchBtns = Array.from(body.querySelectorAll('button[data-extmeta-chain-rematch]'));
+
+    const syncLiveScrapeActionButtons = () => {
+      const submitting = Boolean(typeof state === 'object' && state && state.extMetaBatchSubmitting);
+      const liveBatchCbs = Array.from(body.querySelectorAll('input[data-extmeta-batch-lib]'));
+      const liveCheckedCount = liveBatchCbs.filter((c) => c.checked).length;
+      body.querySelectorAll('button[data-extmeta-batch-mode]').forEach((b) => {
+        b.disabled = submitting || liveCheckedCount === 0;
+      });
+      body.querySelectorAll('button[data-extmeta-chain-rematch]').forEach((b) => {
+        const isHidden = b.getAttribute('data-lib-hidden') === 'true';
+        b.disabled = isHidden || submitting;
+      });
+    };
+
     const syncBatchDraft = () => {
       const picked = batchLibCbs.filter((c) => c.checked).map((c) => c.value);
       if (typeof state === 'object' && state) {
+        const prevIds = (state.extMetaBatchDraft && Array.isArray(state.extMetaBatchDraft.libraryIds))
+          ? state.extMetaBatchDraft.libraryIds.slice()
+          : null;
         state.extMetaBatchDraft = {
-          libraryIds: batchLibCbs.length > 0 ? picked.slice() : null,
+          libraryIds: batchLibCbs.length > 0 ? picked.slice() : prevIds,
           allowOnline: batchOnlineEl ? Boolean(batchOnlineEl.checked) : false,
         };
       }
@@ -7137,14 +7152,53 @@
       const picked = syncBatchDraft();
       const total = batchLibCbs.length;
       const count = picked.length;
+      const submitting = Boolean(disableActions) || Boolean(typeof state === 'object' && state && state.extMetaBatchSubmitting);
       if (batchSelectAllEl) {
         batchSelectAllEl.checked = total > 0 && count === total;
         batchSelectAllEl.indeterminate = count > 0 && count < total;
       }
       if (batchCountEl) batchCountEl.textContent = `已选 ${count} / ${total}`;
       if (batchEmptyHintEl) batchEmptyHintEl.style.display = count === 0 ? '' : 'none';
-      batchActionBtns.forEach((b) => { b.disabled = disableActions || count === 0; });
+      batchActionBtns.forEach((b) => { b.disabled = submitting || count === 0; });
+      chainRematchBtns.forEach((b) => {
+        const isHidden = b.getAttribute('data-lib-hidden') === 'true';
+        b.disabled = isHidden || submitting;
+      });
     };
+
+    const submitMetadataScrape = async (payload, okMsg) => {
+      if (typeof state === 'object' && state) state.extMetaBatchSubmitting = true;
+      syncLiveScrapeActionButtons();
+      let started = false;
+      try {
+        await api('/admin/api/metadata/scrape', {
+          method: 'POST',
+          body: payload,
+        });
+        toast(okMsg);
+        started = true;
+      } catch (err) {
+        toast(err.message, 'error');
+      } finally {
+        if (typeof state === 'object' && state) state.extMetaBatchSubmitting = false;
+        if (body && body.isConnected !== false) {
+          syncLiveScrapeActionButtons();
+        }
+      }
+      if (started) renderAdminBangumi(body);
+    };
+
+    chainRematchBtns.forEach((btn) => {
+      btn.onclick = async () => {
+        const libID = btn.getAttribute('data-extmeta-chain-rematch');
+        if (!libID || btn.disabled || (typeof state === 'object' && state && state.extMetaBatchSubmitting)) return;
+        await submitMetadataScrape(
+          { libraryIds: [libID], libraryId: libID, mode: 'force', allowOnline: false },
+          '已启动按新顺延链重匹配',
+        );
+      };
+    });
+
     if (batchSelectAllEl) {
       batchSelectAllEl.indeterminate = selectableLibs.length > 0 && selectedBatchLibIDs.length > 0 && selectedBatchLibIDs.length < selectableLibs.length;
       batchSelectAllEl.onchange = () => {
@@ -7167,28 +7221,17 @@
           updateBatchControls(false);
           return;
         }
-        if (btn.disabled) return;
+        if (btn.disabled || (typeof state === 'object' && state && state.extMetaBatchSubmitting)) return;
         const mode = btn.getAttribute('data-extmeta-batch-mode') || 'incremental';
         const allowOnline = batchOnlineEl ? Boolean(batchOnlineEl.checked) : false;
-        const isAll = selectableLibs.length > 0 && picked.length === selectableLibs.length;
+        const selected = picked.slice();
         const payload = {
-          libraryIds: isAll ? [] : picked,
-          libraryId: !isAll && picked.length === 1 ? picked[0] : '',
+          libraryIds: selected,
+          libraryId: selected.length === 1 ? selected[0] : '',
           mode,
           allowOnline,
         };
-        updateBatchControls(true);
-        try {
-          await api('/admin/api/metadata/scrape', {
-            method: 'POST',
-            body: payload,
-          });
-          toast('多源批量匹配任务已启动');
-          renderAdminBangumi(body);
-        } catch (err) {
-          if (btn.isConnected) updateBatchControls(false);
-          toast(err.message, 'error');
-        }
+        await submitMetadataScrape(payload, '多源批量匹配任务已启动');
       };
     });
 
@@ -7345,7 +7388,7 @@
         if (archReimportBtn.disabled) return;
         archReimportBtn.disabled = true;
         try {
-          await api('/admin/api/bangumi/archive/sync', { method: 'POST', body: { force: true } });
+          await api('/admin/api/bangumi/archive/update', { method: 'POST', body: { force: true } });
           toast('已开始重新导入 Bangumi 离线索引库');
           renderAdminBangumi(body);
         } catch (err) {

@@ -310,6 +310,7 @@ function loadAdminScraperContext({ apiImpl, confirmResult = true, stateInit = {}
       extMetaGuideOpen: false,
       extMetaRepoDraft: null,
       extMetaBatchDraft: null,
+      extMetaBatchSubmitting: false,
       extMetaExportDraft: null,
     }, stateInit),
     esc: (v) => (v == null ? '' : String(v)
@@ -1102,6 +1103,30 @@ test('app.css external metadata classes use theme variables without hardcoded co
   assert.ok(idx >= 0, 'expected new CSS section in app.css');
   const addedCSS = cssSource.slice(idx);
   assert.doesNotMatch(addedCSS, /#[0-9a-fA-F]{3,8}\b|rgb\(|rgba\(/);
+
+  const rootMatch = cssSource.match(/:root\s*\{([^}]*)\}/);
+  const lightMatch = cssSource.match(/\[data-theme="light"\]\s*\{([^}]*)\}/);
+  assert.ok(rootMatch && lightMatch, 'expected :root and [data-theme="light"] blocks');
+  assert.match(rootMatch[1], /--warn-text\s*:/);
+  const lightWarnMatch = lightMatch[1].match(/--warn-text\s*:\s*#([0-9a-fA-F]{6})\b/);
+  assert.ok(lightWarnMatch, 'expected [data-theme="light"] to define high-contrast --warn-text hex');
+
+  // Verify WCAG AA contrast (>= 4.5:1) of light-theme --warn-text on white #ffffff card background
+  const hex = lightWarnMatch[1];
+  const lin = (c) => {
+    const s = parseInt(c, 16) / 255;
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  };
+  const lum = 0.2126 * lin(hex.slice(0, 2)) + 0.7152 * lin(hex.slice(2, 4)) + 0.0722 * lin(hex.slice(4, 6));
+  const contrastOnWhite = 1.05 / (lum + 0.05);
+  assert.ok(contrastOnWhite >= 4.5, `expected light --warn-text contrast >= 4.5 on #fff, got ${contrastOnWhite.toFixed(2)}`);
+
+  for (const sel of ['.extmeta-batch-empty-hint', '.extmeta-warn-banner-body strong', '.extmeta-wal-warning', '.extmeta-local-wal-hint']) {
+    const pos = cssSource.indexOf(sel);
+    assert.ok(pos >= 0, `expected ${sel} rule`);
+    const block = cssSource.slice(pos, cssSource.indexOf('}', pos) + 1);
+    assert.match(block, /color:\s*var\(--warn-text\)/, `${sel} must use var(--warn-text)`);
+  }
 });
 
 test('footer separator renders pure CSS circle using currentColor without middle-dot glyph', () => {
@@ -1537,7 +1562,7 @@ test('extmeta-batch-online is hidden unless an enabled offline_sqlite source has
   assert.deepEqual(requests[0], [
     '/admin/api/metadata/scrape',
     'POST',
-    { libraryIds: [], libraryId: '', mode: 'incremental', allowOnline: false },
+    { libraryIds: ['lib-1', 'lib-2', 'lib-union'], libraryId: '', mode: 'incremental', allowOnline: false },
   ]);
 
   // 2. Enabled offline_sqlite with onlineEnabled=true and onlineApiUrl => checkbox shown, defaults unchecked, can toggle true
@@ -1567,7 +1592,7 @@ test('extmeta-batch-online is hidden unless an enabled offline_sqlite source has
   assert.deepEqual(requests[0], [
     '/admin/api/metadata/scrape',
     'POST',
-    { libraryIds: [], libraryId: '', mode: 'incremental', allowOnline: true },
+    { libraryIds: ['lib-1', 'lib-2', 'lib-union'], libraryId: '', mode: 'incremental', allowOnline: true },
   ]);
 
   // 3. Removing onlineApiUrl hides checkbox again and resets stale draft allowOnline back to false
@@ -1580,7 +1605,7 @@ test('extmeta-batch-online is hidden unless an enabled offline_sqlite source has
   assert.deepEqual(requests[0], [
     '/admin/api/metadata/scrape',
     'POST',
-    { libraryIds: [], libraryId: '', mode: 'incremental', allowOnline: false },
+    { libraryIds: ['lib-1', 'lib-2', 'lib-union'], libraryId: '', mode: 'incremental', allowOnline: false },
   ]);
 });
 
@@ -1812,7 +1837,7 @@ test('batch multi-select checkboxes toggle all, disable buttons at 0 selected, p
     { libraryIds: ['lib-1', 'lib-2'], libraryId: '', mode: 'force', allowOnline: false },
   ]);
 
-  // Select all back via select-all -> sends libraryIds:[]
+  // Select all back via select-all -> always sends explicit libraryIds array (never [])
   requests.length = 0;
   const selAll2 = h.doc.getElementById('extmeta-batch-select-all');
   selAll2.checked = true;
@@ -1822,7 +1847,31 @@ test('batch multi-select checkboxes toggle all, disable buttons at 0 selected, p
   assert.deepEqual(requests[0], [
     '/admin/api/metadata/scrape',
     'POST',
-    { libraryIds: [], libraryId: '', mode: 'incremental', allowOnline: false },
+    { libraryIds: ['lib-1', 'lib-2', 'lib-union'], libraryId: '', mode: 'incremental', allowOnline: false },
+  ]);
+
+  // Single-library full selection sends explicit libraryIds: ['lib-1'] and libraryId: 'lib-1'
+  requests.length = 0;
+  const singleLibOnly = [sampleLibraries[0]];
+  const hSingle = loadAdminScraperContext({
+    apiImpl: async (url, opts = {}) => {
+      requests.push([url, opts.method || 'GET', opts.body ? JSON.parse(JSON.stringify(opts.body)) : null]);
+      if (url === '/admin/api/bangumi/status') return sampleBangumiStatus();
+      if (url.startsWith('/admin/api/bangumi/runs')) return [];
+      if (url === '/admin/api/libraries') return singleLibOnly;
+      if (url.startsWith('/admin/api/bangumi/tracker')) return {};
+      if (url === '/admin/api/metadata/overview') return sampleOverview();
+      if (url === '/admin/api/metadata/scrape-runs') return [];
+      return {};
+    },
+  });
+  hSingle.paintAdminBangumi(hSingle.body, sampleBangumiStatus(), [], singleLibOnly, {}, sampleOverview(), []);
+  await hSingle.doc.getElementById('extmeta-batch-start-retry').onclick();
+  await flushMicrotasks();
+  assert.deepEqual(requests[0], [
+    '/admin/api/metadata/scrape',
+    'POST',
+    { libraryIds: ['lib-1'], libraryId: 'lib-1', mode: 'retry_unmatched', allowOnline: false },
   ]);
 });
 
@@ -1839,9 +1888,14 @@ test('chain change warning banner, rematch shortcut, Bangumi tankobon reimport b
     },
   });
 
+  let nextChainSaveResp = { sources: [], chainState: { needsRematch: true } };
   const h = loadAdminScraperContext({
     apiImpl: async (url, opts = {}) => {
       requests.push([url, opts.method || 'GET', opts.body ? JSON.parse(JSON.stringify(opts.body)) : null]);
+      if (url === '/admin/api/bangumi/archive/sync') {
+        throw new Error('unregistered /admin/api/bangumi/archive/sync must never be called');
+      }
+      if (url.endsWith('/metadata-sources') && opts.method === 'PUT') return nextChainSaveResp;
       if (url === '/admin/api/bangumi/status') return bgmStatus;
       if (url.startsWith('/admin/api/bangumi/runs')) return [];
       if (url === '/admin/api/libraries') return sampleLibraries;
@@ -1859,17 +1913,19 @@ test('chain change warning banner, rematch shortcut, Bangumi tankobon reimport b
   assert.doesNotMatch(html, /默认不选/);
   assert.doesNotMatch(appSource, /原图不压缩/);
   assert.doesNotMatch(appSource, /默认不选/);
+  assert.doesNotMatch(appSource, /\/admin\/api\/bangumi\/archive\/sync/);
 
   // Market list displays importCovers badge
   assert.match(html, /匹配时导入内嵌封面/);
 
-  // Bangumi old v4 archive reimport banner + POST /admin/api/bangumi/archive/sync { force: true }
+  // Bangumi tankobon reimport banner + POST /admin/api/bangumi/archive/update { force: true }
   const reimportBanner = h.doc.getElementById('bgm-arch-tankobon-banner');
   const reimportBtn = h.doc.getElementById('bgm-arch-reimport-tankobon-btn');
   assert.ok(reimportBanner && reimportBtn);
-  assert.match(html, /当前 Bangumi 离线库为旧版本（缺少单行本分卷关系索引），重新导入后即可自动匹配并显示单卷封面。/);
+  assert.match(html, /当前 Bangumi 离线库缺少单行本分卷关系索引（旧版或不含关系表的快照），重新导入包含单行本关系的新版离线库后即可自动匹配并显示单卷封面。/);
   await reimportBtn.onclick();
-  assert.deepEqual(requests[0], ['/admin/api/bangumi/archive/sync', 'POST', { force: true }]);
+  assert.deepEqual(requests[0], ['/admin/api/bangumi/archive/update', 'POST', { force: true }]);
+  assert.equal(requests.some((r) => r[0].includes('/archive/sync')), false);
 
   // Chain rematch banner + row badge + shortcut button
   requests.length = 0;
@@ -1889,8 +1945,9 @@ test('chain change warning banner, rematch shortcut, Bangumi tankobon reimport b
     { libraryIds: ['lib-1'], libraryId: 'lib-1', mode: 'force', allowOnline: false },
   ]);
 
-  // Chain modal save shows updated reminder toast, and add modal hides importCovers for non-sqlite kinds
+  // Chain modal save checks response.chainState.needsRematch for toast copy
   requests.length = 0;
+  nextChainSaveResp = { sources: [], chainState: { needsRematch: true } };
   h.body.querySelector('button[data-extmeta-chain-edit="lib-1"]').onclick();
   await h.doc.getElementById('mchain-save').onclick();
   assert.equal(
@@ -1898,6 +1955,17 @@ test('chain change warning banner, rematch shortcut, Bangumi tankobon reimport b
     '顺延链已保存，请点击「按新顺延链重匹配」或使用下方全量重匹配应用新优先级',
   );
 
+  nextChainSaveResp = { sources: [], chainState: { needsRematch: false } };
+  h.body.querySelector('button[data-extmeta-chain-edit="lib-2"]').onclick();
+  await h.doc.getElementById('mchain-save').onclick();
+  assert.equal(h.toasts.at(-1).msg, '顺延链已保存');
+
+  nextChainSaveResp = {};
+  h.body.querySelector('button[data-extmeta-chain-edit="lib-2"]').onclick();
+  await h.doc.getElementById('mchain-save').onclick();
+  assert.equal(h.toasts.at(-1).msg, '顺延链已保存');
+
+  // Add source modal preserves prevKind across repeated clicks on upload tab
   h.doc.getElementById('extmeta-source-add-btn').onclick();
   const kindSel = h.doc.getElementById('emas-kind');
   const wrap = h.doc.getElementById('emas-import-covers-wrap');
@@ -1906,10 +1974,19 @@ test('chain change warning banner, rematch shortcut, Bangumi tankobon reimport b
   kindSel.onchange();
   assert.equal(wrap.style.display, 'none');
 
-  // Switching to upload tab forces offline_sqlite and reveals importCovers checkbox again
+  // Clicking upload tab once or repeatedly forces offline_sqlite while keeping original prevKind='tag_dictionary'
+  const pathTabBtn = h.modalBody.querySelector('button[data-emas-tab="path"]');
   const uploadTabBtn = h.modalBody.querySelector('button[data-emas-tab="upload"]');
   uploadTabBtn.onclick();
+  assert.equal(kindSel.value, 'offline_sqlite');
+  assert.equal(kindSel.disabled, true);
   assert.equal(wrap.style.display, '');
+  uploadTabBtn.onclick();
+  assert.equal(kindSel.value, 'offline_sqlite');
+  pathTabBtn.onclick();
+  assert.equal(kindSel.disabled, false);
+  assert.equal(kindSel.value, 'tag_dictionary');
+  assert.equal(wrap.style.display, 'none');
 
   // Quick-toggle in market list preserves src.importCovers
   await flushMicrotasks();
@@ -1921,4 +1998,218 @@ test('chain change warning banner, rematch shortcut, Bangumi tankobon reimport b
   const putReq = requests.find((r) => r[0] === '/admin/api/metadata/sources/src-sqlite-1' && r[1] === 'PUT');
   assert.ok(putReq);
   assert.equal(putReq[2].importCovers, true);
+});
+
+test('batch scrape submission keeps state.extMetaBatchSubmitting lock across repaints, checkbox toggles, chain rematch, and library cards', async () => {
+  function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+
+  let scrapeDeferred = null;
+  const scrapeRequests = [];
+  const libsWithRematch = [
+    { id: 'lib-1', name: '本地漫画库', providerType: 'local', enabled: true, metadataChainNeedsRematch: true },
+    { id: 'lib-2', name: 'WebDAV 书库', providerType: 'webdav', enabled: true, metadataChainNeedsRematch: false },
+    { id: 'lib-hidden', name: '已隐藏待重匹配库', providerType: 'local', enabled: false, metadataChainNeedsRematch: true },
+  ];
+  const ov = sampleOverview({
+    libraryChainStates: {
+      'lib-1': { needsRematch: true },
+      'lib-2': { needsRematch: false },
+      'lib-hidden': { needsRematch: true },
+    },
+  });
+
+  const h = loadAdminScraperContext({
+    apiImpl: async (url, opts = {}) => {
+      if (url === '/admin/api/metadata/scrape') {
+        scrapeRequests.push(JSON.parse(JSON.stringify(opts.body)));
+        return scrapeDeferred.promise;
+      }
+      if (url === '/admin/api/bangumi/status') return sampleBangumiStatus();
+      if (url.startsWith('/admin/api/bangumi/runs')) return [];
+      if (url === '/admin/api/libraries') return libsWithRematch;
+      if (url.startsWith('/admin/api/bangumi/tracker')) return {};
+      if (url === '/admin/api/metadata/overview') return ov;
+      if (url === '/admin/api/metadata/scrape-runs') return [];
+      return {};
+    },
+  });
+
+  h.paintAdminBangumi(h.body, sampleBangumiStatus(), [], libsWithRematch, {}, ov, []);
+  const hiddenRematch = h.body.querySelector('button[data-extmeta-chain-rematch="lib-hidden"]');
+  assert.equal(hiddenRematch.disabled, true);
+
+  // 1. Start batch scrape and verify in-flight lock across checkbox toggles & polling repaint
+  scrapeDeferred = deferred();
+  const pendingInc = h.doc.getElementById('extmeta-batch-start-incremental').onclick();
+  assert.equal(h.ctx.state.extMetaBatchSubmitting, true);
+  assert.equal(scrapeRequests.length, 1);
+  assert.equal(h.doc.getElementById('extmeta-batch-start-incremental').disabled, true);
+  assert.equal(h.doc.getElementById('extmeta-batch-start-retry').disabled, true);
+  assert.equal(h.doc.getElementById('extmeta-batch-start-force').disabled, true);
+  assert.equal(h.body.querySelector('button[data-extmeta-chain-rematch="lib-1"]').disabled, true);
+
+  // Duplicate clicks while in-flight do nothing
+  await h.doc.getElementById('extmeta-batch-start-force').onclick();
+  await h.body.querySelector('button[data-extmeta-chain-rematch="lib-1"]').onclick();
+  assert.equal(scrapeRequests.length, 1);
+
+  // Toggling checkboxes while in-flight keeps buttons disabled
+  const cb2 = h.body.querySelector('input[data-extmeta-batch-lib="lib-2"]');
+  cb2.checked = false;
+  cb2.onchange();
+  assert.equal(h.doc.getElementById('extmeta-batch-start-incremental').disabled, true);
+  assert.equal(h.doc.getElementById('extmeta-batch-start-force').disabled, true);
+
+  // Polling repaint while in-flight preserves disabled state on newly created DOM buttons
+  h.paintAdminBangumi(h.body, sampleBangumiStatus(), [], libsWithRematch, {}, ov, []);
+  assert.equal(h.doc.getElementById('extmeta-batch-start-incremental').disabled, true);
+  assert.equal(h.doc.getElementById('extmeta-batch-start-retry').disabled, true);
+  assert.equal(h.doc.getElementById('extmeta-batch-start-force').disabled, true);
+  assert.equal(h.body.querySelector('button[data-extmeta-chain-rematch="lib-1"]').disabled, true);
+  assert.equal(h.body.querySelector('button[data-extmeta-chain-rematch="lib-hidden"]').disabled, true);
+
+  // Failure resets state.extMetaBatchSubmitting in finally and re-enables live buttons (keeping hidden lib disabled)
+  scrapeDeferred.reject(new Error('network timeout'));
+  await pendingInc;
+  assert.equal(h.ctx.state.extMetaBatchSubmitting, false);
+  assert.equal(h.doc.getElementById('extmeta-batch-start-incremental').disabled, false);
+  assert.equal(h.doc.getElementById('extmeta-batch-start-force').disabled, false);
+  assert.equal(h.body.querySelector('button[data-extmeta-chain-rematch="lib-1"]').disabled, false);
+  assert.equal(h.body.querySelector('button[data-extmeta-chain-rematch="lib-hidden"]').disabled, true);
+
+  // 2. Chain rematch shortcut also acquires/releases state.extMetaBatchSubmitting
+  scrapeDeferred = deferred();
+  const pendingRematch = h.body.querySelector('button[data-extmeta-chain-rematch="lib-1"]').onclick();
+  assert.equal(h.ctx.state.extMetaBatchSubmitting, true);
+  assert.equal(h.doc.getElementById('extmeta-batch-start-incremental').disabled, true);
+  assert.equal(h.body.querySelector('button[data-extmeta-chain-rematch="lib-1"]').disabled, true);
+  scrapeDeferred.resolve({});
+  await pendingRematch;
+  await flushMicrotasks();
+  assert.equal(h.ctx.state.extMetaBatchSubmitting, false);
+  assert.equal(h.doc.getElementById('extmeta-batch-start-incremental').disabled, false);
+
+  // 3. Admin Libraries card entry points (匹配离线库 & 按新顺延链重匹配) share state.extMetaBatchSubmitting
+  const libStart = appSource.indexOf('  async function renderAdminLibraries(');
+  const libEnd = appSource.indexOf('  async function browse115Drawer(', libStart);
+  const { doc: libDoc, makeContainer: makeLibContainer } = createFakeDOM();
+  const libBody = makeLibContainer('admin-tab-body');
+  const libScrapeRequests = [];
+  let libScrapeDeferred = null;
+  const libLibs = [
+    { id: 'lib-normal', name: '普通本地库', providerType: 'local', rootPath: '/manga', enabled: true, seriesCount: 1, bookCount: 1, comicBytes: 10, metadataChainNeedsRematch: true },
+    { id: 'lib-union', name: '漫画联合库', providerType: 'union', enabled: true, seriesCount: 1, bookCount: 1, comicBytes: 10, unionLayers: [] },
+  ];
+  const libCtx = vm.createContext({
+    document: libDoc,
+    navigator: { userAgent: 'Mozilla/5.0' },
+    CSS: { escape: (v) => String(v) },
+    WEEKDAY_NAMES: ['周日', '周一', '周二', '周三', '周四', '周五', '周六'],
+    state: { auth: { userId: 'admin', isAdmin: true }, libraries: [], extMetaBatchSubmitting: false },
+    esc: h.ctx.esc,
+    fmtBytes: (n) => `${n} B`,
+    fmtTime: (t) => t || '—',
+    providerLabel: (p) => p || 'local',
+    formatScheduleSummary: () => '',
+    toast: () => {},
+    confirmModal: async () => true,
+    openModal: () => {},
+    closeModal: () => {},
+    navigate: () => {},
+    browse115Drawer: () => {},
+    browseLocalDrawer: () => {},
+    browseWebDAVDrawer: () => {},
+    api: async (url, opts = {}) => {
+      if (url === '/admin/api/libraries') return libLibs;
+      if (url === '/admin/api/webdav-accounts') return [];
+      if (url === '/admin/api/schedules') return { timezone: 'Asia/Shanghai', schedules: {} };
+      if (url === '/admin/api/metadata/scrape') {
+        libScrapeRequests.push(JSON.parse(JSON.stringify(opts.body)));
+        return libScrapeDeferred.promise;
+      }
+      return {};
+    },
+  });
+  const renderAdminLibraries = vm.runInContext(appSource.slice(libStart, libEnd) + '\nrenderAdminLibraries;', libCtx);
+  await renderAdminLibraries(libBody);
+
+  libScrapeDeferred = deferred();
+  const pendingLibBgm = libBody.querySelector('button[data-lib-bgm="lib-normal"]').onclick();
+  assert.equal(libCtx.state.extMetaBatchSubmitting, true);
+  assert.equal(libBody.querySelector('button[data-lib-bgm="lib-normal"]').disabled, true);
+  assert.equal(libBody.querySelector('button[data-lib-rematch="lib-normal"]').disabled, true);
+  assert.equal(libBody.querySelector('button[data-lib-bgm="lib-union"]').disabled, true);
+
+  // Clicking sibling rematch button while in-flight is blocked
+  await libBody.querySelector('button[data-lib-rematch="lib-normal"]').onclick();
+  assert.equal(libScrapeRequests.length, 1);
+
+  // Re-render while in-flight keeps buttons disabled
+  await renderAdminLibraries(libBody);
+  assert.equal(libBody.querySelector('button[data-lib-bgm="lib-normal"]').disabled, true);
+  assert.equal(libBody.querySelector('button[data-lib-rematch="lib-normal"]').disabled, true);
+
+  libScrapeDeferred.reject(new Error('scrape failed'));
+  await pendingLibBgm;
+  assert.equal(libCtx.state.extMetaBatchSubmitting, false);
+  assert.equal(libBody.querySelector('button[data-lib-bgm="lib-normal"]').disabled, false);
+  assert.equal(libBody.querySelector('button[data-lib-rematch="lib-normal"]').disabled, false);
+  assert.equal(libBody.querySelector('button[data-lib-bgm="lib-union"]').disabled, false);
+});
+
+test('explicit empty [] batch selection draft survives empty-library repaints and #extmeta-batch-online toggle', () => {
+  const onlineCapableOverview = sampleOverview({
+    sources: [
+      {
+        id: 'src-sqlite-online',
+        kind: 'offline_sqlite',
+        name: '支持在线图库',
+        enabled: true,
+        ready: true,
+        onlineEnabled: true,
+        onlineApiUrl: 'https://api.example.test/lookup',
+      },
+    ],
+  });
+
+  const h = loadAdminScraperContext({ apiImpl: async () => ({}) });
+
+  // 1. User initializes with libraries and explicitly unchecks all -> draft.libraryIds === []
+  h.paintAdminBangumi(h.body, sampleBangumiStatus(), [], sampleLibraries, {}, onlineCapableOverview, []);
+  const selectAll = h.doc.getElementById('extmeta-batch-select-all');
+  selectAll.checked = false;
+  selectAll.onchange();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.ctx.state.extMetaBatchDraft.libraryIds)), []);
+
+  // 2. Repaint when selectable libraries temporarily become empty, then toggle #extmeta-batch-online
+  h.paintAdminBangumi(h.body, sampleBangumiStatus(), [], [], {}, onlineCapableOverview, []);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.ctx.state.extMetaBatchDraft.libraryIds)), []);
+  const onlineCb = h.doc.getElementById('extmeta-batch-online');
+  assert.ok(onlineCb);
+  onlineCb.checked = true;
+  onlineCb.onchange();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.ctx.state.extMetaBatchDraft.libraryIds)), []);
+  assert.equal(h.ctx.state.extMetaBatchDraft.allowOnline, true);
+
+  // 3. When libraries reappear, explicit [] zero-selection and allowOnline=true are both preserved
+  h.paintAdminBangumi(h.body, sampleBangumiStatus(), [], sampleLibraries, {}, onlineCapableOverview, []);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.ctx.state.extMetaBatchDraft.libraryIds)), []);
+  assert.match(h.body.innerHTML, /已选 0 \/ 3/);
+  assert.equal(h.doc.getElementById('extmeta-batch-online').checked, true);
+  assert.equal(h.body.querySelector('input[data-extmeta-batch-lib="lib-1"]').checked, false);
+
+  // 4. Uninitialized null draft remains null while libraries are empty, then selects all on first arrival
+  const hFresh = loadAdminScraperContext({ apiImpl: async () => ({}) });
+  hFresh.paintAdminBangumi(hFresh.body, sampleBangumiStatus(), [], [], {}, onlineCapableOverview, []);
+  assert.equal(hFresh.ctx.state.extMetaBatchDraft.libraryIds, null);
+  hFresh.doc.getElementById('extmeta-batch-online').checked = true;
+  hFresh.doc.getElementById('extmeta-batch-online').onchange();
+  assert.equal(hFresh.ctx.state.extMetaBatchDraft.libraryIds, null);
+  hFresh.paintAdminBangumi(hFresh.body, sampleBangumiStatus(), [], sampleLibraries, {}, onlineCapableOverview, []);
+  assert.match(hFresh.body.innerHTML, /已选 3 \/ 3/);
 });

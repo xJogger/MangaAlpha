@@ -1658,6 +1658,14 @@ test('metadata center renders schemaFormat badges, -wal warnings, and streams SQ
   assert.doesNotMatch(h.modalRoot.innerHTML, /默认不选/);
 
   const uploadTabBtn = h.modalRoot.querySelector('button[data-emas-tab="upload"]');
+  const pathTabBtn = h.modalRoot.querySelector('button[data-emas-tab="path"]');
+  const kindSel = h.doc.getElementById('emas-kind');
+  kindSel.value = 'tag_dictionary';
+  uploadTabBtn.onclick();
+  uploadTabBtn.onclick();
+  assert.equal(kindSel.value, 'offline_sqlite');
+  pathTabBtn.onclick();
+  assert.equal(kindSel.value, 'tag_dictionary');
   uploadTabBtn.onclick();
   assert.match(h.doc.getElementById('emas-pane-upload').innerHTML, /client_max_body_size/);
 
@@ -1777,4 +1785,10 @@ test('app.css v3.4.0 additions use theme CSS variables without hardcoded colors'
   assert.doesNotMatch(slice, /\brgba?\(/);
   assert.match(cssSource, /\.poster-badge-top-left\s*\{[^}]*color:\s*var\(--warn\)[^}]*background:\s*var\(--overlay-strong\)/);
   assert.doesNotMatch(slice, /\.book-vol-badge\s*\{/);
+
+  const lightTheme = cssSource.match(/\[data-theme="light"\]\s*\{([^}]*)\}/);
+  assert.ok(lightTheme && /--warn-text\s*:\s*#[0-9a-fA-F]{6}/.test(lightTheme[1]), 'expected light theme --warn-text variable');
+  assert.match(cssSource, /\.extmeta-batch-empty-hint\s*\{[^}]*color:\s*var\(--warn-text\)/);
+  assert.match(slice, /\.extmeta-wal-warning\s*\{[^}]*color:\s*var\(--warn-text\)/);
+  assert.match(slice, /\.extmeta-local-wal-hint\s*\{[^}]*color:\s*var\(--warn-text\)/);
 });
