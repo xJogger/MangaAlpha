@@ -132,6 +132,7 @@ function createShelfHarness({
   search = '',
   infinite = true,
   pageSize = 2,
+  displayPrefs = {},
   withObserver = true,
   userId = 'u1',
   apiHandler,
@@ -225,6 +226,7 @@ function createShelfHarness({
       }
     },
     displayPref(name) {
+      if (Object.prototype.hasOwnProperty.call(displayPrefs, name)) return displayPrefs[name];
       if (name === 'shelfInfiniteScroll') return infinite;
       if (name === 'shelfPageSize') return pageSize;
       return 8;
@@ -438,8 +440,70 @@ test('renderHome waits for libraries before rendering card sources', async () =>
 
   resolveLibs([{ id: 'lib1', name: '主库', providerType: '115' }]);
   await new Promise((r) => setTimeout(r, 15));
+  assert.equal(h.doc.getElementById('home-libs').innerHTML, '');
+  assert.doesNotMatch(h.doc.getElementById('page-content').innerHTML, /browse-head|继续上次的阅读进度|正在读取书库|lib-strip|全部书库/);
   assert.match(h.doc.getElementById('home-updated').innerHTML, /主库 · 115 网盘/);
   assert.match(h.doc.getElementById('home-added').innerHTML, /主库 · 115 网盘/);
+});
+
+test('renderHome skips skeletons and API calls for sections set to 0 and renders fallback card when all three are 0', async () => {
+  const calls1 = [];
+  const hPartial = createShelfHarness({
+    displayPrefs: { homeContinueSize: 0, homeUpdatedSize: 0, homeAddedSize: 12 },
+    apiHandler: async (path) => {
+      calls1.push(path);
+      if (path === '/api/v1/libraries') return [{ id: 'lib1', name: '主库', providerType: '115' }];
+      if (path.startsWith('/api/v1/series')) return { content: [{ id: 's1', libraryId: 'lib1', name: 'Added Only' }] };
+      return { content: [] };
+    },
+  });
+
+  hPartial.ctx.renderHome();
+  assert.equal(hPartial.doc.getElementById('home-updated').innerHTML, '');
+  assert.doesNotMatch(hPartial.doc.getElementById('page-content').innerHTML, /poster-card-skeleton|正在读取书库|browse-head/);
+  await new Promise((r) => setTimeout(r, 15));
+  assert.ok(!calls1.some((u) => u.includes('/admin/api/bookshelf/continue-reading')));
+  assert.ok(!calls1.some((u) => u.includes('sort=lastModifiedDate,desc')));
+  assert.deepEqual(
+    calls1.filter((u) => u.startsWith('/api/v1/series')),
+    ['/api/v1/series?sort=createdDate,desc&size=12'],
+  );
+  assert.equal(hPartial.doc.getElementById('home-libs').innerHTML, '');
+  assert.match(hPartial.doc.getElementById('home-added').innerHTML, /Added Only/);
+  assert.equal(hPartial.doc.getElementById('home-empty').innerHTML, '');
+
+  const callsAllZero = [];
+  const hAllZero = createShelfHarness({
+    displayPrefs: { homeContinueSize: 0, homeUpdatedSize: 0, homeAddedSize: 0 },
+    apiHandler: async (path) => {
+      callsAllZero.push(path);
+      if (path === '/api/v1/libraries') return [{ id: 'lib1', name: '主库', providerType: '115' }];
+      return { content: [] };
+    },
+  });
+
+  hAllZero.ctx.renderHome();
+  assert.equal(hAllZero.doc.getElementById('home-updated').innerHTML, '');
+  await new Promise((r) => setTimeout(r, 15));
+  assert.deepEqual(callsAllZero, ['/api/v1/libraries']);
+  assert.equal(hAllZero.doc.getElementById('home-libs').innerHTML, '');
+  const emptyHTML = hAllZero.doc.getElementById('home-empty').innerHTML;
+  assert.match(emptyHTML, /首页展示板块已全部关闭/);
+  assert.match(emptyHTML, /href="\/libraries"[^>]*>浏览书库<\/a>/);
+  assert.match(emptyHTML, /href="\/account"[^>]*>账号设置<\/a>/);
+
+  // Zero-library state keeps recovery card instead of "all sections disabled" card
+  const hNoLibs = createShelfHarness({
+    displayPrefs: { homeContinueSize: 0, homeUpdatedSize: 0, homeAddedSize: 0 },
+    apiHandler: async (path) => {
+      if (path === '/api/v1/libraries') return [];
+      return { content: [] };
+    },
+  });
+  hNoLibs.ctx.renderHome();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.match(hNoLibs.doc.getElementById('home-libs').innerHTML, /欢迎来到 MangaAlpha 书架/);
+  assert.equal(hNoLibs.doc.getElementById('home-empty').innerHTML, '');
 });
 
 test('random roaming falls back to pagination so no work is silently dropped', async () => {

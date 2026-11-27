@@ -268,13 +268,15 @@ function createV33Harness(options = {}) {
 
   const displayPrefs = {
     homeContinueSize: 6,
-    homeRecentSize: 12,
+    homeUpdatedSize: 18,
+    homeAddedSize: 12,
     shelfPageSize: 24,
     seriesPageSize: 24,
     historyPreviewCount: 3,
     defaultBrowseView: 'series',
     defaultSort: 'createdDate,desc',
     mergeBangumiWorks: true,
+    ...(options.displayPrefs || {}),
   };
 
   const api = async (url, opts = {}) => {
@@ -783,6 +785,9 @@ test('renderHome uses new continue-reading aggregate endpoint with merge_bangumi
   assert.match(crCall.url, /merge_bangumi=1/);
 
   const homeContinue = h.doc.getElementById('home-continue');
+  assert.equal(h.doc.getElementById('home-libs').innerHTML, '');
+  assert.ok(!h.doc.getElementById('page-content').innerHTML.includes('browse-head'));
+  assert.ok(!h.doc.getElementById('page-content').innerHTML.includes('lib-strip'));
   assert.ok(homeContinue.innerHTML.includes('另有 2 卷在读'));
   assert.ok(homeContinue.innerHTML.includes('?versions=1'));
   // Second item has otherInProgressCount=0 so count only appears once

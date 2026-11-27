@@ -20,9 +20,9 @@
   const DISPLAY_PREFS = {
     shelfPageSize: { key: 'webui.shelf.pageSize', type: 'int', def: 36, min: 12, max: 120 },
     shelfInfiniteScroll: { key: 'webui.shelf.infiniteScroll', type: 'bool', def: false },
-    homeContinueSize: { key: 'webui.home.continueSize', type: 'int', def: 8, min: 4, max: 24 },
-    homeUpdatedSize: { key: 'webui.home.updatedSize', type: 'int', def: 18, min: 4, max: 36 },
-    homeAddedSize: { key: 'webui.home.addedSize', type: 'int', def: 12, min: 4, max: 36 },
+    homeContinueSize: { key: 'webui.home.continueSize', type: 'int', def: 8, min: 4, max: 24, allowZero: true },
+    homeUpdatedSize: { key: 'webui.home.updatedSize', type: 'int', def: 18, min: 4, max: 36, allowZero: true },
+    homeAddedSize: { key: 'webui.home.addedSize', type: 'int', def: 12, min: 4, max: 36, allowZero: true },
     seriesBooksView: { key: 'webui.series.booksView', type: 'enum', values: ['list', 'cover'], def: 'list' },
   };
 
@@ -38,6 +38,7 @@
     }
     const n = Number.parseInt(raw, 10);
     if (!Number.isFinite(n)) return spec.def;
+    if (spec.type === 'int' && spec.allowZero && n === 0) return 0;
     return Math.min(spec.max, Math.max(spec.min, n));
   }
 
@@ -151,7 +152,9 @@
     const spec = DISPLAY_PREFS[name];
     if (spec.type === 'bool') return Boolean(state.displayPrefs[name]);
     if (spec.type === 'enum') return normalizeDisplayPref(spec, state.displayPrefs[name]);
-    return Math.min(spec.max, Math.max(spec.min, state.displayPrefs[name] || spec.def));
+    const raw = state.displayPrefs[name];
+    const n = Number.isFinite(raw) ? raw : spec.def;
+    return normalizeDisplayPref(spec, n);
   }
 
   async function ensureDisplayPrefs() {
@@ -231,7 +234,10 @@
     return `<div class="pref-field">
       <label for="${esc(id)}">${esc(label)}</label>
       <select id="${esc(id)}" data-display-pref="${esc(name)}">
-        ${options.map((value) => `<option value="${value}" ${value === current ? 'selected' : ''}>${value} ${unit}</option>`).join('')}
+        ${options.map((value) => {
+          const text = (spec && spec.allowZero && value === 0) ? '关闭' : `${value} ${unit}`;
+          return `<option value="${value}" ${value === current ? 'selected' : ''}>${esc(text)}</option>`;
+        }).join('')}
       </select>
     </div>`;
   }
@@ -265,6 +271,8 @@
           } else if (spec.type === 'enum') {
             const labelsMap = DISPLAY_PREF_ENUM_LABELS[name] || {};
             toast(`已保存显示偏好：${labelsMap[saved] || saved}`);
+          } else if (spec.type === 'int' && spec.allowZero && saved === 0) {
+            toast('已保存显示偏好：关闭');
           } else {
             toast(`已保存显示偏好：${saved} 项`);
           }
@@ -287,9 +295,9 @@
       </p>
       <div class="pref-grid">
         ${displayPrefSelectHTML('shelfPageSize', '书架每页数量', [24, 36, 48, 60, 96])}
-        ${displayPrefSelectHTML('homeContinueSize', '首页「继续阅读」', [4, 8, 12, 18, 24])}
-        ${displayPrefSelectHTML('homeUpdatedSize', '首页「最近更新」', [8, 12, 18, 24, 36])}
-        ${displayPrefSelectHTML('homeAddedSize', '首页「最新入库」', [8, 12, 18, 24, 36])}
+        ${displayPrefSelectHTML('homeContinueSize', '首页「继续阅读」', [0, 4, 8, 12, 18, 24])}
+        ${displayPrefSelectHTML('homeUpdatedSize', '首页「最近更新」', [0, 8, 12, 18, 24, 36])}
+        ${displayPrefSelectHTML('homeAddedSize', '首页「最新入库」', [0, 8, 12, 18, 24, 36])}
         ${displayPrefSelectHTML('seriesBooksView', '系列默认卷视图', [
           { value: 'list', label: '列表模式' },
           { value: 'cover', label: '封面模式' },
@@ -1260,21 +1268,19 @@
   function renderHome() {
     document.title = '书架 · MangaAlpha';
     const seq = routeSeq;
-    renderShell('home', `<div class="browse-head">
-        <div class="browse-heading">
-          <h1 class="browse-title">书架</h1>
-          <p class="browse-sub">继续上次的阅读进度，或从最近更新与最新入库里发现新作品。</p>
-        </div>
-      </div>
-      <section id="home-libs"><p class="list-status" role="status">正在读取书库…</p></section>
+    const continueSize = displayPref('homeContinueSize');
+    const updatedSize = displayPref('homeUpdatedSize');
+    const addedSize = displayPref('homeAddedSize');
+    const allDisabled = continueSize === 0 && updatedSize === 0 && addedSize === 0;
+    renderShell('home', `<section id="home-libs"></section>
       <section id="home-continue" aria-live="polite"></section>
-      <section id="home-updated" aria-live="polite">
+      <section id="home-updated" aria-live="polite">${updatedSize > 0 ? `
         <div class="section-block">
           <div class="section-head"><h2>最近更新</h2></div>
           ${posterSkeletonGridHTML(8)}
-        </div>
-      </section>
-      <section id="home-added" aria-live="polite"></section>`);
+        </div>` : ''}</section>
+      <section id="home-added" aria-live="polite"></section>
+      <section id="home-empty" aria-live="polite"></section>`);
     function load(slot, fetchData, render) {
       fetchData().then((data) => {
         if (seq !== routeSeq) return;
@@ -1300,11 +1306,13 @@
       return p;
     }, (libs) => {
       state.libraries = libs || [];
+      const emptyEl = document.getElementById('home-empty');
       let html = '';
       const allAuthorizedHidden = state.libraries.length === 0 && Boolean(
         state.auth && (state.auth.hasHiddenLibraries || Number(state.auth.authorizedLibrariesCount || 0) > 0),
       );
       if (state.libraries.length === 0) {
+        if (emptyEl) emptyEl.innerHTML = '';
         if (allAuthorizedHidden) {
           html += `
             <div class="card" style="text-align:center;padding:38px 20px">
@@ -1331,102 +1339,102 @@
               <a href="/account" data-nav class="btn btn-primary">查看账号设置</a>
             </div>`;
         }
-      } else {
-        html += `
-          <section class="section-block">
-            <div class="section-head">
-              <h2>书库</h2>
-              <a href="/libraries" data-nav class="more-link">浏览全部 →</a>
+      } else if (emptyEl) {
+        emptyEl.innerHTML = allDisabled ? `
+          <div class="card" style="text-align:center;padding:38px 20px;max-width:560px;margin:18px auto 0">
+            <h2>首页展示板块已全部关闭</h2>
+            <p style="color:var(--text-secondary);max-width:460px;margin:8px auto 18px">
+              「继续阅读」「最近更新」「最新入库」当前均已关闭，可在账号设置中随时重新开启。
+            </p>
+            <div style="display:flex;justify-content:center;flex-wrap:wrap;gap:10px">
+              <a href="/libraries" data-nav class="btn btn-primary">浏览书库</a>
+              <a href="/account" data-nav class="btn">账号设置</a>
             </div>
-            <div class="lib-strip">
-              <a href="/libraries" data-nav class="lib-pill">全部书库</a>
-              ${state.libraries.map((l) => `
-                <a href="/libraries/${encodeURIComponent(l.id)}" data-nav class="lib-pill">
-                  <span>${esc(l.name)}</span>
-                  <span class="badge">${esc(providerLabel(l.providerType, l.webdavAccountName))}</span>
-                  ${l.oneshotsDirectory === '.' ? `<span class="badge badge-accent">单本</span>` : (l.oneshotsDirectory ? `<span class="badge badge-accent">含单篇</span>` : '')}
-                </a>
-              `).join('')}
-            </div>
-          </section>`;
+          </div>` : '';
       }
 
       return html;
     });
-    load('home-continue', () => api(`/admin/api/bookshelf/continue-reading?size=${displayPref('homeContinueSize')}&merge_bangumi=${mergedWorks() ? '1' : '0'}`), (res) => {
-      const contGroups = res?.content || [];
-      let html = '';
-      if (contGroups.length > 0) {
-        html += `
-          <section class="section-block">
-            <div class="section-head">
-              <h2>继续阅读</h2>
-            </div>
-            <div class="continue-grid">
-              ${contGroups.map((g) => {
-                const b = (g && g.primary) || g;
-                if (!b || !b.id) return '';
-                const pg = (b.readProgress && b.readProgress.page) || 1;
-                const totalPg = (b.media && b.media.pagesCount) || 0;
-                const readerURL = `/reader/series/${encodeURIComponent(b.seriesId)}/book/${encodeURIComponent(b.id)}?page=${pg}`;
-                const seriesURL = `/series/${encodeURIComponent(b.seriesId)}${g && g.mergedByBangumi && g.bgmSubjectId ? '?versions=1' : ''}`;
-                const seriesTitle = b.seriesTitle || b.name || '未命名';
-                const bookTitle = (b.metadata && b.metadata.title) ? b.metadata.title : b.name;
-                const otherInProgress = Number((g && g.otherInProgressCount) || 0);
-                return `
-                  <div class="continue-card">
-                    <a href="${seriesURL}" data-nav>
-                      <img loading="lazy" src="/api/v1/series/${encodeURIComponent(b.seriesId)}/thumbnail?v=${state.coverVer}" alt="">
-                    </a>
-                    <div class="continue-info">
-                      <a href="${seriesURL}" data-nav class="continue-series" title="${esc(seriesTitle)}">${esc(seriesTitle)}</a>
-                      <div class="continue-book" title="${esc(bookTitle)}">${esc(bookTitle)}</div>
-                      <div class="continue-badges">
-                        <span class="badge badge-accent">第 ${pg}${totalPg > 0 ? ` / ${totalPg}` : ''} 页</span>
-                        ${otherInProgress > 0 ? `<span class="badge" title="同作品还有 ${otherInProgress} 卷正在阅读，点击系列名查看全部卷">另有 ${otherInProgress} 卷在读</span>` : ''}
+    if (continueSize > 0) {
+      load('home-continue', () => api(`/admin/api/bookshelf/continue-reading?size=${continueSize}&merge_bangumi=${mergedWorks() ? '1' : '0'}`), (res) => {
+        const contGroups = res?.content || [];
+        let html = '';
+        if (contGroups.length > 0) {
+          html += `
+            <section class="section-block">
+              <div class="section-head">
+                <h2>继续阅读</h2>
+              </div>
+              <div class="continue-grid">
+                ${contGroups.map((g) => {
+                  const b = (g && g.primary) || g;
+                  if (!b || !b.id) return '';
+                  const pg = (b.readProgress && b.readProgress.page) || 1;
+                  const totalPg = (b.media && b.media.pagesCount) || 0;
+                  const readerURL = `/reader/series/${encodeURIComponent(b.seriesId)}/book/${encodeURIComponent(b.id)}?page=${pg}`;
+                  const seriesURL = `/series/${encodeURIComponent(b.seriesId)}${g && g.mergedByBangumi && g.bgmSubjectId ? '?versions=1' : ''}`;
+                  const seriesTitle = b.seriesTitle || b.name || '未命名';
+                  const bookTitle = (b.metadata && b.metadata.title) ? b.metadata.title : b.name;
+                  const otherInProgress = Number((g && g.otherInProgressCount) || 0);
+                  return `
+                    <div class="continue-card">
+                      <a href="${seriesURL}" data-nav>
+                        <img loading="lazy" src="/api/v1/series/${encodeURIComponent(b.seriesId)}/thumbnail?v=${state.coverVer}" alt="">
+                      </a>
+                      <div class="continue-info">
+                        <a href="${seriesURL}" data-nav class="continue-series" title="${esc(seriesTitle)}">${esc(seriesTitle)}</a>
+                        <div class="continue-book" title="${esc(bookTitle)}">${esc(bookTitle)}</div>
+                        <div class="continue-badges">
+                          <span class="badge badge-accent">第 ${pg}${totalPg > 0 ? ` / ${totalPg}` : ''} 页</span>
+                          ${otherInProgress > 0 ? `<span class="badge" title="同作品还有 ${otherInProgress} 卷正在阅读，点击系列名查看全部卷">另有 ${otherInProgress} 卷在读</span>` : ''}
+                        </div>
                       </div>
-                    </div>
-                    <a href="${readerURL}" class="btn btn-primary btn-sm">继续读</a>
-                  </div>`;
-              }).join('')}
-            </div>
-          </section>`;
-      }
+                      <a href="${readerURL}" class="btn btn-primary btn-sm">继续读</a>
+                    </div>`;
+                }).join('')}
+              </div>
+            </section>`;
+        }
 
-      return html;
-    });
-    load('home-updated', () => Promise.all([api(seriesURL + 'sort=lastModifiedDate,desc&size=' + displayPref('homeUpdatedSize')), libsReady]).then(([data]) => data), (res) => {
-      const updatedList = res?.content || [];
-      let html = '';
-      if (updatedList.length > 0) {
-        html += `
-          <section class="section-block">
-            <div class="section-head">
-              <h2>最近更新</h2>
-              <a href="/libraries?sort=lastModifiedDate,desc" data-nav class="more-link">更多 →</a>
-            </div>
-            <div class="poster-grid">${updatedList.map((x) => seriesCardHTML(x)).join('')}</div>
-          </section>`;
-      }
+        return html;
+      });
+    }
+    if (updatedSize > 0) {
+      load('home-updated', () => Promise.all([api(seriesURL + 'sort=lastModifiedDate,desc&size=' + updatedSize), libsReady]).then(([data]) => data), (res) => {
+        const updatedList = res?.content || [];
+        let html = '';
+        if (updatedList.length > 0) {
+          html += `
+            <section class="section-block">
+              <div class="section-head">
+                <h2>最近更新</h2>
+                <a href="/libraries?sort=lastModifiedDate,desc" data-nav class="more-link">更多 →</a>
+              </div>
+              <div class="poster-grid">${updatedList.map((x) => seriesCardHTML(x)).join('')}</div>
+            </section>`;
+        }
 
-      return html;
-    });
-    load('home-added', () => Promise.all([api(seriesURL + 'sort=createdDate,desc&size=' + displayPref('homeAddedSize')), libsReady]).then(([data]) => data), (res) => {
-      const addedList = res?.content || [];
-      let html = '';
-      if (addedList.length > 0) {
-        html += `
-          <section class="section-block">
-            <div class="section-head">
-              <h2>最新入库</h2>
-              <a href="/libraries?sort=createdDate,desc" data-nav class="more-link">更多 →</a>
-            </div>
-            <div class="poster-grid">${addedList.map((x) => seriesCardHTML(x)).join('')}</div>
-          </section>`;
-      }
+        return html;
+      });
+    }
+    if (addedSize > 0) {
+      load('home-added', () => Promise.all([api(seriesURL + 'sort=createdDate,desc&size=' + addedSize), libsReady]).then(([data]) => data), (res) => {
+        const addedList = res?.content || [];
+        let html = '';
+        if (addedList.length > 0) {
+          html += `
+            <section class="section-block">
+              <div class="section-head">
+                <h2>最新入库</h2>
+                <a href="/libraries?sort=createdDate,desc" data-nav class="more-link">更多 →</a>
+              </div>
+              <div class="poster-grid">${addedList.map((x) => seriesCardHTML(x)).join('')}</div>
+            </section>`;
+        }
 
-      return html;
-    });
+        return html;
+      });
+    }
   }
 
   // --- Libraries Browse View ---

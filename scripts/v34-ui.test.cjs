@@ -449,6 +449,8 @@ function createV34Harness(options = {}) {
   const prefsSlice = extractSlice('  const DISPLAY_PREFS = {', '  async function copyTextSafeGlobal(');
   const recoverySlice = extractSlice('  function recoverUserContext()', '  let modalScroll = null;');
   const xhrSlice = extractSlice('  function xhrUploadFormData(', '  function navigate(target, replace = false)');
+  const homeHelperSlice = options.includeHome ? extractSlice('  const mergedWorks =', '  // --- Setup & Login Views ---') : '';
+  const homeSlice = options.includeHome ? extractSlice('  function renderHome(', '  // --- Libraries Browse View ---') : '';
   const accountSlice = extractSlice('  // --- Personal Account Settings Page (/account) ---', '  // --- AI Agent One-Click Authorization Page (/agent-auth/:requestID) ---');
   const seriesDetailSlice = extractSlice('  // --- Series Detail View (/series/:id) ---', '  // --- Metadata Edit Modal ---');
   const bookDetailSlice = extractSlice('  // --- Book Detail View (/book/:id & /books/:id) ---', '  // --- Admin Console (/admin) ---');
@@ -545,6 +547,11 @@ function createV34Harness(options = {}) {
     fmtBgmCollectionType: () => '',
     renderSeriesTrackerBadge: () => '',
     providerLabel: (pt, acc) => (pt === 'webdav' && acc ? `WebDAV · ${acc}` : (pt === 'local' ? '本地 / SMB' : (pt === 'union' ? '联合库' : '115 网盘'))),
+    librarySourceText: (id) => {
+      const lib = (ctx.state?.libraries || []).find((l) => l.id === id);
+      return lib ? `${lib.name} · ${ctx.providerLabel(lib.providerType, lib.webdavAccountName)}` : '';
+    },
+    isAdminUser: () => Boolean(ctx.state?.auth?.isAdmin),
     formatScheduleSummary: () => '',
     safeRedirectTarget: (p) => (String(p || '').startsWith('/') ? String(p) : '/'),
     toast: (msg, kind = 'ok') => { toasts.push({ msg, kind }); },
@@ -620,6 +627,7 @@ function createV34Harness(options = {}) {
   }
 
   if (options.includeAccount) vm.runInContext(accountSlice, ctx);
+  if (options.includeHome) vm.runInContext(homeHelperSlice + '\n' + homeSlice, ctx);
   if (options.includeSeriesDetail) vm.runInContext(seriesDetailSlice, ctx);
   else vm.runInContext(extractSlice('  function currentUserId()', '  function isSeriesPath('), ctx);
   if (options.includeBookDetail) vm.runInContext(bookDetailSlice, ctx);
@@ -1791,4 +1799,153 @@ test('app.css v3.4.0 additions use theme CSS variables without hardcoded colors'
   assert.match(cssSource, /\.extmeta-batch-empty-hint\s*\{[^}]*color:\s*var\(--warn-text\)/);
   assert.match(slice, /\.extmeta-wal-warning\s*\{[^}]*color:\s*var\(--warn-text\)/);
   assert.match(slice, /\.extmeta-local-wal-hint\s*\{[^}]*color:\s*var\(--warn-text\)/);
+});
+
+// ---------------------------------------------------------------------------
+// 8. Home 3-section zero toggle (displayPrefs + /account + renderHome)
+// ---------------------------------------------------------------------------
+test('DISPLAY_PREFS home section sizes support 0 across normalizeDisplayPref, displayPref, localStorage, client-settings, and /account UI', async () => {
+  let failNextPatch = false;
+  const h = createV34Harness({
+    includeAccount: true,
+    auth: { claimed: true, authenticated: true, userId: 'u-1', username: 'alice', role: 'user', isAdmin: false },
+    storage: {
+      'fk115_display.u-1.homeContinueSize': '0',
+      'fk115_display.u-1.homeUpdatedSize': '0',
+      'fk115_display.u-1.homeAddedSize': '0',
+    },
+    apiHandler: async (url, opts) => {
+      if (url === '/api/v1/client-settings/user/list') {
+        return {
+          'webui.home.continueSize': { value: '0', allowUnauthenticated: false },
+          'webui.home.updatedSize': { value: '18', allowUnauthenticated: false },
+          'webui.home.addedSize': { value: '0', allowUnauthenticated: false },
+        };
+      }
+      if (url === '/api/v1/client-settings/user' && opts.method === 'PATCH') {
+        if (failNextPatch) {
+          failNextPatch = false;
+          throw new Error('保存失败');
+        }
+        return null;
+      }
+      if (url === '/admin/api/me') {
+        return {
+          user: { id: 'u-1', username: 'alice', role: 'user', allowNsfw: false, showNsfw: false },
+          authorizedLibraries: [],
+          hiddenLibraryIds: [],
+          visibleLibraries: [],
+        };
+      }
+      if (url === '/admin/api/auth/api-keys' || url === '/admin/api/auth/sessions') return [];
+      if (url.startsWith('/admin/api/bangumi/tracker')) return null;
+      return {};
+    },
+  });
+
+  // 1. Spec & normalization checks
+  assert.equal(Boolean(h.ctx.DISPLAY_PREFS.shelfPageSize.allowZero), false);
+  assert.equal(h.ctx.normalizeDisplayPref(h.ctx.DISPLAY_PREFS.shelfPageSize, 0), 12);
+
+  for (const [name, defVal] of [['homeContinueSize', 8], ['homeUpdatedSize', 18], ['homeAddedSize', 12]]) {
+    const spec = h.ctx.DISPLAY_PREFS[name];
+    assert.equal(spec.allowZero, true);
+    assert.equal(h.ctx.normalizeDisplayPref(spec, 0), 0);
+    assert.equal(h.ctx.normalizeDisplayPref(spec, '0'), 0);
+    assert.equal(h.ctx.normalizeDisplayPref(spec, 2), 4);
+    assert.equal(h.ctx.normalizeDisplayPref(spec, -1), 4);
+    assert.equal(h.ctx.normalizeDisplayPref(spec, ''), defVal);
+  }
+
+  // 2. readLocalDisplayPrefs & displayPref() must not treat 0 as falsy
+  const localPrefs = h.ctx.readLocalDisplayPrefs('u-1');
+  assert.equal(localPrefs.homeContinueSize, 0);
+  assert.equal(localPrefs.homeUpdatedSize, 0);
+  assert.equal(localPrefs.homeAddedSize, 0);
+
+  // 3. ensureDisplayPrefs() preserves '0' from client-settings and syncs localStorage
+  await h.ctx.ensureDisplayPrefs();
+  assert.equal(h.ctx.displayPref('homeContinueSize'), 0);
+  assert.equal(h.ctx.displayPref('homeUpdatedSize'), 18);
+  assert.equal(h.ctx.displayPref('homeAddedSize'), 0);
+  assert.equal(h.storage.getItem('fk115_display.u-1.homeContinueSize'), '0');
+  assert.equal(h.storage.getItem('fk115_display.u-1.homeUpdatedSize'), '18');
+  assert.equal(h.storage.getItem('fk115_display.u-1.homeAddedSize'), '0');
+
+  // 4. /account renders <option value="0">关闭</option> with strict wording
+  await h.ctx.renderAccountPage();
+  const pageHTML = h.doc.getElementById('page-content').innerHTML;
+  assert.doesNotMatch(pageHTML, /关闭\s*[（(]0[）)]|0\s*项\s*[（(]关闭[）)]|>\s*0\s*项\s*</);
+
+  const shelfSel = h.doc.getElementById('disp-pref-shelfPageSize');
+  assert.doesNotMatch(shelfSel.innerHTML, /value="0"|关闭/);
+
+  const contSel = h.doc.getElementById('disp-pref-homeContinueSize');
+  const updSel = h.doc.getElementById('disp-pref-homeUpdatedSize');
+  const addSel = h.doc.getElementById('disp-pref-homeAddedSize');
+  assert.equal(contSel.value, '0');
+  assert.equal(updSel.value, '18');
+  assert.equal(addSel.value, '0');
+  assert.match(contSel.innerHTML, /<option value="0" selected>关闭<\/option>/);
+  assert.match(updSel.innerHTML, /<option value="0" >关闭<\/option>/);
+  assert.match(addSel.innerHTML, /<option value="0" selected>关闭<\/option>/);
+
+  // 5. Saving 0 on homeUpdatedSize sends "0", persists to localStorage, and toasts "已保存显示偏好：关闭"
+  updSel.value = '0';
+  await updSel.dispatch('change');
+  const patch0 = h.apiCalls.filter((c) => c.url === '/api/v1/client-settings/user' && c.method === 'PATCH').pop();
+  assert.deepEqual(JSON.parse(JSON.stringify(patch0.opts.body)), { 'webui.home.updatedSize': { value: '0' } });
+  assert.equal(h.ctx.displayPref('homeUpdatedSize'), 0);
+  assert.equal(h.storage.getItem('fk115_display.u-1.homeUpdatedSize'), '0');
+  assert.equal(h.toasts.at(-1).msg, '已保存显示偏好：关闭');
+
+  // 6. Error rollback when changing away from 0 restores value "0"
+  failNextPatch = true;
+  contSel.value = '12';
+  await contSel.dispatch('change');
+  assert.equal(contSel.value, '0');
+  assert.equal(h.ctx.displayPref('homeContinueSize'), 0);
+
+  // 7. Changing back to non-zero emits "已保存显示偏好：12 项"
+  contSel.value = '12';
+  await contSel.dispatch('change');
+  assert.equal(h.ctx.displayPref('homeContinueSize'), 12);
+  assert.equal(h.toasts.at(-1).msg, '已保存显示偏好：12 项');
+});
+
+test('real renderHome integrates with DISPLAY_PREFS 0 values end-to-end', async () => {
+  const h = createV34Harness({
+    includeHome: true,
+    auth: { claimed: true, authenticated: true, userId: 'u-1', username: 'alice', role: 'user', isAdmin: false },
+    apiHandler: async (url) => {
+      if (url === '/api/v1/client-settings/user/list') {
+        return {
+          'webui.home.continueSize': { value: '0' },
+          'webui.home.updatedSize': { value: '0' },
+          'webui.home.addedSize': { value: '0' },
+        };
+      }
+      if (url === '/api/v1/libraries') {
+        return [{ id: 'lib-1', name: '本地主库', providerType: 'local' }];
+      }
+      return { content: [] };
+    },
+  });
+
+  await h.ctx.ensureDisplayPrefs();
+  assert.equal(h.ctx.displayPref('homeContinueSize'), 0);
+  assert.equal(h.ctx.displayPref('homeUpdatedSize'), 0);
+  assert.equal(h.ctx.displayPref('homeAddedSize'), 0);
+
+  h.apiCalls.length = 0;
+  h.ctx.renderHome();
+  assert.equal(h.doc.getElementById('home-updated').innerHTML, '');
+  await flushMicrotasks();
+
+  assert.deepEqual(h.apiCalls.map((c) => c.url), ['/api/v1/libraries']);
+  assert.equal(h.doc.getElementById('home-libs').innerHTML, '');
+  const emptyHTML = h.doc.getElementById('home-empty').innerHTML;
+  assert.match(emptyHTML, /首页展示板块已全部关闭/);
+  assert.match(emptyHTML, /浏览书库/);
+  assert.match(emptyHTML, /账号设置/);
 });
