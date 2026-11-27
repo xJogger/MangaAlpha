@@ -331,6 +331,36 @@ func (c *LiveClient) subject(ctx context.Context, subjectID int64) (apiSubjectRe
 	return item, token, nil
 }
 
+// VerifyTankobonRatings fills unknown ratings for aligned subjects using the
+// lightweight detail endpoint. Each subject is checked at most once per match.
+func (c *LiveClient) VerifyTankobonRatings(ctx context.Context, matches []VolumeMatchResult) {
+	type rating struct {
+		nsfw, known bool
+		coverURL    string
+	}
+	checked := make(map[int64]rating)
+	for i := range matches {
+		match := &matches[i]
+		if match.NSFWKnown || match.SubjectID <= 0 {
+			continue
+		}
+		result, ok := checked[match.SubjectID]
+		if !ok {
+			item, _, err := c.subject(ctx, match.SubjectID)
+			if err == nil && item.NSFW != nil {
+				result = rating{*item.NSFW, true, strings.TrimSpace(item.Images.Common)}
+			}
+			checked[match.SubjectID] = result
+		}
+		if result.known {
+			match.NSFW, match.NSFWKnown = result.nsfw, true
+			if result.coverURL != "" {
+				match.CoverURL = result.coverURL
+			}
+		}
+	}
+}
+
 func (c *LiveClient) fetchSubjectPersons(ctx context.Context, subjectID int64, token string) ([]apiPersonRelation, error) {
 	if err := c.limiter.Wait(ctx); err != nil {
 		return nil, err

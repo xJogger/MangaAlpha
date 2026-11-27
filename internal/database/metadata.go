@@ -341,10 +341,27 @@ func (s *Store) ApplyScrapedMetadata(
 		return SeriesMetadata{}, err
 	}
 	defer tx.Rollback()
-	current, err := scanSeriesMetadataRow(tx.QueryRowContext(ctx,
+	if _, err := s.applyScrapedMetadataTx(ctx, tx, series, incoming, false, false, nil, false); err != nil {
+		return SeriesMetadata{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SeriesMetadata{}, err
+	}
+	return s.SeriesMetadataByID(ctx, series)
+}
+
+func (s *Store) applyScrapedMetadataTx(ctx context.Context, tx *sql.Tx, series Series, incoming ScrapedMetadata, chain, replace bool, expectedSubjectID *int64, markUnmatched bool) (SeriesMetadata, error) {
+	scan := scanSeriesMetadataRow
+	if chain {
+		scan = scanRawSeriesMetadataRow
+	}
+	current, err := scan(tx.QueryRowContext(ctx,
 		`SELECT `+seriesMetadataColumns+` FROM series_metadata WHERE series_id=?`, series.ID))
 	if errors.Is(err, sql.ErrNoRows) {
 		current = defaultSeriesMetadata(series)
+		if chain {
+			current.Title, current.TitleSort, current.Status = "", "", ""
+		}
 	} else if err != nil {
 		return SeriesMetadata{}, err
 	}
@@ -352,12 +369,25 @@ func (s *Store) ApplyScrapedMetadata(
 	if current.BgmSubjectID != nil {
 		prevSubjectID = *current.BgmSubjectID
 	}
+	if expectedSubjectID != nil && *expectedSubjectID != prevSubjectID {
+		return SeriesMetadata{}, ErrMetadataChanged
+	}
 	extSourceID := strings.TrimSpace(incoming.ExtSourceID)
 	extEntryID := strings.TrimSpace(incoming.ExtEntryID)
 	extCoverURL := strings.TrimSpace(incoming.ExtCoverURL)
 	extCoverPath := strings.TrimSpace(incoming.ExtCoverPath)
 	matchOrigin := strings.TrimSpace(incoming.MatchOrigin)
 
+	legacy := chain && current.MatchOrigin == "" && (prevSubjectID > 0 || current.ExtEntryID != "")
+	if legacy {
+		matchOrigin = ""
+		if current.ExtEntryID != "" {
+			extSourceID, extEntryID, extCoverURL = current.ExtSourceID, current.ExtEntryID, current.ExtCoverURL
+			if strings.HasPrefix(strings.ToLower(extCoverURL), "sqlite-blob://") {
+				extCoverURL = ""
+			}
+		}
+	}
 	externalOnly := extSourceID != "" && incoming.SubjectID == 0
 	if !externalOnly {
 		subj := incoming.SubjectID
@@ -368,7 +398,7 @@ func (s *Store) ApplyScrapedMetadata(
 			current.ExtCoverPath = ""
 		}
 		current.ExtSourceID, current.ExtEntryID, current.ExtCoverURL = extSourceID, extEntryID, extCoverURL
-	} else if incoming.SubjectID > 0 {
+	} else if incoming.SubjectID > 0 || replace {
 		current.ExtSourceID, current.ExtEntryID, current.ExtCoverURL, current.ExtCoverPath = "", "", "", ""
 	}
 	if !externalOnly && prevSubjectID != incoming.SubjectID {
@@ -381,30 +411,44 @@ func (s *Store) ApplyScrapedMetadata(
 		current.MatchOrigin = matchOrigin
 	}
 	current.ScrapeStatus = ScrapeStatusMatched
+	if markUnmatched {
+		if legacy {
+			return SeriesMetadata{}, ErrMetadataChanged
+		}
+		current.ScrapeStatus = ScrapeStatusUnmatched
+		current.MatchOrigin = ""
+	}
 	current.ScrapeConfidence = incoming.Confidence
 	now := nowText()
 	current.ScrapeSyncedAt = &now
 	if !externalOnly {
-		if incoming.CoverURL != "" {
+		if incoming.CoverURL != "" && (!legacy || current.BgmCoverURL == "") {
 			if current.BgmCoverURL != incoming.CoverURL {
 				current.BgmCoverPath = ""
 			}
 			current.BgmCoverURL = incoming.CoverURL
 		}
-		current.BgmScore = incoming.Score
-		current.BgmRank = nil
-		if incoming.Rank > 0 {
-			current.BgmRank = &incoming.Rank
+		if !legacy || current.BgmScore == nil {
+			current.BgmScore = incoming.Score
+		}
+		if !legacy || current.BgmRank == nil {
+			current.BgmRank = nil
+			if incoming.Rank > 0 {
+				current.BgmRank = &incoming.Rank
+			}
 		}
 	}
 	if !current.TitleSortLock && incoming.TitleSort == "" &&
 		(current.TitleSort == "" || current.TitleSort == current.Title) {
 		incoming.TitleSort = incoming.Title
 	}
-	applySeriesFields(&current, incoming, false)
+	if replace && !legacy {
+		resetSeriesMatchFields(&current)
+	}
+	applySeriesFields(&current, incoming, legacy)
 
 	if !current.NSFWLock {
-		current.IsNSFW = incoming.IsNSFW || (externalOnly && prevSubjectID > 0 && current.IsNSFW)
+		current.IsNSFW = incoming.IsNSFW || ((legacy || externalOnly && prevSubjectID > 0) && current.IsNSFW)
 		if !current.IsNSFW {
 			current.IsNSFW, err = queryUnionHasNSFWSource(ctx, tx, series.ID)
 			if err != nil {
@@ -415,10 +459,7 @@ func (s *Store) ApplyScrapedMetadata(
 	if err := saveSeriesMetadataTx(ctx, tx, current, now); err != nil {
 		return SeriesMetadata{}, err
 	}
-	if err := tx.Commit(); err != nil {
-		return SeriesMetadata{}, err
-	}
-	return s.SeriesMetadataByID(ctx, series)
+	return current, nil
 }
 
 // SeriesComicInfoBackfill contains series-level fields extracted during an
@@ -497,7 +538,7 @@ func applySeriesFields(m *SeriesMetadata, incoming ScrapedMetadata, onlyEmpty bo
 		{&m.ReadingDirection, incoming.ReadingDirection, m.ReadingDirLock},
 	} {
 		value := strings.TrimSpace(field.value)
-		if value == "" || field.locked || (onlyEmpty && *field.dst != "") {
+		if value == "" || field.locked || (onlyEmpty && strings.TrimSpace(*field.dst) != "") {
 			continue
 		}
 		switch field.dst {
@@ -775,6 +816,8 @@ func (s *Store) PatchSeriesMetadata(
 			current.CoverSource = CoverSourceBangumi
 		case CoverSourceBook:
 			current.CoverSource = CoverSourceBook
+		case "external", "ext":
+			current.CoverSource = "external"
 		default:
 			current.CoverSource = CoverSourceAuto
 		}
@@ -905,6 +948,8 @@ func WithAutomaticMetadata(ctx context.Context) context.Context {
 	return context.WithValue(ctx, automaticMetadataKey{}, true)
 }
 
+type rematchLegacyKey struct{}
+
 var ErrMetadataChanged = errors.New("series metadata changed during automatic scraping")
 
 func (s *Store) saveSeriesMetadata(ctx context.Context, m SeriesMetadata, now string) error {
@@ -932,8 +977,9 @@ LEFT JOIN series_metadata sm ON sm.series_id=s.id
 WHERE s.id=? AND l.enabled=1 AND NOT EXISTS (
  SELECT 1 FROM union_layers ul WHERE ul.member_library_id=l.id
 )`, m.SeriesID).Scan(&origin, &updatedAt, &bgmID, &extEntryID)
+		allowLegacy, _ := ctx.Value(rematchLegacyKey{}).(bool)
 		if errors.Is(err, sql.ErrNoRows) || origin == "manual" || origin == "agent" ||
-			(origin == "" && (bgmID > 0 || extEntryID != "")) ||
+			(!allowLegacy && origin == "" && (bgmID > 0 || extEntryID != "")) ||
 			err == nil && updatedAt != "" && !parseTime(updatedAt).Equal(m.UpdatedAt) {
 			return ErrMetadataChanged
 		}

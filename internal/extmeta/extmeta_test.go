@@ -1470,6 +1470,9 @@ func TestForceScrapePreservesProtectedBindings(t *testing.T) {
 		t.Helper()
 		for _, want := range protected {
 			got := readMetadata(t, store, want.SeriesID)
+			if want.SeriesID == "legacy-bangumi" {
+				want.ExtSourceID, want.ExtEntryID = src.ID, "101"
+			}
 			if got.ExtSourceID != want.ExtSourceID || got.ExtEntryID != want.ExtEntryID || got.MatchOrigin != want.MatchOrigin ||
 				got.ScrapeStatus != database.ScrapeStatusMatched || (want.BgmSubjectID != nil && (got.BgmSubjectID == nil || *got.BgmSubjectID != legacyID)) {
 				t.Fatalf("protected binding changed: %+v", got)
@@ -1489,8 +1492,8 @@ func TestForceScrapePreservesProtectedBindings(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForManager(t, func() bool { return m.ScrapeRuns()[0].CompletedAt != "" })
-	if done := m.ScrapeRuns()[0]; done.ID != extRun.ID || done.Status != "success" || done.TotalSeries != 1 ||
-		done.Matched != 1 || done.LibraryName != "main" || done.CurrentSeries != "Blue River" {
+	if done := m.ScrapeRuns()[0]; done.ID != extRun.ID || done.Status != "success" || done.TotalSeries != 3 ||
+		done.Matched != 3 || done.LibraryName != "main" || done.CurrentSeries != "Blue River" {
 		t.Fatalf("external force scrape = %+v", done)
 	}
 	assertProtected()

@@ -199,7 +199,7 @@ func (s *Server) patchBookCoverSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch req.CoverSource {
-	case database.CoverSourceAuto, "custom", "ext", database.CoverSourceBangumi, database.CoverSourceBook:
+	case database.CoverSourceAuto, "custom", "ext", "external", "archive", database.CoverSourceBangumi, database.CoverSourceBook:
 	default:
 		writeError(w, http.StatusBadRequest, "INVALID_COVER_SOURCE", "Unknown book cover source.")
 		return

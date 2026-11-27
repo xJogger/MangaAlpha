@@ -24,6 +24,8 @@ type Store struct {
 	unpagedBookThreshold int64
 
 	unionMu        sync.Mutex
+	coverCleanupMu sync.RWMutex
+	coverCleanup   func(context.Context, []string)
 	basicAuthMu    sync.RWMutex
 	basicAuthCache map[string]time.Time
 
@@ -602,6 +604,19 @@ func (s *Store) DeleteLibrary(ctx context.Context, id string) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE shelf_revision SET bulk_mode=1 WHERE id=1`); err != nil {
 		return err
 	}
+	cleanup := s.importedCoverCleanup()
+	var coverRefs []string
+	if cleanup != nil {
+		coverRefs, err = queryImportedCoverRefs(ctx, tx, `
+SELECT c.cover_ref FROM series s JOIN series_cover_candidates c ON c.series_id=s.id
+WHERE s.library_id=? AND c.cover_kind='imported_file'
+UNION
+SELECT c.cover_ref FROM books b JOIN book_cover_candidates c ON c.book_id=b.id
+WHERE b.library_id=? AND c.cover_kind='imported_file'`, id, id)
+		if err != nil {
+			return err
+		}
+	}
 	// Delete bottom-up so large libraries bypass per-row rollup/shelf trigger storms.
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM union_book_sources
@@ -628,7 +643,13 @@ WHERE union_series_id IN (SELECT id FROM series WHERE library_id=?)`, id); err !
 	if _, err := tx.ExecContext(ctx, `UPDATE shelf_revision SET bulk_mode=0, catalog=catalog+1, progress=progress+1 WHERE id=1`); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if len(coverRefs) > 0 {
+		cleanup(ctx, coverRefs)
+	}
+	return nil
 }
 
 func (s *Store) HiddenLibraryCount(ctx context.Context) (int64, error) {

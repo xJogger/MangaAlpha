@@ -13,32 +13,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func TestSQLiteBlobCoverRefEncodeDecode(t *testing.T) {
-	t.Parallel()
-
-	ref := EncodeSQLiteBlobCoverRef("src-1", SQLiteBlobKindKomgaSeries, "0ABC/123")
-	if ref != "sqlite-blob://src-1/komga-series/0ABC%2F123" {
-		t.Fatalf("unexpected encoded ref: %q", ref)
-	}
-	sid, kind, rid, ok := ParseSQLiteBlobCoverRef(ref)
-	if !ok || sid != "src-1" || kind != SQLiteBlobKindKomgaSeries || rid != "0ABC/123" {
-		t.Fatalf("ParseSQLiteBlobCoverRef failed: ok=%v sid=%q kind=%q rid=%q", ok, sid, kind, rid)
-	}
-
-	for _, bad := range []string{
-		"",
-		"https://example.test/cover.jpg",
-		"sqlite-blob://src/invalid-kind/123",
-		"sqlite-blob://../komga-series/123",
-		"sqlite-blob://src/komga-book/",
-		"sqlite-blob://src/komga-book",
-	} {
-		if _, _, _, ok := ParseSQLiteBlobCoverRef(bad); ok {
-			t.Errorf("expected invalid blob ref %q to fail", bad)
-		}
-	}
-}
-
 func TestKomgaSQLiteReadOnlyExtractionWALAndThumbnails(t *testing.T) {
 	t.Parallel()
 
@@ -175,7 +149,7 @@ INSERT INTO THUMBNAIL_BOOK VALUES
 	if err != nil {
 		t.Fatalf("ProbeSQLiteFile(komga): %v", err)
 	}
-	if probe.Format != FormatKomgaSQLite || probe.EntryCount != 4 || probe.BookCount != 3 || !probe.HasCoverBlobs || probe.WALWarning {
+	if probe.Format != FormatKomgaSQLite || probe.EntryCount != 4 || probe.BookCount != 0 || !probe.HasCoverBlobs || probe.WALWarning {
 		t.Fatalf("unexpected Komga probe result: %+v", probe)
 	}
 
@@ -240,7 +214,12 @@ INSERT INTO THUMBNAIL_BOOK VALUES
 		t.Fatal(err)
 	}
 	if _, err := odb.Exec(`
+CREATE TABLE SERIES (ID TEXT PRIMARY KEY);
+CREATE TABLE SERIES_METADATA (SERIES_ID TEXT);
+CREATE TABLE BOOK (ID TEXT PRIMARY KEY);
+CREATE TABLE BOOK_METADATA (BOOK_ID TEXT);
 CREATE TABLE THUMBNAIL_SERIES (ID TEXT PRIMARY KEY, SERIES_ID TEXT, MEDIA_TYPE TEXT, THUMBNAIL BLOB);
+INSERT INTO SERIES VALUES ('s1');
 INSERT INTO THUMBNAIL_SERIES VALUES ('huge', 's1', 'image/jpeg', zeroblob(16*1024*1024 + 1));
 `); err != nil {
 		t.Fatal(err)
@@ -421,7 +400,7 @@ INSERT INTO books VALUES(
 		e2.Language != "ja" || e2.ReleaseDate != "2002-10-10" || e2.ReadingDirection != "RIGHT_TO_LEFT" ||
 		e2.TotalBookCount == nil || *e2.TotalBookCount != 12 || e2.AgeRating == nil || *e2.AgeRating != 13 ||
 		len(e2.Links) != 1 || len(e2.SharingLabels) != 1 || !e2.HasCoverBlob ||
-		e2.CoverURL != "sqlite-blob://src-v2/open-entry/s1" {
+		e2.CoverURL != "" {
 		t.Fatalf("unexpected extended v2 entry: %+v", e2)
 	}
 
@@ -434,13 +413,13 @@ INSERT INTO books VALUES(
 		t.Fatalf("unexpected open book entry: %+v", books[0])
 	}
 
-	eb, eMIME, err := ReadOpenCoverBLOB(ctx, v2Path, SQLiteBlobKindOpenEntry, "s1")
+	eb, eMIME, err := readOpenCoverBLOB(ctx, roV2, SQLiteBlobKindOpenEntry, "s1", "")
 	if err != nil || eMIME != "image/jpeg" || !bytes.Equal(eb, validJPEG) {
-		t.Fatalf("ReadOpenCoverBLOB entry failed: mime=%q err=%v", eMIME, err)
+		t.Fatalf("open entry BLOB failed: mime=%q err=%v", eMIME, err)
 	}
-	bb, bMIME, err := ReadOpenCoverBLOB(ctx, v2Path, SQLiteBlobKindOpenBook, "vol-1")
+	bb, bMIME, err := readOpenCoverBLOB(ctx, roV2, SQLiteBlobKindOpenBook, "s1", "vol-1")
 	if err != nil || bMIME != "image/png" || !bytes.Equal(bb, validPNG) {
-		t.Fatalf("ReadOpenCoverBLOB book failed: mime=%q err=%v", bMIME, err)
+		t.Fatalf("open book BLOB failed: mime=%q err=%v", bMIME, err)
 	}
 
 	// 3. ProbeSQLiteFile detects tag_translation_text_v1 (.json.gz) and rejects unknown payloads.
@@ -565,21 +544,16 @@ CREATE TABLE books(series_entry_id TEXT, book_key TEXT, cover_blob BLOB, PRIMARY
 INSERT INTO entries VALUES ('a:b'),('a'),('a/b'),('literal');
 INSERT INTO books VALUES ('a:b','c',?),('a','b:c',?),('a/b','v/01',?),('literal','plain:key',?);`,
 		encodeTestPNG(t), encodeTestJPEG(t), encodeTestPNG(t), encodeTestJPEG(t))
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct{ key, mediaType string }{
-		{openBookCoverKey("a:b", "c"), "image/png"},
-		{openBookCoverKey("a", "b:c"), "image/jpeg"},
-		{openBookCoverKey("a/b", "v/01"), "image/png"},
-		{"plain:key", "image/jpeg"},
+	defer db.Close()
+	for _, tc := range []struct{ series, book, mediaType string }{
+		{"a:b", "c", "image/png"}, {"a", "b:c", "image/jpeg"}, {"a/b", "v/01", "image/png"}, {"literal", "plain:key", "image/jpeg"},
 	} {
-		_, mediaType, err := ReadOpenCoverBLOB(t.Context(), dbPath, SQLiteBlobKindOpenBook, tc.key)
+		_, mediaType, err := readOpenCoverBLOB(t.Context(), db, SQLiteBlobKindOpenBook, tc.series, tc.book)
 		if err != nil || mediaType != tc.mediaType {
-			t.Fatalf("cover key %q resolved to %q: %v", tc.key, mediaType, err)
+			t.Fatalf("cover for %q/%q returned %q: %v", tc.series, tc.book, mediaType, err)
 		}
 	}
-	if _, _, err := ReadOpenCoverBLOB(t.Context(), dbPath, SQLiteBlobKindOpenBook, "a:b:c"); !errors.Is(err, ErrEntryNotFound) {
-		t.Fatalf("ambiguous old compound key accepted: %v", err)
+	if _, _, err := readOpenCoverBLOB(t.Context(), db, SQLiteBlobKindOpenBook, "a:b", "b:c"); !errors.Is(err, ErrEntryNotFound) {
+		t.Fatalf("wrong parent book accepted: %v", err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/xJogger/fake-komga-115/internal/archive"
@@ -107,12 +108,19 @@ func (m *Manager) batchSeries(ctx context.Context, run *Run, seriesID string, op
 	}
 	var matches map[string]thumbnail.VolumeMatchResult
 	var matchErr error
-	if run.Operation == OperationBatchBookCovers {
+	var coverCandidates map[string][]database.BookCoverCandidate
+	if run.Operation == OperationBatchBookCovers && options.FallbackPage1 && !options.Force {
+		coverCandidates, err = m.store.ListBookCoverCandidatesBySeries(ctx, seriesID)
+		if err != nil {
+			return err
+		}
+	}
+	if run.Operation == OperationBatchBookCovers && !options.FallbackPage1 {
 		matches, matchErr = m.matchSeriesVolumes(ctx, series)
 	}
 	return m.eachBookPage(ctx, series, func(books []database.Book) error {
 		var metas map[string]database.BookMetadata
-		if run.Operation == OperationBatchBookCovers {
+		if run.Operation == OperationBatchBookCovers && !options.FallbackPage1 {
 			metas, err = m.bookMetadataPage(ctx, books)
 			if err != nil {
 				return err
@@ -128,6 +136,12 @@ func (m *Manager) batchSeries(ctx context.Context, run *Run, seriesID string, op
 			run.CurrentItem = book.Name
 			switch run.Operation {
 			case OperationBatchBookCovers:
+				if options.FallbackPage1 {
+					if options.Force || !slices.ContainsFunc(coverCandidates[book.ID], func(c database.BookCoverCandidate) bool { return c.CoverKind == database.CoverKindImportedFile }) {
+						generated, err = m.batchPageOne(ctx, book, options.Force)
+					}
+					break
+				}
 				meta := metas[book.ID]
 				match, found := matches[book.ID]
 				var candidate *thumbnail.VolumeMatchResult
@@ -193,12 +207,7 @@ func (m *Manager) batchBookCover(ctx context.Context, book database.Book, meta d
 	if coverErr == nil && len(cover.Bytes) > 0 {
 		return generated, nil
 	}
-	if options.FallbackPage1 && !hasUserCover {
-		if covered, err := m.thumbs.HasSourceBookBangumiCover(ctx, book); err != nil || covered {
-			return false, err
-		}
-		return m.batchPageOne(ctx, book)
-	}
+
 	if coverErr != nil {
 		return false, coverErr
 	}
@@ -214,14 +223,16 @@ func (m *Manager) batchBookComicInfo(ctx context.Context, book database.Book, op
 		status == archive.ComicInfoSkippedEncrypted || status == archive.ComicInfoSkippedUnsupported {
 		return parsed, nil
 	}
-	generated, pageErr := m.batchPageOne(ctx, book)
+	generated, pageErr := m.batchPageOne(ctx, book, false)
 	return parsed || generated, pageErr
 }
 
-func (m *Manager) batchPageOne(ctx context.Context, book database.Book) (bool, error) {
-	valid, err := m.thumbs.HasBookThumbnail(ctx, book)
-	if err != nil || valid {
-		return false, err
+func (m *Manager) batchPageOne(ctx context.Context, book database.Book, force bool) (bool, error) {
+	if !force {
+		valid, err := m.thumbs.HasBookThumbnail(ctx, book)
+		if err != nil || valid {
+			return false, err
+		}
 	}
 	page, err := m.archive.ReadPage(archive.WithoutComicInfoCaching(ctx), book, 1)
 	switch {
@@ -232,7 +243,7 @@ func (m *Manager) batchPageOne(ctx context.Context, book database.Book) (bool, e
 	case err != nil:
 		return false, err
 	}
-	if err := m.thumbs.GenerateBookThumbnail(ctx, book, page.Data); err != nil {
+	if err := m.thumbs.GenerateBookThumbnailWithOptions(ctx, book, page.Data, force); err != nil {
 		return false, err
 	}
 	return true, nil

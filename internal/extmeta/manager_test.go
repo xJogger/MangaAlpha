@@ -512,7 +512,7 @@ func TestManagerOfflineChainMappingAndManualProtection(t *testing.T) {
 		persisted.Status != "success" || persisted.StartedAt != run.StartedAt || persisted.CompletedAt == "" {
 		t.Fatalf("persisted scrape = %+v", persisted)
 	}
-	if byID, err := reopened.ScrapeRunByID(ctx, run.ID); err != nil || byID != persisted {
+	if byID, err := reopened.ScrapeRunByID(ctx, run.ID); err != nil || !reflect.DeepEqual(byID, persisted) {
 		t.Fatalf("scrape by ID = %+v, err = %v", byID, err)
 	}
 	var mode, createdAt string
@@ -535,7 +535,7 @@ func TestManagerOfflineChainMappingAndManualProtection(t *testing.T) {
 	}
 }
 
-func TestManagerNonEmptyMappingAllowsScrapeWithoutOtherSources(t *testing.T) {
+func TestManagerMappingRequiresReadyTarget(t *testing.T) {
 	client := &http.Client{Transport: managerTransport(func(r *http.Request) (*http.Response, error) {
 		body := `{"schema":"mangaalpha_mapping_v1","key":"Blue River","targetSource":"bangumi","targetId":"42"}`
 		return managerResponse(r, http.StatusOK, strings.NewReader(body)), nil
@@ -549,17 +549,8 @@ func TestManagerNonEmptyMappingAllowsScrapeWithoutOtherSources(t *testing.T) {
 		t.Fatal(err)
 	}
 	syncManagerFixture(t, m, src, false, "success")
-	run, err := m.StartMultiScrape(t.Context(), "", "", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitForManager(t, func() bool { return m.ScrapeRuns()[0].CompletedAt != "" })
-	var libraryID sql.NullString
-	if err := store.DB().QueryRow("SELECT library_id FROM bangumi_scrape_runs WHERE id=?", run.ID).Scan(&libraryID); err != nil || libraryID.Valid {
-		t.Fatalf("stored all-library ID = %+v, err = %v", libraryID, err)
-	}
-	if done := m.ScrapeRuns()[0]; done.LibraryName != "全部未隐藏书库" || done.Status != "success" {
-		t.Fatalf("all-library scrape = %+v", done)
+	if _, err := m.StartMultiScrape(t.Context(), "", "", false); !errors.Is(err, ErrNoReadySources) {
+		t.Fatalf("mapping-only scrape: %v", err)
 	}
 }
 

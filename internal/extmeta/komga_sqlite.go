@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -25,7 +24,7 @@ const (
 	// FormatTagDictV1 identifies tag_translation_text_v1 JSON/gzipped dictionaries.
 	FormatTagDictV1 = "tag_translation_text_v1"
 
-	// SQLiteBlobCoverPrefix is the virtual cover URI scheme for covers stored inside offline SQLite BLOBs.
+	// SQLiteBlobCoverPrefix identifies obsolete virtual cover references.
 	SQLiteBlobCoverPrefix     = "sqlite-blob://"
 	SQLiteBlobKindKomgaSeries = "komga-series"
 	SQLiteBlobKindKomgaBook   = "komga-book"
@@ -55,6 +54,7 @@ type KomgaAuthor struct {
 
 // KomgaBookEntry holds series-scoped book metadata extracted from a Komga database.sqlite.
 type KomgaBookEntry struct {
+	DefaultTitle        bool          `json:"-"`
 	KomgaBookID         string        `json:"komgaBookId"`
 	Name                string        `json:"name"`
 	URL                 string        `json:"url"`
@@ -72,29 +72,30 @@ type KomgaBookEntry struct {
 
 // KomgaSeriesEntry holds complete series and book metadata extracted from a Komga database.sqlite.
 type KomgaSeriesEntry struct {
-	KomgaSeriesID       string                `json:"komgaSeriesId"`
-	Name                string                `json:"name"`
-	URL                 string                `json:"url"`
-	OneShot             bool                  `json:"oneShot"`
-	Status              string                `json:"status"`
-	Title               string                `json:"title"`
-	TitleSort           string                `json:"titleSort"`
-	Summary             string                `json:"summary"`
-	ReadingDirection    string                `json:"readingDirection"`
-	Publisher           string                `json:"publisher"`
-	AgeRating           *int                  `json:"ageRating,omitempty"`
-	Language            string                `json:"language"`
-	TotalBookCount      *int                  `json:"totalBookCount,omitempty"`
-	ReleaseDate         string                `json:"releaseDate"`
-	Genres              []string              `json:"genres,omitempty"`
-	Tags                []string              `json:"tags,omitempty"`
-	SharingLabels       []string              `json:"sharingLabels,omitempty"`
-	Links               []KomgaLink           `json:"links,omitempty"`
-	AlternateTitles     []KomgaAlternateTitle `json:"alternateTitles,omitempty"`
-	Authors             []KomgaAuthor         `json:"authors,omitempty"`
-	NSFW                bool                  `json:"nsfw"`
-	SelectedThumbnailID string                `json:"selectedThumbnailId,omitempty"`
-	Books               []KomgaBookEntry      `json:"books,omitempty"`
+	DefaultTitle, DefaultStatus bool
+	KomgaSeriesID               string                `json:"komgaSeriesId"`
+	Name                        string                `json:"name"`
+	URL                         string                `json:"url"`
+	OneShot                     bool                  `json:"oneShot"`
+	Status                      string                `json:"status"`
+	Title                       string                `json:"title"`
+	TitleSort                   string                `json:"titleSort"`
+	Summary                     string                `json:"summary"`
+	ReadingDirection            string                `json:"readingDirection"`
+	Publisher                   string                `json:"publisher"`
+	AgeRating                   *int                  `json:"ageRating,omitempty"`
+	Language                    string                `json:"language"`
+	TotalBookCount              *int                  `json:"totalBookCount,omitempty"`
+	ReleaseDate                 string                `json:"releaseDate"`
+	Genres                      []string              `json:"genres,omitempty"`
+	Tags                        []string              `json:"tags,omitempty"`
+	SharingLabels               []string              `json:"sharingLabels,omitempty"`
+	Links                       []KomgaLink           `json:"links,omitempty"`
+	AlternateTitles             []KomgaAlternateTitle `json:"alternateTitles,omitempty"`
+	Authors                     []KomgaAuthor         `json:"authors,omitempty"`
+	NSFW                        bool                  `json:"nsfw"`
+	SelectedThumbnailID         string                `json:"selectedThumbnailId,omitempty"`
+	Books                       []KomgaBookEntry      `json:"books,omitempty"`
 }
 
 // KomgaSchemaInfo summarizes detected required and optional tables in a Komga SQLite file.
@@ -122,48 +123,6 @@ func DetectSQLiteWALWarning(dbPath string) (bool, int64) {
 		return false, 0
 	}
 	return true, info.Size()
-}
-
-// EncodeSQLiteBlobCoverRef encodes a virtual sqlite-blob:// cover reference.
-func EncodeSQLiteBlobCoverRef(sourceID, kind, recordID string) string {
-	sourceID = strings.TrimSpace(sourceID)
-	kind = strings.TrimSpace(kind)
-	recordID = strings.TrimSpace(recordID)
-	if sourceID == "" || kind == "" || recordID == "" {
-		return ""
-	}
-	return SQLiteBlobCoverPrefix + url.PathEscape(sourceID) + "/" + url.PathEscape(kind) + "/" + url.PathEscape(recordID)
-}
-
-// ParseSQLiteBlobCoverRef decodes and validates a sqlite-blob://<sourceID>/<kind>/<recordID> reference.
-func ParseSQLiteBlobCoverRef(raw string) (sourceID, kind, recordID string, ok bool) {
-	trimmed := strings.TrimSpace(raw)
-	if !strings.HasPrefix(trimmed, SQLiteBlobCoverPrefix) {
-		return "", "", "", false
-	}
-	rest := strings.TrimPrefix(trimmed, SQLiteBlobCoverPrefix)
-	parts := strings.SplitN(rest, "/", 3)
-	if len(parts) != 3 {
-		return "", "", "", false
-	}
-	s, err1 := url.PathUnescape(parts[0])
-	k, err2 := url.PathUnescape(parts[1])
-	r, err3 := url.PathUnescape(parts[2])
-	if err1 != nil || err2 != nil || err3 != nil {
-		return "", "", "", false
-	}
-	s = strings.TrimSpace(s)
-	k = strings.TrimSpace(k)
-	r = strings.TrimSpace(r)
-	if s == "" || r == "" || strings.Contains(s, "/") || s == "." || s == ".." {
-		return "", "", "", false
-	}
-	switch k {
-	case SQLiteBlobKindKomgaSeries, SQLiteBlobKindKomgaBook, SQLiteBlobKindOpenEntry, SQLiteBlobKindOpenBook:
-	default:
-		return "", "", "", false
-	}
-	return s, k, r, true
 }
 
 func openKomgaReadOnlySQLite(dbPath string) (*sql.DB, error) {
@@ -268,7 +227,14 @@ func ReadKomgaSeries(ctx context.Context, db *sql.DB, seriesID string) (*KomgaSe
 	if err != nil {
 		return nil, err
 	}
-	entries, err := queryKomgaSeries(ctx, db, schemaInfo, seriesID, true)
+	return readKomgaSeries(ctx, db, schemaInfo, seriesID, true, true)
+}
+
+func readKomgaSeries(ctx context.Context, db sqliteQueryer, schemaInfo KomgaSchemaInfo, seriesID string, books, covers bool) (*KomgaSeriesEntry, error) {
+	if strings.TrimSpace(seriesID) == "" {
+		return nil, ErrEntryNotFound
+	}
+	entries, err := queryKomgaSeries(ctx, db, schemaInfo, seriesID, books, covers)
 	if err != nil {
 		return nil, err
 	}
@@ -284,10 +250,10 @@ func ReadKomgaAllSeries(ctx context.Context, db *sql.DB) ([]KomgaSeriesEntry, er
 	if err != nil {
 		return nil, err
 	}
-	return queryKomgaSeries(ctx, db, schemaInfo, "", true)
+	return queryKomgaSeries(ctx, db, schemaInfo, "", true, true)
 }
 
-func queryKomgaSeries(ctx context.Context, db sqliteQueryer, info KomgaSchemaInfo, onlySeriesID string, includeBooks bool) ([]KomgaSeriesEntry, error) {
+func queryKomgaSeries(ctx context.Context, db sqliteQueryer, info KomgaSchemaInfo, onlySeriesID string, includeBooks, includeCovers bool) ([]KomgaSeriesEntry, error) {
 	seriesCols, err := tableColumns(ctx, db, "SERIES")
 	if err != nil {
 		return nil, err
@@ -318,7 +284,7 @@ func queryKomgaSeries(ctx context.Context, db sqliteQueryer, info KomgaSchemaInf
 
 	query := fmt.Sprintf(`
 SELECT s.ID, %s, %s, %s,
-       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
 FROM SERIES s
 LEFT JOIN SERIES_METADATA sm ON sm.SERIES_ID = s.ID
 WHERE 1=1`,
@@ -335,10 +301,9 @@ WHERE 1=1`,
 		colOrEmpty(metaCols, "sm", "LANGUAGE"),
 		colOrNullInt(metaCols, "sm", "TOTAL_BOOK_COUNT"),
 		colOrEmpty(metaCols, "sm", "RELEASE_DATE"),
+		colOrZero(metaCols, "sm", "TITLE_LOCK"), colOrZero(metaCols, "sm", "STATUS_LOCK"),
 	)
-	if seriesCols["deleted"] {
-		query += " AND COALESCE(s.DELETED, 0) = 0"
-	}
+	query += komgaActive("s", seriesCols)
 	var args []any
 	if onlySeriesID != "" {
 		query += " AND s.ID = ?"
@@ -356,16 +321,16 @@ WHERE 1=1`,
 	indexByID := make(map[string]int)
 	for rows.Next() {
 		var (
-			entry          KomgaSeriesEntry
-			oneShot        int
-			ageRating      sql.NullInt64
-			totalBookCount sql.NullInt64
+			entry                          KomgaSeriesEntry
+			oneShot, titleLock, statusLock int
+			ageRating                      sql.NullInt64
+			totalBookCount                 sql.NullInt64
 		)
 		if err := rows.Scan(
 			&entry.KomgaSeriesID, &entry.Name, &entry.URL, &oneShot,
 			&entry.Status, &entry.Title, &entry.TitleSort, &entry.Summary,
 			&entry.ReadingDirection, &entry.Publisher, &ageRating,
-			&entry.Language, &totalBookCount, &entry.ReleaseDate,
+			&entry.Language, &totalBookCount, &entry.ReleaseDate, &titleLock, &statusLock,
 		); err != nil {
 			return nil, err
 		}
@@ -378,6 +343,8 @@ WHERE 1=1`,
 		if entry.Title == "" {
 			entry.Title = entry.Name
 		}
+		entry.DefaultTitle = titleLock == 0 && strings.EqualFold(entry.Title, entry.Name)
+		entry.DefaultStatus = statusLock == 0 && strings.EqualFold(entry.Status, "ONGOING")
 		entry.TitleSort = strings.TrimSpace(entry.TitleSort)
 		if entry.TitleSort == "" {
 			entry.TitleSort = entry.Title
@@ -405,6 +372,10 @@ WHERE 1=1`,
 		return nil, nil
 	}
 
+	rows.Close()
+	if !includeCovers {
+		info.HasThumbnailSeries, info.HasThumbnailBook = false, false
+	}
 	if err := loadKomgaSeriesSubtables(ctx, db, info, onlySeriesID, seriesList, indexByID); err != nil {
 		return nil, err
 	}
@@ -546,13 +517,9 @@ func loadKomgaSeriesSubtables(
 		if err != nil {
 			return err
 		}
-		orderExpr := "ROWID ASC"
+		orderExpr := "ID ASC"
 		if thumbCols["selected"] {
-			if thumbCols["type"] {
-				orderExpr = "COALESCE(SELECTED, 0) DESC, CASE WHEN TYPE='USER_UPLOADED' THEN 0 ELSE 1 END, ROWID ASC"
-			} else {
-				orderExpr = "COALESCE(SELECTED, 0) DESC, ROWID ASC"
-			}
+			orderExpr = "COALESCE(SELECTED, 0) DESC, " + orderExpr
 		}
 		q := "SELECT ID, SERIES_ID FROM THUMBNAIL_SERIES"
 		var args []any
@@ -607,14 +574,24 @@ func loadKomgaBooks(
 		}
 		return "''"
 	}
+	titleLockExpr := "0"
+	if bmCols["title_lock"] {
+		titleLockExpr = "COALESCE(bm.TITLE_LOCK, 0)"
+	}
 	numSortExpr := "NULL"
 	if bmCols["number_sort"] {
 		numSortExpr = "bm.NUMBER_SORT"
 	}
+	numberExpr := colOrEmpty(bmCols, "bm", "NUMBER")
+	bookNumber := "NULL"
+	if bookCols["number"] {
+		bookNumber = "NULLIF(CAST(b.NUMBER AS REAL), 0)"
+		numberExpr = "COALESCE(NULLIF(TRIM(" + numberExpr + "), ''), NULLIF(b.NUMBER,0), '')"
+	}
 
 	q := fmt.Sprintf(`
 SELECT b.ID, b.SERIES_ID, %s, %s,
-       %s, %s, %s, %s, %s, %s
+       %s, %s, %s, %s, %s, %s, %s
 FROM BOOK b
 LEFT JOIN BOOK_METADATA bm ON bm.BOOK_ID = b.ID
 WHERE 1=1`,
@@ -622,24 +599,19 @@ WHERE 1=1`,
 		colOrEmpty(bookCols, "b", "URL"),
 		colOrEmpty(bmCols, "bm", "TITLE"),
 		colOrEmpty(bmCols, "bm", "SUMMARY"),
-		colOrEmpty(bmCols, "bm", "NUMBER"),
+		numberExpr,
 		numSortExpr,
 		colOrEmpty(bmCols, "bm", "RELEASE_DATE"),
-		colOrEmpty(bmCols, "bm", "ISBN"),
+		colOrEmpty(bmCols, "bm", "ISBN"), titleLockExpr,
 	)
-	if bookCols["deleted"] {
-		q += " AND COALESCE(b.DELETED, 0) = 0"
-	}
+	q += komgaActive("b", bookCols)
 	var args []any
 	if onlySeriesID != "" {
 		q += " AND b.SERIES_ID = ?"
 		args = append(args, onlySeriesID)
 	}
-	if bmCols["number_sort"] {
-		q += " ORDER BY COALESCE(bm.NUMBER_SORT, 1e18) ASC, b.ROWID ASC"
-	} else {
-		q += " ORDER BY b.ROWID ASC"
-	}
+	q += " ORDER BY COALESCE(NULLIF(" + numSortExpr + ",0), " + bookNumber + ", 1e18), COALESCE(" + bookNumber + ", 1e18), "
+	q += colOrEmpty(bookCols, "b", "NAME") + " COLLATE NOCASE, b.ID"
 
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -654,13 +626,14 @@ WHERE 1=1`,
 	locByBookID := make(map[string]bookLoc)
 	for rows.Next() {
 		var (
-			b       KomgaBookEntry
-			sid     string
-			numSort sql.NullFloat64
+			b         KomgaBookEntry
+			sid       string
+			numSort   sql.NullFloat64
+			titleLock int
 		)
 		if err := rows.Scan(
 			&b.KomgaBookID, &sid, &b.Name, &b.URL,
-			&b.Title, &b.Summary, &b.Number, &numSort, &b.ReleaseDate, &b.ISBN,
+			&b.Title, &b.Summary, &b.Number, &numSort, &b.ReleaseDate, &b.ISBN, &titleLock,
 		); err != nil {
 			return err
 		}
@@ -672,6 +645,7 @@ WHERE 1=1`,
 		b.Name = strings.TrimSpace(b.Name)
 		b.URL = strings.TrimSpace(b.URL)
 		b.Title = strings.TrimSpace(b.Title)
+		b.DefaultTitle = titleLock == 0 && (strings.EqualFold(b.Title, stripBookArchiveExt(b.Name)) || strings.EqualFold(b.Title, stripBookArchiveExt(komgaPathTail(b.URL))))
 		b.Summary = strings.TrimSpace(b.Summary)
 		b.Number = strings.TrimSpace(b.Number)
 		b.ReleaseDate = strings.TrimSpace(b.ReleaseDate)
@@ -694,7 +668,7 @@ WHERE 1=1`,
 	whereClause := ""
 	var subArgs []any
 	if onlySeriesID != "" {
-		whereClause = " WHERE BOOK_ID IN (SELECT ID FROM BOOK WHERE SERIES_ID = ?)"
+		whereClause = " WHERE BOOK_ID IN (SELECT b.ID FROM BOOK b WHERE b.SERIES_ID = ?" + komgaActive("b", bookCols) + ")"
 		subArgs = append(subArgs, onlySeriesID)
 	}
 
@@ -783,13 +757,9 @@ WHERE 1=1`,
 		if err != nil {
 			return err
 		}
-		orderExpr := "ROWID ASC"
+		orderExpr := "ID ASC"
 		if thumbCols["selected"] {
-			if thumbCols["type"] {
-				orderExpr = "COALESCE(SELECTED, 0) DESC, CASE WHEN TYPE='USER_UPLOADED' THEN 0 ELSE 1 END, ROWID ASC"
-			} else {
-				orderExpr = "COALESCE(SELECTED, 0) DESC, ROWID ASC"
-			}
+			orderExpr = "COALESCE(SELECTED, 0) DESC, " + orderExpr
 		}
 		trows, err := db.QueryContext(ctx, "SELECT ID, BOOK_ID FROM THUMBNAIL_BOOK"+whereClause+" ORDER BY "+orderExpr, subArgs...)
 		if err != nil {
@@ -882,11 +852,18 @@ func komgaCoverRating(ctx context.Context, db sqliteQueryer, kind, thumbID, entr
 	case SQLiteBlobKindKomgaSeries:
 		query = `SELECT SERIES_ID, SERIES_ID FROM THUMBNAIL_SERIES WHERE ID=?`
 	case SQLiteBlobKindKomgaBook:
-		query = `SELECT b.ID, b.SERIES_ID FROM THUMBNAIL_BOOK t JOIN BOOK b ON b.ID=t.BOOK_ID WHERE t.ID=?`
+		cols, err := tableColumns(ctx, db, "BOOK")
+		if err != nil {
+			return false, err
+		}
+		query = `SELECT b.ID, b.SERIES_ID FROM THUMBNAIL_BOOK t JOIN BOOK b ON b.ID=t.BOOK_ID WHERE t.ID=?` + komgaActive("b", cols)
 	default:
 		return false, ErrInvalidConfig
 	}
 	if err := db.QueryRowContext(ctx, query, thumbID).Scan(&ownerID, &seriesID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, ErrEntryNotFound
+		}
 		return false, err
 	}
 	if seriesID == "" || (entryID != "" && ownerID != entryID) || (parentEntryID != "" && seriesID != parentEntryID) {
@@ -896,7 +873,7 @@ func komgaCoverRating(ctx context.Context, db sqliteQueryer, kind, thumbID, entr
 	if err != nil {
 		return false, err
 	}
-	entries, err := queryKomgaSeries(ctx, db, info, seriesID, false)
+	entries, err := queryKomgaSeries(ctx, db, info, seriesID, false, false)
 	if err != nil {
 		return false, err
 	}
@@ -914,7 +891,24 @@ func ReadKomgaThumbnailBLOB(ctx context.Context, dbPath, kind, thumbID string) (
 		return nil, "", err
 	}
 	defer db.Close()
-	return readKomgaThumbnailBLOB(ctx, db, kind, thumbID)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	defer tx.Rollback()
+	if _, err := komgaCoverRating(ctx, tx, kind, thumbID, "", ""); err != nil {
+		return nil, "", err
+	}
+	return readKomgaThumbnailBLOB(ctx, tx, kind, thumbID)
+}
+
+// readKomgaSeriesThumbnail uses IDs selected from the same read transaction.
+func readKomgaSeriesThumbnail(ctx context.Context, db sqliteQueryer, series *KomgaSeriesEntry) ([]byte, string, error) {
+	raw, media, err := readKomgaThumbnailBLOB(ctx, db, SQLiteBlobKindKomgaSeries, series.SelectedThumbnailID)
+	if errors.Is(err, ErrEntryNotFound) && len(series.Books) > 0 {
+		return readKomgaThumbnailBLOB(ctx, db, SQLiteBlobKindKomgaBook, series.Books[0].SelectedThumbnailID)
+	}
+	return raw, media, err
 }
 
 func readKomgaThumbnailBLOB(ctx context.Context, db sqliteQueryer, kind, thumbID string) ([]byte, string, error) {
@@ -1027,4 +1021,15 @@ func tableColumns(ctx context.Context, db sqliteQueryer, tableName string) (map[
 
 func isValidKomgaOpenSchemaTarget(s string) bool {
 	return slices.Contains([]string{FormatKomgaSQLite, FormatOpenV1, FormatOpenV2, SchemaGalleryV1, FormatTagDictV1}, s)
+}
+
+func komgaActive(alias string, cols map[string]bool) string {
+	filter := ""
+	if cols["deleted_date"] {
+		filter += " AND (" + alias + ".DELETED_DATE IS NULL OR TRIM(" + alias + ".DELETED_DATE) = '')"
+	}
+	if cols["deleted"] {
+		filter += " AND COALESCE(" + alias + ".DELETED, 0) = 0"
+	}
+	return filter
 }

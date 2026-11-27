@@ -168,7 +168,7 @@ func TestMetadataScrapeRejectsEmptyMappingSource(t *testing.T) {
 }
 
 func TestMetadataAdminRoutesBindingExportAndCovers(t *testing.T) {
-	srv, store, bgm, _ := setupV27TestServer(t, "")
+	srv, store, bgm := newV27TestServer(t, "")
 	ctx := context.Background()
 	root := srv.runtime.DataDir
 	if _, err := store.ClaimAdmin(ctx, "fixture-owner", "FixturePassword123!"); err != nil {
@@ -213,9 +213,9 @@ func TestMetadataAdminRoutesBindingExportAndCovers(t *testing.T) {
 		case "/good.png":
 			coverCalls.Add(1)
 			_, _ = w.Write(png)
-		case "/blocked.png", "/other.png":
+		case "/blocked.png", "/other.png", "/restricted.png":
 			coverCalls.Add(1)
-			w.WriteHeader(http.StatusTooManyRequests)
+			w.WriteHeader(http.StatusServiceUnavailable)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -373,6 +373,11 @@ VALUES('first','work','catalog','first.cbz','fixture','first.cbz',?,'',1,?,?,'sc
 	if got := coverCalls.Load(); got != 1 {
 		t.Fatalf("external cover cache missed: %d requests", got)
 	}
+	bind("104")
+	call("GET", thumbnailPath, readerKey, nil, http.StatusNotFound)
+	if coverCalls.Load() != 1 {
+		t.Fatal("NSFW series attempted an external fetch")
+	}
 	bind("102")
 	admin("GET", sourcePath+"/entries/102/cover", nil, http.StatusServiceUnavailable)
 	bind("103")
@@ -385,14 +390,12 @@ VALUES('first','work','catalog','first.cbz','fixture','first.cbz',?,'',1,?,?,'sc
 	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM zip_indexes`).Scan(&indexedBooks); err != nil || indexedBooks != 0 {
 		t.Fatalf("thumbnail fallback implicitly opened archive: zip_indexes=%d err=%v", indexedBooks, err)
 	}
-	bind("104")
-	call("GET", thumbnailPath, readerKey, nil, http.StatusNotFound)
-	if coverCalls.Load() != 2 {
-		t.Fatal("NSFW series attempted an external fetch")
-	}
 	clear := decodeMetadataFixture[database.SeriesMetadata](t, admin("DELETE", "/series/work/metadata/bind", nil, http.StatusOK))
 	if clear.ExtEntryID != "" || clear.ExtSourceID != "" || clear.MatchOrigin != "" {
 		t.Fatalf("cleared binding = %+v", clear)
+	}
+	if candidates, err := store.ListSeriesCoverCandidates(ctx, "work"); err != nil || len(candidates) != 0 {
+		t.Fatalf("cleared cover candidates = %+v, %v", candidates, err)
 	}
 	admin("GET", "/metadata/overview", nil, http.StatusOK)
 	admin("GET", "/metadata/syncs", nil, http.StatusOK)
@@ -451,14 +454,14 @@ INSERT INTO entries(id,title,cover_url,is_nsfw) VALUES
  ('101','Blue River','https://upstream.example.test/good.png',0),
  ('102','Second Entry','https://upstream.example.test/blocked.png',0),
  ('103','Third Entry','https://upstream.example.test/other.png',0),
- ('104','Restricted Entry','https://upstream.example.test/other.png',1);
+ ('104','Restricted Entry','https://upstream.example.test/restricted.png',1);
 `); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestMetadataSourcesListUploadWALAndBlobCoverHTTP(t *testing.T) {
-	srv, store, bgm, _ := setupV27TestServer(t, "")
+	srv, store, bgm := newV27TestServer(t, "")
 	ctx := t.Context()
 	if _, err := store.ClaimAdmin(ctx, "fixture-owner", "FixturePassword123!"); err != nil {
 		t.Fatal(err)
@@ -593,20 +596,20 @@ INSERT INTO entries VALUES ('oe1','Open Entry','','[]','','[]','Manga','',9,0,1,
 	}
 	// 3. Upload raw komga.sqlite with file part BEFORE config fields -> 201 Created.
 	upResp := makeUploadReq(adminKey, "komga.sqlite", komgaRaw, false, [][2]string{
-		{"name", "Uploaded Komga"}, {"tagDictSourceId", dict.ID},
+		{"name", "Uploaded Komga"}, {"tagDictSourceId", dict.ID}, {"importCovers", "true"},
 	})
 	if upResp.Code != http.StatusCreated {
 		t.Fatalf("komga upload status = %d, want 201: %s", upResp.Code, upResp.Body.String())
 	}
 	createdView := decodeMetadataFixture[extmeta.SourceView](t, upResp)
-	if createdView.ID == "" || createdView.SchemaFormat != extmeta.FormatKomgaSQLite || !createdView.Ready || createdView.EntryCount != 1 {
+	if createdView.ID == "" || createdView.SchemaFormat != extmeta.FormatKomgaSQLite || !createdView.Ready || !createdView.ImportCovers || createdView.EntryCount != 1 {
 		t.Fatalf("unexpected upload response: %+v", createdView)
 	}
 	if createdView.TagDictSourceID != dict.ID {
 		t.Fatalf("new upload dictionary = %q, want %q", createdView.TagDictSourceID, dict.ID)
 	}
 
-	// 4. Entry cover served lazily from Komga BLOB.
+	// 4. An administrator can preview a cover from an opted-in source.
 	coverReq := httptest.NewRequest(http.MethodGet, "/admin/api/metadata/sources/"+createdView.ID+"/entries/ks1/cover", nil)
 	coverReq.Header.Set("X-API-Key", adminKey)
 	coverW := httptest.NewRecorder()
@@ -699,7 +702,7 @@ INSERT INTO entries VALUES ('oe1','Open Entry','','[]','','[]','Manga','',9,0,1,
 		t.Fatalf("gz overwrite status = %d, want 200: %s", updResp.Code, updResp.Body.String())
 	}
 	updView := decodeMetadataFixture[extmeta.SourceView](t, updResp)
-	if updView.SchemaFormat != extmeta.FormatOpenV2 {
+	if updView.SchemaFormat != extmeta.FormatOpenV2 || !updView.ImportCovers {
 		t.Fatalf("expected updated schemaFormat=%q, got %+v", extmeta.FormatOpenV2, updView)
 	}
 	if updView.TagDictSourceID != dict.ID {

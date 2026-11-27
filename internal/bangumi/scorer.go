@@ -443,9 +443,6 @@ func ToScrapedMetadataWithQuery(seriesName string, parsed ParsedQuery, cand Subj
 		coverURL = CoverEndpointURL(cand.ID)
 	}
 	status := cand.Status
-	if status == "" {
-		status = "ONGOING"
-	}
 	return database.ScrapedMetadata{
 		SubjectID:       cand.ID,
 		Confidence:      cand.Confidence,

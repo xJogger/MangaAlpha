@@ -31,18 +31,21 @@ var (
 )
 
 type ManagerOptions struct {
-	ProxyURLProvider func(context.Context) string
+	ProxyURLProvider  func(context.Context) string
+	ImportedCoversDir string
 	// HTTPClient, when supplied, replaces the default SSRF-protected client.
 	HTTPClient *http.Client
 }
 
 type Manager struct {
-	store   *database.Store
-	bangumi *bangumi.Service
-	covers  *CoverService
-	root    string
-	logger  *slog.Logger
-	opts    ManagerOptions
+	store          *database.Store
+	bangumi        *bangumi.Service
+	covers         *CoverService
+	root           string
+	importedCovers string
+	importedMu     sync.Mutex
+	logger         *slog.Logger
+	opts           ManagerOptions
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -73,9 +76,12 @@ func NewManager(store *database.Store, bgm *bangumi.Service, covers *CoverServic
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
+	if opts.ImportedCoversDir == "" {
+		opts.ImportedCoversDir = filepath.Join(dataDir, "imported-covers")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		store: store, bangumi: bgm, covers: covers, root: root, logger: logger, opts: opts,
+		store: store, bangumi: bgm, covers: covers, root: root, importedCovers: opts.ImportedCoversDir, logger: logger, opts: opts,
 		ctx: ctx, cancel: cancel, activeSync: make(map[string]bool),
 		sidecars: make(map[string]*SidecarStore), dictionaries: make(map[string]*TagDictionary),
 		mappings: make(map[string][]MappingRecord),
@@ -412,7 +418,8 @@ func (m *Manager) AddCustomSource(ctx context.Context, src database.MetadataSour
 		DownloadURL: src.DownloadURL, ManifestURL: src.ManifestURL, ReleaseAPIURL: src.ReleaseAPIURL,
 		AssetName: src.AssetName, Compression: src.Compression, LocalPath: strings.TrimSpace(src.LocalPath),
 		TagDictSourceID: src.TagDictSourceID, TagDisplayMode: src.TagDisplayMode, NSFWRule: src.NSFWRule,
-		AutoUpdate: src.AutoUpdate, OnlineAPIURL: src.OnlineAPIURL, OnlineEnabled: src.OnlineEnabled, Enabled: src.Enabled,
+		ImportCovers: strings.TrimSpace(src.Kind) == KindOfflineSQLite && src.ImportCovers,
+		AutoUpdate:   src.AutoUpdate, OnlineAPIURL: src.OnlineAPIURL, OnlineEnabled: src.OnlineEnabled, Enabled: src.Enabled,
 	}
 	if err := validateSource(src, true); err != nil {
 		return database.MetadataSource{}, err
@@ -452,6 +459,7 @@ type SourceConfig struct {
 	DownloadURL     *string `json:"downloadUrl"`
 	OnlineAPIURL    *string `json:"onlineApiUrl"`
 	OnlineEnabled   *bool   `json:"onlineEnabled"`
+	ImportCovers    *bool   `json:"importCovers"`
 }
 
 func setOption[T any](field *T, option *T) {
@@ -494,6 +502,9 @@ func (m *Manager) UpdateSourceConfig(ctx context.Context, id string, cfg SourceC
 	setOption(&src.DownloadURL, cfg.DownloadURL)
 	setOption(&src.OnlineAPIURL, cfg.OnlineAPIURL)
 	setOption(&src.OnlineEnabled, cfg.OnlineEnabled)
+	if src.Kind == KindOfflineSQLite {
+		setOption(&src.ImportCovers, cfg.ImportCovers)
+	}
 	src.LocalPath = strings.TrimSpace(src.LocalPath)
 	src.SchemaType = strings.TrimSpace(src.SchemaType)
 	if err := validateSource(src, cfg.LocalPath != nil); err != nil {

@@ -1108,11 +1108,8 @@ WHERE ub.library_id=?`, unionLibraryID)
 				delTx.Rollback()
 				return UnionRefreshStats{}, err
 			}
-			if err := execChunkedDelete(ctx, delTx, `DELETE FROM books WHERE id IN `, bookIDsToDelete); err != nil {
-				delTx.Rollback()
-				return UnionRefreshStats{}, err
-			}
-			if err := execChunkedDelete(ctx, delTx, `DELETE FROM series WHERE id IN `, seriesIDsToDelete); err != nil {
+			refs, err := s.deleteUnionCatalogRows(ctx, delTx, bookIDsToDelete, seriesIDsToDelete)
+			if err != nil {
 				delTx.Rollback()
 				return UnionRefreshStats{}, err
 			}
@@ -1122,6 +1119,9 @@ WHERE ub.library_id=?`, unionLibraryID)
 			}
 			if err := delTx.Commit(); err != nil {
 				return UnionRefreshStats{}, err
+			}
+			if cleanup := s.importedCoverCleanup(); cleanup != nil && len(refs) > 0 {
+				cleanup(ctx, refs)
 			}
 			bookIDsToDelete = nil
 			seriesIDsToDelete = nil
@@ -1185,6 +1185,7 @@ WHERE ub.library_id=?`, unionLibraryID)
 
 	catalogMutated := false
 	progressMutated := false
+	var coverRefs []string
 
 	if hasPendingCatalogWrites {
 		if err := enableBulk(); err != nil {
@@ -1198,10 +1199,8 @@ WHERE ub.library_id=?`, unionLibraryID)
 		if err := execChunkedDelete(ctx, tx, `DELETE FROM union_series_sources WHERE union_series_id IN `, seriesSrcDeleteIDs); err != nil {
 			return UnionRefreshStats{}, err
 		}
-		if err := execChunkedDelete(ctx, tx, `DELETE FROM books WHERE id IN `, bookIDsToDelete); err != nil {
-			return UnionRefreshStats{}, err
-		}
-		if err := execChunkedDelete(ctx, tx, `DELETE FROM series WHERE id IN `, seriesIDsToDelete); err != nil {
+		coverRefs, err = s.deleteUnionCatalogRows(ctx, tx, bookIDsToDelete, seriesIDsToDelete)
+		if err != nil {
 			return UnionRefreshStats{}, err
 		}
 		if err := writeNewBundlesTx(tx, newSeriesBundles); err != nil {
@@ -1410,6 +1409,9 @@ WHERE id=1`, catBump, progBump); err != nil {
 
 	if err := tx.Commit(); err != nil {
 		return UnionRefreshStats{}, err
+	}
+	if cleanup := s.importedCoverCleanup(); cleanup != nil && len(coverRefs) > 0 {
+		cleanup(ctx, coverRefs)
 	}
 	if inheritedBookMeta > 0 {
 		s.NotifyBookSearchDirty()

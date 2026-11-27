@@ -371,7 +371,7 @@ VALUES(?,42,1,'existing-source','existing-entry','')`, first.SeriesID); err != n
 	if _, err := store.DB().Exec("UPDATE series_metadata SET cover_source='bangumi' WHERE series_id=?", first.SeriesID); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := service.Get(ctx, first.SeriesID); err != nil || ok {
+	if data, ok, err := service.Get(ctx, first.SeriesID); err != nil || !ok || data.MediaType != "image/jpeg" {
 		t.Fatalf("bangumi mode with invalid fallback: %v, %v", ok, err)
 	}
 }

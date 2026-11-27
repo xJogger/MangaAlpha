@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,8 +46,13 @@ func TestBatchBookCoversOnlyReadsPageWhenRequested(t *testing.T) {
 	}
 	assertBatchTableCount(t, store, "zip_indexes", 0)
 	assertBatchTableCount(t, store, "book_thumbnails", 0)
+	if err := store.UpsertBookCoverCandidates(ctx, []database.BookCoverCandidate{{
+		BookID: "book-1", SourceID: "fixture", CoverKind: database.CoverKindImportedFile, CoverRef: strings.Repeat("a", 64) + ".png",
+	}}); err != nil {
+		t.Fatal(err)
+	}
 	run = startBookBatch(t, manager, OperationBatchBookCovers, TargetLibrary, "library", JobOptions{FallbackPage1: true})
-	if run.GeneratedCount != 1 || run.SkippedCount != 1 || matchCalls.Load() != 2 {
+	if run.GeneratedCount != 1 || run.SkippedCount != 1 || matchCalls.Load() != 1 {
 		t.Fatalf("page fallback batch: %+v, match calls=%d", run, matchCalls.Load())
 	}
 	assertBatchTableCount(t, store, "zip_indexes", 1)

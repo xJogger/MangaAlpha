@@ -238,7 +238,6 @@ func ProbeSQLiteFile(ctx context.Context, filePath string) (SQLiteProbeResult, e
 		res.Format = FormatKomgaSQLite
 		res.HasBooksTable = true
 		_ = db.QueryRowContext(ctx, `SELECT count(*) FROM SERIES`).Scan(&res.EntryCount)
-		_ = db.QueryRowContext(ctx, `SELECT count(*) FROM BOOK`).Scan(&res.BookCount)
 		res.HasCoverBlobs = tables["thumbnail_series"] || tables["thumbnail_book"]
 		return res, nil
 
@@ -528,9 +527,6 @@ func getMangaAlphaMetaV1Entry(ctx context.Context, db sqliteQueryer, sourceID, e
 			break
 		}
 	}
-	if entry.CoverURL == "" && entry.HasCoverBlob && sourceID != "" {
-		entry.CoverURL = EncodeSQLiteBlobCoverRef(sourceID, SQLiteBlobKindOpenEntry, entry.EntryID)
-	}
 
 	if raw := strings.TrimSpace(extraJSON.String); raw != "" {
 		var fields map[string]any
@@ -556,7 +552,7 @@ func getMangaAlphaMetaV1Entry(ctx context.Context, db sqliteQueryer, sourceID, e
 // ReadOpenOfflineBooks reads volume/book records for seriesEntryID from an optional
 // `books` table in a mangaalpha_meta_v1 / mangaalpha_meta_v2 SQLite database.
 // Returns (nil, nil) when the database has no `books` table.
-func ReadOpenOfflineBooks(ctx context.Context, db *sql.DB, seriesEntryID string) ([]OpenBookEntry, error) {
+func ReadOpenOfflineBooks(ctx context.Context, db sqliteQueryer, seriesEntryID string) ([]OpenBookEntry, error) {
 	if db == nil {
 		return nil, nil
 	}
@@ -662,100 +658,6 @@ ORDER BY %s`,
 		out = append(out, item)
 	}
 	return out, rows.Err()
-}
-
-// openBookCoverKey encodes each component independently so separators inside
-// source IDs and book keys cannot change the referenced row.
-func openBookCoverKey(seriesID, bookKey string) string {
-	return "/" + url.PathEscape(seriesID) + "/" + url.PathEscape(bookKey)
-}
-
-func resolveOpenBookCover(ctx context.Context, db sqliteQueryer, key, entryID, parentEntryID string) (string, string, error) {
-	if key == "" {
-		return "", "", ErrEntryNotFound
-	}
-	var predicate string
-	var args []any
-	switch {
-	case key == entryID && entryID != "":
-		predicate, args = "b.book_key=?", []any{key}
-	case strings.HasPrefix(key, "/"):
-		series, book, ok := strings.Cut(strings.TrimPrefix(key, "/"), "/")
-		if !ok || strings.Contains(book, "/") {
-			return "", "", ErrInvalidConfig
-		}
-		seriesID, seriesErr := url.PathUnescape(series)
-		bookKey, bookErr := url.PathUnescape(book)
-		if seriesErr != nil || bookErr != nil || seriesID == "" || bookKey == "" || (entryID != "" && bookKey != entryID) {
-			return "", "", ErrInvalidConfig
-		}
-		predicate, args = "b.series_entry_id=? AND b.book_key=?", []any{seriesID, bookKey}
-	case entryID != "":
-		// Legacy colon-separated refs use the bare book key in book_metadata.
-		series, ok := strings.CutSuffix(key, ":"+entryID)
-		if !ok || series == "" {
-			return "", "", ErrInvalidConfig
-		}
-		predicate, args = "b.series_entry_id=? AND b.book_key=?", []any{series, entryID}
-	default:
-		if strings.Contains(key, ":") {
-			seriesID, bookKey, err := queryOpenBookOwner(ctx, db, parentEntryID, "b.series_entry_id || ':' || b.book_key=?", key)
-			if !errors.Is(err, sql.ErrNoRows) {
-				return seriesID, bookKey, err
-			}
-		}
-		predicate, args = "b.book_key=?", []any{key}
-	}
-	seriesID, bookKey, err := queryOpenBookOwner(ctx, db, parentEntryID, predicate, args...)
-	if errors.Is(err, sql.ErrNoRows) {
-		err = ErrEntryNotFound
-	}
-	return seriesID, bookKey, err
-}
-
-func queryOpenBookOwner(ctx context.Context, db sqliteQueryer, parentEntryID, predicate string, args ...any) (seriesID, bookKey string, err error) {
-	if parentEntryID != "" {
-		predicate += " AND b.series_entry_id=?"
-		args = append(args, parentEntryID)
-	}
-	rows, err := db.QueryContext(ctx, `
-SELECT b.series_entry_id,b.book_key FROM books b
-JOIN entries e ON e.id=b.series_entry_id WHERE `+predicate+` LIMIT 2`, args...)
-	if err != nil {
-		return "", "", err
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return "", "", err
-		}
-		return "", "", sql.ErrNoRows
-	}
-	if err := rows.Scan(&seriesID, &bookKey); err != nil {
-		return "", "", err
-	}
-	if rows.Next() {
-		return "", "", ErrEntryNotFound
-	}
-	return seriesID, bookKey, rows.Err()
-}
-
-// ReadOpenCoverBLOB lazily reads a single cover_blob from an open-format SQLite DB.
-func ReadOpenCoverBLOB(ctx context.Context, dbPath, kind, key string) ([]byte, string, error) {
-	db, err := openKomgaReadOnlySQLite(dbPath)
-	if err != nil {
-		return nil, "", err
-	}
-	defer db.Close()
-	key = strings.TrimSpace(key)
-	if kind == SQLiteBlobKindOpenBook {
-		seriesID, bookKey, err := resolveOpenBookCover(ctx, db, key, "", "")
-		if err != nil {
-			return nil, "", err
-		}
-		return readOpenCoverBLOB(ctx, db, kind, seriesID, bookKey)
-	}
-	return readOpenCoverBLOB(ctx, db, kind, key, "")
 }
 
 func readOpenCoverBLOB(ctx context.Context, db sqliteQueryer, kind, seriesID, bookKey string) ([]byte, string, error) {

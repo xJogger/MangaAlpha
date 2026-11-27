@@ -120,8 +120,7 @@ CREATE TABLE ext_entries (
   raw_title TEXT NOT NULL,
   thumb_sha1 TEXT NOT NULL,
   category TEXT NOT NULL,
-  is_nsfw INTEGER NOT NULL,
-  cover_ref TEXT NOT NULL DEFAULT ''
+  is_nsfw INTEGER NOT NULL
 );
 CREATE TABLE ext_entry_keys (
   entry_id TEXT NOT NULL,
@@ -183,20 +182,10 @@ type sidecarRow struct {
 	title     string
 	titleAlt  string
 	coverURL  string
-	coverRef  string
 	category  string
 	isNSFW    int
 	extraKeys []string
 	ftsExtra  []string
-}
-
-func encodeSidecarBlobRef(kind, recordID string) string {
-	kind = strings.TrimSpace(kind)
-	recordID = strings.TrimSpace(recordID)
-	if kind == "" || recordID == "" {
-		return ""
-	}
-	return url.PathEscape(kind) + "/" + url.PathEscape(recordID)
 }
 
 func parseFlexibleAuthorNames(raw string) []string {
@@ -236,7 +225,6 @@ func buildSidecarFromMangaAlphaMetaV1(
 	hasAuthors := cols["authors"]
 	hasAgeRating := cols["age_rating"]
 	hasSharingLabels := cols["sharing_labels_json"]
-	hasCoverBlob := cols["cover_blob"]
 
 	selTitleSort := "''"
 	if hasTitleSort {
@@ -254,16 +242,12 @@ func buildSidecarFromMangaAlphaMetaV1(
 	if hasSharingLabels {
 		selSharing = "COALESCE(sharing_labels_json,'')"
 	}
-	selCoverBlob := "0"
-	if hasCoverBlob {
-		selCoverBlob = "(cover_blob IS NOT NULL AND length(cover_blob) > 0)"
-	}
 	query := fmt.Sprintf(`
-SELECT rowid, COALESCE(id,''), COALESCE(title,''), COALESCE(title_alt,''), COALESCE(cover_url,''), COALESCE(category,''), COALESCE(is_nsfw,0), %s, %s, %s, %s, %s
+SELECT rowid, COALESCE(id,''), COALESCE(title,''), COALESCE(title_alt,''), COALESCE(cover_url,''), COALESCE(category,''), COALESCE(is_nsfw,0), %s, %s, %s, %s
 FROM entries
 WHERE rowid > ?
 ORDER BY rowid ASC
-LIMIT ?`, selTitleSort, selAuthors, selAgeRating, selSharing, selCoverBlob)
+LIMIT ?`, selTitleSort, selAuthors, selAgeRating, selSharing)
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -279,8 +263,7 @@ LIMIT ?`, selTitleSort, selAuthors, selAgeRating, selSharing, selCoverBlob)
 			var r sidecarRow
 			var titleSort, authorsRaw, sharingRaw string
 			var ageRating sql.NullInt64
-			var hasBlobInt int
-			if err := rows.Scan(&rid, &r.entryID, &r.title, &r.titleAlt, &r.coverURL, &r.category, &r.isNSFW, &titleSort, &authorsRaw, &ageRating, &sharingRaw, &hasBlobInt); err != nil {
+			if err := rows.Scan(&rid, &r.entryID, &r.title, &r.titleAlt, &r.coverURL, &r.category, &r.isNSFW, &titleSort, &authorsRaw, &ageRating, &sharingRaw); err != nil {
 				rows.Close()
 				return total, err
 			}
@@ -302,9 +285,7 @@ LIMIT ?`, selTitleSort, selAuthors, selAgeRating, selSharing, selCoverBlob)
 					}
 				}
 			}
-			if strings.TrimSpace(r.coverURL) == "" && hasBlobInt != 0 {
-				r.coverRef = encodeSidecarBlobRef(SQLiteBlobKindOpenEntry, r.entryID)
-			}
+
 			if ts := strings.TrimSpace(titleSort); ts != "" {
 				r.extraKeys = append(r.extraKeys, ts)
 				r.ftsExtra = append(r.ftsExtra, ts)
@@ -365,7 +346,11 @@ func buildSidecarFromKomgaSQLiteV1(
 	upDB, sideDB *sql.DB,
 	onProgress func(int64),
 ) (int64, error) {
-	seriesList, err := ReadKomgaAllSeries(ctx, upDB)
+	info, err := DetectKomgaSchema(ctx, upDB)
+	if err != nil {
+		return 0, err
+	}
+	seriesList, err := queryKomgaSeries(ctx, upDB, info, "", false, false)
 	if err != nil {
 		return 0, err
 	}
@@ -437,10 +422,10 @@ func buildSidecarFromKomgaSQLiteV1(
 			cat = strings.Join(ks.Genres, ", ")
 		}
 		batch = append(batch, sidecarRow{
-			entryID:   ks.KomgaSeriesID,
-			title:     primaryTitle,
-			titleAlt:  titleAlt,
-			coverRef:  encodeSidecarBlobRef(SQLiteBlobKindKomgaSeries, ks.SelectedThumbnailID),
+			entryID:  ks.KomgaSeriesID,
+			title:    primaryTitle,
+			titleAlt: titleAlt,
+
 			category:  cat,
 			isNSFW:    nsfwInt,
 			extraKeys: dedupeStrings(extraKeys),
@@ -523,8 +508,8 @@ func insertSidecarBatch(ctx context.Context, sideDB *sql.DB, batch []sidecarRow)
 	defer tx.Rollback()
 
 	entryStmt, err := tx.PrepareContext(ctx, `
-INSERT INTO ext_entries(entry_id, norm_title, norm_alt, raw_title, thumb_sha1, category, is_nsfw, cover_ref)
-VALUES(?,?,?,?,?,?,?,?)`)
+INSERT INTO ext_entries(entry_id, norm_title, norm_alt, raw_title, thumb_sha1, category, is_nsfw)
+VALUES(?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
@@ -562,7 +547,6 @@ INSERT INTO ext_fts(entry_id, text) VALUES(?, ?)`)
 			thumbSHA1,
 			strings.TrimSpace(r.category),
 			r.isNSFW,
-			r.coverRef,
 		); err != nil {
 			return err
 		}
@@ -607,12 +591,12 @@ INSERT INTO ext_fts(entry_id, text) VALUES(?, ?)`)
 // SidecarStore provides sub-5ms title search and SHA-1 cover lookup via a companion
 // SQLite FTS5 index, paired with read-only primary-key lookups against the upstream database.
 type SidecarStore struct {
-	sourceID     string
-	schema       string
-	sidecarDB    *sql.DB
-	upstreamDB   *sql.DB
-	hasCoverRef  bool
-	hasKeysTable bool
+	sourceID         string
+	schema           string
+	sidecarDB        *sql.DB
+	upstreamDB       *sql.DB
+	hasKeysTable     bool
+	checkpointedOnly bool
 }
 
 // OpenSidecarStore opens the sidecar index and (optionally) the upstream database in strict read-only mode.
@@ -626,8 +610,9 @@ func OpenSidecarStore(sourceID, upstreamDBPath, sidecarPath, schema string) (*Si
 	_ = sideDB.QueryRow(`SELECT value FROM ext_meta WHERE key='schema'`).Scan(&storedSchema)
 
 	var upDB *sql.DB
+	var checkpointedOnly bool
 	if strings.TrimSpace(upstreamDBPath) != "" {
-		upDB, err = openKomgaReadOnlySQLite(upstreamDBPath)
+		upDB, checkpointedOnly, err = openKomgaSQLiteSnapshot(upstreamDBPath)
 		if err != nil {
 			sideDB.Close()
 			return nil, fmt.Errorf("open upstream sqlite: %w", err)
@@ -647,7 +632,6 @@ func OpenSidecarStore(sourceID, upstreamDBPath, sidecarPath, schema string) (*Si
 		storedSchema = strings.TrimSpace(schema)
 	}
 
-	cols, _ := tableColumns(context.Background(), sideDB, "ext_entries")
 	tables, _ := listSQLiteTables(context.Background(), sideDB)
 
 	return &SidecarStore{
@@ -655,26 +639,8 @@ func OpenSidecarStore(sourceID, upstreamDBPath, sidecarPath, schema string) (*Si
 		schema:       storedSchema,
 		sidecarDB:    sideDB,
 		upstreamDB:   upDB,
-		hasCoverRef:  cols["cover_ref"],
-		hasKeysTable: tables["ext_entry_keys"],
+		hasKeysTable: tables["ext_entry_keys"], checkpointedOnly: checkpointedOnly,
 	}, nil
-}
-
-func (s *SidecarStore) resolveCoverRef(coverRef string) string {
-	coverRef = strings.TrimSpace(coverRef)
-	if coverRef == "" || s.sourceID == "" {
-		return ""
-	}
-	kindRaw, idRaw, ok := strings.Cut(coverRef, "/")
-	if !ok {
-		return ""
-	}
-	kind, err1 := url.PathUnescape(kindRaw)
-	recID, err2 := url.PathUnescape(idRaw)
-	if err1 != nil || err2 != nil {
-		return ""
-	}
-	return EncodeSQLiteBlobCoverRef(s.sourceID, kind, recID)
 }
 
 // Schema returns the resolved upstream database schema name.
@@ -708,15 +674,9 @@ func (s *SidecarStore) LookupByThumbSHA1(ctx context.Context, sha1Hex string) ([
 		return nil, nil
 	}
 
-	coverExpr := "''"
-	if s.hasCoverRef {
-		coverExpr = "cover_ref"
-	}
-	rows, err := s.sidecarDB.QueryContext(ctx, fmt.Sprintf(`
-SELECT entry_id, raw_title, thumb_sha1, category, is_nsfw, %s
-FROM ext_entries
-WHERE thumb_sha1 = ?
-ORDER BY entry_id ASC`, coverExpr), digest)
+	rows, err := s.sidecarDB.QueryContext(ctx, `
+SELECT entry_id, raw_title, thumb_sha1, category, is_nsfw
+FROM ext_entries WHERE thumb_sha1 = ? ORDER BY entry_id ASC`, digest)
 	if err != nil {
 		return nil, err
 	}
@@ -726,12 +686,10 @@ ORDER BY entry_id ASC`, coverExpr), digest)
 	for rows.Next() {
 		var m SearchMatch
 		var nsfw int
-		var coverRef string
-		if err := rows.Scan(&m.EntryID, &m.Title, &m.ThumbSHA1, &m.Category, &nsfw, &coverRef); err != nil {
+		if err := rows.Scan(&m.EntryID, &m.Title, &m.ThumbSHA1, &m.Category, &nsfw); err != nil {
 			return nil, err
 		}
 		m.SourceID = s.sourceID
-		m.CoverURL = s.resolveCoverRef(coverRef)
 		m.IsNSFW = nsfw != 0
 		m.Score = 1.0
 		m.MatchType = "thumb_sha1"
@@ -791,10 +749,6 @@ func (s *SidecarStore) searchWithHints(ctx context.Context, titles, authors []st
 		if err := s.scoreGalleryMatches(ctx, candidates, queries, authorKeys); err != nil {
 			return nil, err
 		}
-	} else if s.schema == SchemaKomgaSQLiteV1 && len(authorKeys) > 0 && s.upstreamDB != nil && len(candidates) > 0 {
-		if err := s.scoreKomgaMatches(ctx, candidates, authorKeys); err != nil {
-			return nil, err
-		}
 	}
 	hits := make([]SearchMatch, 0, len(candidates))
 	for _, hit := range candidates {
@@ -827,14 +781,9 @@ func (s *SidecarStore) recallTitle(ctx context.Context, query string, limit int,
 		recallBudget = max(limit*6, 60)
 		exactLimit = recallBudget
 	}
-	coverExpr := "''"
-	eCoverExpr := "''"
-	if s.hasCoverRef {
-		coverExpr = "cover_ref"
-		eCoverExpr = "e.cover_ref"
-	}
+
 	recalled := make(map[string]struct{})
-	addCandidate := func(entryID, rawTitle, thumbSHA1, category string, isNSFW int, normTitle, normAlt, coverRef, matchType string, exactKey bool) {
+	addCandidate := func(entryID, rawTitle, thumbSHA1, category string, isNSFW int, normTitle, normAlt, matchType string, exactKey bool) {
 		recalled[entryID] = struct{}{}
 		score := scoreTitleMatch(normQ, normTitle, normAlt)
 		if exactKey && score < 0.97 {
@@ -853,7 +802,6 @@ func (s *SidecarStore) recallTitle(ctx context.Context, query string, limit int,
 			Title:     rawTitle,
 			Category:  category,
 			ThumbSHA1: thumbSHA1,
-			CoverURL:  s.resolveCoverRef(coverRef),
 			IsNSFW:    isNSFW != 0,
 			Score:     score,
 			MatchType: matchType,
@@ -862,22 +810,22 @@ func (s *SidecarStore) recallTitle(ctx context.Context, query string, limit int,
 
 	// 1. Exact normalized title / alternate-title / extra-alias lookup.
 	if normQ != "" {
-		exactRows, err := s.sidecarDB.QueryContext(ctx, fmt.Sprintf(`
-SELECT entry_id, raw_title, thumb_sha1, category, is_nsfw, norm_title, norm_alt, %s
+		exactRows, err := s.sidecarDB.QueryContext(ctx, `
+SELECT entry_id, raw_title, thumb_sha1, category, is_nsfw, norm_title, norm_alt
 FROM ext_entries
 WHERE norm_title = ? OR norm_alt = ?
-LIMIT ?`, coverExpr), normQ, normQ, exactLimit)
+LIMIT ?`, normQ, normQ, exactLimit)
 		if err != nil {
 			return err
 		}
 		for exactRows.Next() {
-			var eid, rawTitle, sha1, cat, nt, na, coverRef string
+			var eid, rawTitle, sha1, cat, nt, na string
 			var nsfw int
-			if err := exactRows.Scan(&eid, &rawTitle, &sha1, &cat, &nsfw, &nt, &na, &coverRef); err != nil {
+			if err := exactRows.Scan(&eid, &rawTitle, &sha1, &cat, &nsfw, &nt, &na); err != nil {
 				exactRows.Close()
 				return err
 			}
-			addCandidate(eid, rawTitle, sha1, cat, nsfw, nt, na, coverRef, "exact", false)
+			addCandidate(eid, rawTitle, sha1, cat, nsfw, nt, na, "exact", false)
 		}
 		if err := exactRows.Err(); err != nil {
 			exactRows.Close()
@@ -886,23 +834,23 @@ LIMIT ?`, coverExpr), normQ, normQ, exactLimit)
 		exactRows.Close()
 
 		if s.hasKeysTable {
-			keyRows, err := s.sidecarDB.QueryContext(ctx, fmt.Sprintf(`
-SELECT DISTINCT e.entry_id, e.raw_title, e.thumb_sha1, e.category, e.is_nsfw, e.norm_title, e.norm_alt, %s
+			keyRows, err := s.sidecarDB.QueryContext(ctx, `
+SELECT DISTINCT e.entry_id, e.raw_title, e.thumb_sha1, e.category, e.is_nsfw, e.norm_title, e.norm_alt
 FROM ext_entry_keys k
 JOIN ext_entries e ON e.entry_id = k.entry_id
 WHERE k.norm_key = ?
-LIMIT ?`, eCoverExpr), normQ, exactLimit)
+LIMIT ?`, normQ, exactLimit)
 			if err != nil {
 				return err
 			}
 			for keyRows.Next() {
-				var eid, rawTitle, sha1, cat, nt, na, coverRef string
+				var eid, rawTitle, sha1, cat, nt, na string
 				var nsfw int
-				if err := keyRows.Scan(&eid, &rawTitle, &sha1, &cat, &nsfw, &nt, &na, &coverRef); err != nil {
+				if err := keyRows.Scan(&eid, &rawTitle, &sha1, &cat, &nsfw, &nt, &na); err != nil {
 					keyRows.Close()
 					return err
 				}
-				addCandidate(eid, rawTitle, sha1, cat, nsfw, nt, na, coverRef, "exact", true)
+				addCandidate(eid, rawTitle, sha1, cat, nsfw, nt, na, "exact", true)
 			}
 			if err := keyRows.Err(); err != nil {
 				keyRows.Close()
@@ -917,24 +865,24 @@ LIMIT ?`, eCoverExpr), normQ, exactLimit)
 		if matchExpr == "" {
 			return nil
 		}
-		ftsRows, err := s.sidecarDB.QueryContext(ctx, fmt.Sprintf(`
-SELECT e.entry_id, e.raw_title, e.thumb_sha1, e.category, e.is_nsfw, e.norm_title, e.norm_alt, %s
+		ftsRows, err := s.sidecarDB.QueryContext(ctx, `
+SELECT e.entry_id, e.raw_title, e.thumb_sha1, e.category, e.is_nsfw, e.norm_title, e.norm_alt
 FROM ext_fts f
 JOIN ext_entries e ON e.entry_id = f.entry_id
 WHERE ext_fts MATCH ?
 ORDER BY bm25(ext_fts)
-LIMIT ?`, eCoverExpr), matchExpr, recallBudget)
+LIMIT ?`, matchExpr, recallBudget)
 		if err != nil {
 			return err
 		}
 		for ftsRows.Next() {
-			var eid, rawTitle, sha1, cat, nt, na, coverRef string
+			var eid, rawTitle, sha1, cat, nt, na string
 			var nsfw int
-			if err := ftsRows.Scan(&eid, &rawTitle, &sha1, &cat, &nsfw, &nt, &na, &coverRef); err != nil {
+			if err := ftsRows.Scan(&eid, &rawTitle, &sha1, &cat, &nsfw, &nt, &na); err != nil {
 				ftsRows.Close()
 				return err
 			}
-			addCandidate(eid, rawTitle, sha1, cat, nsfw, nt, na, coverRef, "fts", false)
+			addCandidate(eid, rawTitle, sha1, cat, nsfw, nt, na, "fts", false)
 		}
 		err = ftsRows.Err()
 		ftsRows.Close()
@@ -1120,68 +1068,17 @@ func compareGalleryVersions(a, b *galleryMatch) int {
 	}
 }
 
-func (s *SidecarStore) scoreKomgaMatches(ctx context.Context, hits map[string]SearchMatch, authorKeys []string) error {
-	if len(authorKeys) == 0 || len(hits) == 0 {
-		return nil
-	}
-	info, err := DetectKomgaSchema(ctx, s.upstreamDB)
-	if err != nil || !info.HasBookMetadataAuthor {
-		return nil
-	}
-	ids := make([]string, 0, len(hits))
-	for id := range hits {
-		ids = append(ids, id)
-	}
-	batch, err := json.Marshal(ids)
-	if err != nil {
-		return err
-	}
-	rows, err := s.upstreamDB.QueryContext(ctx, `
-SELECT b.SERIES_ID, COALESCE(a.NAME,'')
-FROM BOOK b
-JOIN BOOK_METADATA_AUTHOR a ON a.BOOK_ID = b.ID
-WHERE b.SERIES_ID IN (SELECT value FROM json_each(?))`, string(batch))
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	bySeries := make(map[string][]string, len(ids))
-	for rows.Next() {
-		var sid, name string
-		if err := rows.Scan(&sid, &name); err != nil {
-			return err
-		}
-		if key := cjk.ExactTitleKey(name); key != "" && !slices.Contains(bySeries[sid], key) {
-			bySeries[sid] = append(bySeries[sid], key)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for id, hit := range hits {
-		entryAuthors := bySeries[id]
-		if len(entryAuthors) == 0 {
-			continue
-		}
-		if sharesKey(authorKeys, entryAuthors) {
-			if hit.Score >= 0.70 {
-				hit.Score = min(1.0, hit.Score+0.02)
-			}
-		} else {
-			hit.Score = max(0, hit.Score-0.02)
-		}
-		hits[id] = hit
-	}
-	return nil
-}
-
 // GetEntry loads the complete metadata record for entryID from the read-only upstream SQLite DB.
 func (s *SidecarStore) GetEntry(ctx context.Context, entryID string) (*Entry, error) {
 	if s == nil || s.upstreamDB == nil {
 		return nil, errors.New("upstream database is not configured")
 	}
 	if s.schema == SchemaKomgaSQLiteV1 {
-		ks, err := ReadKomgaSeries(ctx, s.upstreamDB, strings.TrimSpace(entryID))
+		info, err := DetectKomgaSchema(ctx, s.upstreamDB)
+		if err != nil {
+			return nil, err
+		}
+		ks, err := readKomgaSeries(ctx, s.upstreamDB, info, strings.TrimSpace(entryID), false, false)
 		if err != nil {
 			return nil, err
 		}
@@ -1217,10 +1114,7 @@ func komgaSeriesToEntry(sourceID string, ks *KomgaSeriesEntry) *Entry {
 			links = append(links, OpenLink{Label: l.Label, URL: l.URL})
 		}
 	}
-	var coverURL string
-	if ks.SelectedThumbnailID != "" && sourceID != "" {
-		coverURL = EncodeSQLiteBlobCoverRef(sourceID, SQLiteBlobKindKomgaSeries, ks.SelectedThumbnailID)
-	}
+
 	cat := ""
 	if len(ks.Genres) > 0 {
 		cat = strings.Join(ks.Genres, ", ")
@@ -1228,6 +1122,8 @@ func komgaSeriesToEntry(sourceID string, ks *KomgaSeriesEntry) *Entry {
 	rawFields := map[string]any{
 		"komgaSeriesId": ks.KomgaSeriesID,
 		"oneShot":       ks.OneShot,
+		"defaultTitle":  ks.DefaultTitle,
+		"defaultStatus": ks.DefaultStatus,
 	}
 	if ks.Name != "" {
 		rawFields["name"] = ks.Name
@@ -1253,7 +1149,6 @@ func komgaSeriesToEntry(sourceID string, ks *KomgaSeriesEntry) *Entry {
 		Category:         cat,
 		Tags:             dedupeStrings(ks.Tags),
 		Summary:          strings.TrimSpace(ks.Summary),
-		CoverURL:         coverURL,
 		IsNSFW:           ks.NSFW,
 		Status:           strings.TrimSpace(ks.Status),
 		TitleSort:        strings.TrimSpace(ks.TitleSort),

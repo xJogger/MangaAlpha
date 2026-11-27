@@ -260,66 +260,83 @@ func (s *Store) UpsertBookScrapedMetadata(ctx context.Context, bookID string, me
 				(m.MatchOrigin == "" && (m.BgmSubjectID > 0 || m.ExtEntryID != ""))) {
 			return ErrMetadataChanged
 		}
-		for _, field := range []struct {
-			dst    *string
-			value  string
-			locked bool
-		}{
-			{&m.Title, meta.Title, m.TitleLock},
-			{&m.Summary, meta.Summary, m.SummaryLock},
-			{&m.Number, meta.Number, m.NumberLock},
-			{&m.ReleaseDate, meta.ReleaseDate, m.ReleaseDateLock},
-			{&m.ISBN, meta.ISBN, m.ISBNLock},
-			{&m.SeriesGroup, meta.SeriesGroup, false},
-			{&m.StoryArc, meta.StoryArc, false},
-			{&m.StoryArcNumber, meta.StoryArcNumber, false},
-			{&m.MatchOrigin, meta.MatchOrigin, false},
-		} {
-			if value := strings.TrimSpace(field.value); value != "" && !field.locked {
-				*field.dst = value
-			}
-		}
-		if !m.NumberSortLock && meta.NumberSort != nil {
-			m.NumberSort = meta.NumberSort
-		}
-		if !m.AuthorsLock && meta.Authors != nil {
-			m.Authors = meta.Authors
-			m.explicitEmpty |= bookAuthorsOverride
-		}
-		if !m.TagsLock && meta.Tags != nil {
-			m.Tags = meta.Tags
-			m.explicitEmpty |= bookTagsOverride
-		}
-		if !m.LinksLock && meta.Links != nil {
-			m.Links = meta.Links
-			m.explicitEmpty |= bookLinksOverride
-		}
-		if meta.BgmSubjectID > 0 {
-			if m.BgmSubjectID != meta.BgmSubjectID || (meta.BgmCoverURL != "" && m.BgmCoverURL != meta.BgmCoverURL) {
-				m.BgmCoverPath = ""
-			}
-			if m.BgmSubjectID != meta.BgmSubjectID || meta.BgmCoverURL != "" {
-				m.BgmCoverURL = meta.BgmCoverURL
-			}
-			if meta.BgmCoverPath != "" {
-				m.BgmCoverPath = meta.BgmCoverPath
-			}
-			m.BgmSubjectID, m.BgmIsNSFW = meta.BgmSubjectID, meta.BgmIsNSFW
-		}
-		if meta.ExtSourceID != "" {
-			if m.ExtSourceID != meta.ExtSourceID || m.ExtEntryID != meta.ExtEntryID || m.ExtCoverURL != meta.ExtCoverURL {
-				m.ExtCoverPath = ""
-			}
-			m.ExtSourceID, m.ExtEntryID, m.ExtCoverURL = meta.ExtSourceID, meta.ExtEntryID, meta.ExtCoverURL
-			if meta.ExtCoverPath != "" {
-				m.ExtCoverPath = meta.ExtCoverPath
-			}
-		}
-		if meta.ComicInfoVersion != "" || meta.ComicInfoStatus != "" {
-			m.ComicInfoVersion, m.ComicInfoStatus = meta.ComicInfoVersion, meta.ComicInfoStatus
-		}
+		applyBookScrapedFields(m, meta, false)
 		return nil
 	})
+}
+
+// BackfillBookComicInfo records the archive version and fills missing book fields.
+func (s *Store) BackfillBookComicInfo(ctx context.Context, bookID string, meta BookScrapedMetadata, force bool) error {
+	return s.updateBookMetadata(ctx, bookID, func(m *BookMetadata) error {
+		if m.MatchOrigin == "manual" || m.MatchOrigin == "agent" {
+			m.ComicInfoVersion, m.ComicInfoStatus = meta.ComicInfoVersion, meta.ComicInfoStatus
+			return nil
+		}
+		onlyEmpty := !force || m.ExtEntryID != "" || m.BgmSubjectID != 0
+		applyBookScrapedFields(m, meta, onlyEmpty)
+		return nil
+	})
+}
+
+func applyBookScrapedFields(m *BookMetadata, meta BookScrapedMetadata, onlyEmpty bool) {
+	for _, field := range []struct {
+		dst    *string
+		value  string
+		locked bool
+	}{
+		{&m.Title, meta.Title, m.TitleLock},
+		{&m.Summary, meta.Summary, m.SummaryLock},
+		{&m.Number, meta.Number, m.NumberLock},
+		{&m.ReleaseDate, meta.ReleaseDate, m.ReleaseDateLock},
+		{&m.ISBN, meta.ISBN, m.ISBNLock},
+		{&m.SeriesGroup, meta.SeriesGroup, false},
+		{&m.StoryArc, meta.StoryArc, false},
+		{&m.StoryArcNumber, meta.StoryArcNumber, false},
+		{&m.MatchOrigin, meta.MatchOrigin, false},
+	} {
+		if value := strings.TrimSpace(field.value); value != "" && !field.locked && (!onlyEmpty || strings.TrimSpace(*field.dst) == "") {
+			*field.dst = value
+		}
+	}
+	if !m.NumberSortLock && meta.NumberSort != nil && (!onlyEmpty || m.NumberSort == nil) {
+		m.NumberSort = meta.NumberSort
+	}
+	if !m.AuthorsLock && meta.Authors != nil && (!onlyEmpty || len(m.Authors) == 0) {
+		m.Authors = meta.Authors
+		m.explicitEmpty |= bookAuthorsOverride
+	}
+	if !m.TagsLock && meta.Tags != nil && (!onlyEmpty || len(m.Tags) == 0) {
+		m.Tags = meta.Tags
+		m.explicitEmpty |= bookTagsOverride
+	}
+	if !m.LinksLock && meta.Links != nil && (!onlyEmpty || len(m.Links) == 0) {
+		m.Links = meta.Links
+		m.explicitEmpty |= bookLinksOverride
+	}
+	if meta.BgmSubjectID > 0 && (!onlyEmpty || m.BgmSubjectID == 0) {
+		if m.BgmSubjectID != meta.BgmSubjectID || (meta.BgmCoverURL != "" && m.BgmCoverURL != meta.BgmCoverURL) {
+			m.BgmCoverPath = ""
+		}
+		if m.BgmSubjectID != meta.BgmSubjectID || meta.BgmCoverURL != "" {
+			m.BgmCoverURL = meta.BgmCoverURL
+		}
+		if meta.BgmCoverPath != "" {
+			m.BgmCoverPath = meta.BgmCoverPath
+		}
+		m.BgmSubjectID, m.BgmIsNSFW = meta.BgmSubjectID, meta.BgmIsNSFW
+	}
+	if meta.ExtSourceID != "" && (!onlyEmpty || m.ExtEntryID == "") {
+		if m.ExtSourceID != meta.ExtSourceID || m.ExtEntryID != meta.ExtEntryID || m.ExtCoverURL != meta.ExtCoverURL {
+			m.ExtCoverPath = ""
+		}
+		m.ExtSourceID, m.ExtEntryID, m.ExtCoverURL = meta.ExtSourceID, meta.ExtEntryID, meta.ExtCoverURL
+		if meta.ExtCoverPath != "" {
+			m.ExtCoverPath = meta.ExtCoverPath
+		}
+	}
+	if meta.ComicInfoVersion != "" || meta.ComicInfoStatus != "" {
+		m.ComicInfoVersion, m.ComicInfoStatus = meta.ComicInfoVersion, meta.ComicInfoStatus
+	}
 }
 
 func (s *Store) SetBookCustomCover(ctx context.Context, bookID, coverPath, coverURL string) error {
@@ -340,6 +357,12 @@ func (s *Store) ClearBookCustomCover(ctx context.Context, bookID string) error {
 }
 
 func (s *Store) SetBookCoverSource(ctx context.Context, bookID, source string) error {
+	switch source {
+	case "archive":
+		source = CoverSourceBook
+	case "external":
+		source = "ext"
+	}
 	switch source {
 	case CoverSourceAuto, CoverSourceBangumi, CoverSourceBook, "custom", "ext":
 		return s.updateBookMetadata(ctx, bookID, func(m *BookMetadata) error {

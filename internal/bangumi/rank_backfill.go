@@ -51,6 +51,9 @@ type storedSeriesMetaRow struct {
 	LinksLock           bool
 	IsNSFW              bool
 	NSFWLock            bool
+	UpdatedAt           string
+	KeepChainFields     bool
+	NSFWUnionMember     bool
 }
 
 // syncOfflineMetadata incrementally diffs and updates all unlocked Bangumi
@@ -90,10 +93,21 @@ SELECT sm.series_id, s.name, s.relative_path, sm.bgm_subject_id,
  sm.authors_json, sm.authors_lock,
  sm.alternate_titles_json, sm.alternate_titles_lock,
  sm.links_json, sm.links_lock,
- sm.is_nsfw, sm.nsfw_lock
+ sm.is_nsfw, sm.nsfw_lock, sm.updated_at,
+ (sm.ext_entry_id<>'' OR EXISTS(
+ SELECT 1 FROM series_source_bindings sb WHERE sb.series_id=sm.series_id
+ AND sb.source_id<>'bangumi' AND NOT EXISTS (
+ SELECT 1 FROM metadata_sources ms WHERE ms.id=sb.source_id AND ms.kind='bangumi_archive'
+ ))),
+ EXISTS(SELECT 1 FROM union_series_sources us
+ JOIN series_metadata member ON member.series_id=us.source_series_id
+ WHERE us.union_series_id=sm.series_id AND member.is_nsfw=1)
 FROM series_metadata sm
 JOIN series s ON s.id = sm.series_id
-WHERE sm.bgm_subject_id > 0`)
+JOIN libraries l ON l.id=s.library_id
+WHERE sm.bgm_subject_id > 0 AND l.enabled=1
+ AND NOT EXISTS (SELECT 1 FROM union_layers ul WHERE ul.member_library_id=l.id)
+ AND sm.match_origin NOT IN ('manual','agent')`)
 	if err != nil {
 		return 0, err
 	}
@@ -119,7 +133,7 @@ WHERE sm.bgm_subject_id > 0`)
 			&r.AuthorsJSON, &authorsLock,
 			&r.AlternateTitlesJSON, &altLock,
 			&r.LinksJSON, &linksLock,
-			&isNSFW, &nsfwLock,
+			&isNSFW, &nsfwLock, &r.UpdatedAt, &r.KeepChainFields, &r.NSFWUnionMember,
 		); err != nil {
 			rows.Close()
 			return 0, err
@@ -232,6 +246,8 @@ FROM bgm_subjects WHERE id IN `+database.Placeholders(len(ids)), args...)
 }
 
 type pendingMetaUpdate struct {
+	expectedUpdatedAt   string
+	subjectID           int64
 	seriesID            string
 	bgmScore            any
 	bgmRank             any
@@ -292,7 +308,10 @@ UPDATE series_metadata SET
  total_book_count=?,release_date=?,
  genres_json=?,tags_json=?,authors_json=?,alternate_titles_json=?,links_json=?,
  is_nsfw=?,updated_at=?
-WHERE series_id=?`)
+WHERE series_id=? AND updated_at=? AND bgm_subject_id=? AND match_origin NOT IN ('manual','agent')
+ AND EXISTS (SELECT 1 FROM series s JOIN libraries l ON l.id=s.library_id
+ WHERE s.id=series_metadata.series_id AND l.enabled=1
+ AND NOT EXISTS (SELECT 1 FROM union_layers ul WHERE ul.member_library_id=l.id))`)
 	if err != nil {
 		return 0, err
 	}
@@ -331,16 +350,26 @@ WHERE series_id=?`)
 	}
 	defer insAuthors.Close()
 
+	applied := 0
 	for _, u := range updates {
-		if _, err := stmt.ExecContext(ctx,
+		result, err := stmt.ExecContext(ctx,
 			u.bgmScore, u.bgmRank,
 			u.status, u.title, u.titleSort, u.summary, u.publisher,
 			u.totalBookCount, u.releaseDate,
 			u.genresJSON, u.tagsJSON, u.authorsJSON, u.alternateTitlesJSON, u.linksJSON,
-			u.isNSFW, now, u.seriesID,
-		); err != nil {
+			u.isNSFW, now, u.seriesID, u.expectedUpdatedAt, u.subjectID,
+		)
+		if err != nil {
 			return 0, err
 		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if count == 0 {
+			continue
+		}
+		applied++
 		if u.genresChanged {
 			if _, err := delGenres.ExecContext(ctx, u.seriesID); err != nil {
 				return 0, err
@@ -378,7 +407,7 @@ WHERE series_id=?`)
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return len(updates), nil
+	return applied, nil
 }
 
 func diffOfflineMetadataRow(cur storedSeriesMetaRow, cand SubjectCandidate) (pendingMetaUpdate, bool) {
@@ -386,7 +415,8 @@ func diffOfflineMetadataRow(cur storedSeriesMetaRow, cand SubjectCandidate) (pen
 	inc := ToScrapedMetadataWithQuery(cur.SeriesName, parsed, cand)
 
 	upd := pendingMetaUpdate{
-		seriesID:            cur.SeriesID,
+		seriesID:          cur.SeriesID,
+		expectedUpdatedAt: cur.UpdatedAt, subjectID: cur.BgmSubjectID,
 		bgmScore:            nullFloatToAny(cur.BgmScore),
 		bgmRank:             nullIntToAny(cur.BgmRank),
 		status:              cur.Status,
@@ -419,6 +449,9 @@ func diffOfflineMetadataRow(cur storedSeriesMetaRow, cand SubjectCandidate) (pen
 		}
 	}
 
+	if cur.KeepChainFields {
+		return upd, changed
+	}
 	// Unlocked scalar fields (non-empty guard: never wipe existing values with blanks).
 	if !cur.StatusLock {
 		if normStatus := normalizeStatusForSync(inc.Status); normStatus != "" && normStatus != cur.Status {
@@ -516,8 +549,8 @@ func diffOfflineMetadataRow(cur storedSeriesMetaRow, cand SubjectCandidate) (pen
 			changed = true
 		}
 	}
-	if !cur.NSFWLock && inc.IsNSFW != cur.IsNSFW {
-		upd.isNSFW = boolToInt(inc.IsNSFW)
+	if nsfw := inc.IsNSFW || cur.NSFWUnionMember; !cur.NSFWLock && nsfw != cur.IsNSFW {
+		upd.isNSFW = boolToInt(nsfw)
 		changed = true
 	}
 

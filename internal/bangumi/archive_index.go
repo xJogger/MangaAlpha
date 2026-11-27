@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -93,6 +94,8 @@ func ResolveArchiveSource(source, customURL string) (ArchiveSourceConfig, error)
 }
 
 type ArchiveStatus struct {
+	NeedsTankobonReimport bool   `json:"needsTankobonReimport"`
+	TankobonRelationCount int    `json:"tankobonRelationCount"`
 	Ready                 bool   `json:"ready"`
 	DumpName              string `json:"dumpName"`
 	DumpCreatedAt         string `json:"dumpCreatedAt"`
@@ -1100,6 +1103,11 @@ func (a *ArchiveIndex) openExistingIfPresent() {
 	var count int64
 	_ = db.QueryRow(`SELECT count(*) FROM bgm_subjects`).Scan(&count)
 	_, hasISBNCol, hasRelTable := inspectArchiveCapabilities(db)
+	var tankobons int
+	if hasRelTable {
+		_ = db.QueryRow(`SELECT count(*) FROM bgm_subject_relations WHERE relation_type=1003`).Scan(&tankobons)
+	}
+	version, _ := strconv.Atoi(meta["import_format_version"])
 
 	a.mu.Lock()
 	if a.db != nil {
@@ -1110,6 +1118,8 @@ func (a *ArchiveIndex) openExistingIfPresent() {
 	a.importFormatVersion = meta["import_format_version"]
 	a.hasISBNCol = hasISBNCol
 	a.status.Ready = count > 0
+	a.status.TankobonRelationCount = tankobons
+	a.status.NeedsTankobonReimport = a.status.Ready && (version < 5 || tankobons == 0)
 	a.status.DumpName = meta["dump_name"]
 	a.status.DumpCreatedAt = meta["dump_created_at"]
 	a.status.DumpDigest = meta["dump_digest"]

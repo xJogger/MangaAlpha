@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,8 +52,9 @@ func (s *Service) MatchTankobons(ctx context.Context, series database.Series, me
 }
 
 type bookCoverCandidate struct {
-	book database.Book
-	meta database.BookMetadata
+	book    database.Book
+	meta    database.BookMetadata
+	allowed bool
 }
 
 func (s *Service) bookCoverCandidates(ctx context.Context, book database.Book) ([]bookCoverCandidate, error) {
@@ -64,7 +66,7 @@ func (s *Service) bookCoverCandidates(ctx context.Context, book database.Book) (
 	if sourceErr != nil {
 		return nil, sourceErr
 	}
-	out := []bookCoverCandidate{{book, meta}}
+	out := []bookCoverCandidate{{book, meta, true}}
 	if len(sources) == 0 {
 		return out, nil
 	}
@@ -78,10 +80,11 @@ LEFT JOIN series_metadata sm ON sm.series_id=? WHERE l.id=?`, source.SeriesID, s
 			continue
 		}
 		var sourceMeta database.BookMetadata
-		if !scoped || scope.AllowsLibrary(source.LibraryID) {
+		allowed := !scoped || scope.AllowsLibrary(source.LibraryID)
+		if allowed {
 			sourceMeta, _, _ = s.store.BookMetadataByID(ctx, source.ID)
 		}
-		out = append(out, bookCoverCandidate{source, sourceMeta})
+		out = append(out, bookCoverCandidate{source, sourceMeta, allowed})
 	}
 	return out, nil
 }
@@ -92,6 +95,7 @@ func (s *Service) GetBookCover(ctx context.Context, bookID string) (Data, bool, 
 	if err != nil {
 		return Data{}, false, err
 	}
+	bookID = book.ID
 	if _, scoped := database.UserScopeFromContext(ctx); !scoped {
 		ctx = database.WithUserScope(ctx, database.UserScope{
 			UserID: database.PrimaryAdminUserID, IsAdmin: true, AllowNSFW: true, ShowNSFW: s.store.ShowNSFW(ctx),
@@ -101,46 +105,115 @@ func (s *Service) GetBookCover(ctx context.Context, bookID string) (Data, bool, 
 	if err != nil {
 		return Data{}, false, err
 	}
-	mode := candidates[0].meta.CoverSource
-	explicit := mode != "" && mode != database.CoverSourceAuto
-	for _, source := range []string{"custom", "ext", database.CoverSourceBangumi, database.CoverSourceBook} {
-		if explicit && mode != source {
-			continue
+	for _, item := range candidates {
+		if data := s.fetchBookUserCover(ctx, item.book, item.meta, "custom"); len(data.Bytes) > 0 {
+			return s.visibleBookCover(ctx, bookID, data)
 		}
-		for _, candidate := range candidates {
-			ownMode := candidate.meta.CoverSource
-			if !explicit && ownMode != "" && ownMode != database.CoverSourceAuto && ownMode != source {
+	}
+	mode := candidates[0].meta.CoverSource
+	if mode == "archive" {
+		mode = database.CoverSourceBook
+	}
+	if mode == "external" {
+		mode = "ext"
+	}
+	if mode != database.CoverSourceBook {
+		var hasOwnChain bool
+		for _, item := range candidates {
+			if !item.allowed {
 				continue
 			}
-			var data Data
-			switch source {
-			case "custom", "ext":
-				data = s.fetchBookUserCover(ctx, candidate.book, candidate.meta, source)
-			case database.CoverSourceBangumi:
-				if candidate.meta.BgmSubjectID > 0 {
-					data, _ = s.getBookBangumiCover(ctx, candidate.meta)
-				}
-			case database.CoverSourceBook:
-				var err error
-				data, _, err = s.readBookThumbnail(ctx, candidate.book)
-				if err != nil {
-					return Data{}, false, err
-				}
+			cover, hasChain := s.resolveBookMetadataCover(ctx, item, mode)
+			if item.book.ID == bookID {
+				hasOwnChain = hasChain
 			}
-			if len(data.Bytes) > 0 {
-				return s.visibleBookCover(ctx, book.ID, data)
+			if len(cover.Bytes) > 0 {
+				return s.visibleBookCover(ctx, bookID, cover)
 			}
 		}
-		if source == database.CoverSourceBangumi && candidates[0].meta.BgmSubjectID <= 0 {
+		if !hasOwnChain && (mode == "" || mode == database.CoverSourceAuto || mode == database.CoverSourceBangumi) && candidates[0].meta.BgmSubjectID <= 0 {
 			if data := s.matchBookCover(ctx, book, candidates[0].meta); len(data.Bytes) > 0 {
-				return s.visibleBookCover(ctx, book.ID, data)
+				return s.visibleBookCover(ctx, bookID, data)
 			}
 		}
 	}
+	for _, item := range candidates {
+		data, ok, err := s.readBookThumbnail(ctx, item.book)
+		if err != nil {
+			return Data{}, false, err
+		}
+		if ok {
+			return s.visibleBookCover(ctx, bookID, data)
+		}
+	}
+
 	if err := ctx.Err(); err != nil {
 		return Data{}, false, err
 	}
 	return Data{}, false, nil
+}
+
+func (s *Service) resolveBookMetadataCover(ctx context.Context, item bookCoverCandidate, mode string) (Data, bool) {
+	candidates, err := s.store.ListBookCoverCandidates(ctx, item.book.ID)
+	if err != nil {
+		return Data{}, true
+	}
+	preferred := func(c database.BookCoverCandidate) bool {
+		switch mode {
+		case database.CoverSourceBangumi:
+			return c.CoverKind == database.CoverKindBangumi
+		case "ext":
+			return c.CoverKind != database.CoverKindBangumi
+		default:
+			return true
+		}
+	}
+	fetchCandidate := func(c database.BookCoverCandidate) Data {
+		if !s.coverRatingAllowed(ctx, c.IsNSFW, c.NSFWKnown) {
+			return Data{}
+		}
+		switch c.CoverKind {
+		case database.CoverKindImportedFile:
+			return s.importedCover(c.CoverRef)
+		case database.CoverKindBangumi:
+			id, _ := strconv.ParseInt(c.EntryID, 10, 64)
+			if id <= 0 {
+				return Data{}
+			}
+			data, _ := s.getBookBangumiCover(ctx, database.BookMetadata{BgmSubjectID: id, BgmCoverURL: c.CoverRef, BgmIsNSFW: c.IsNSFW || !c.NSFWKnown})
+			return data
+		case database.CoverKindHTTPURL:
+			return s.fetchExternalBookCover(ctx, c.SourceID, c.EntryID, c.SeriesEntryID, c.CoverRef)
+		}
+		return Data{}
+	}
+	for _, c := range candidates {
+		if preferred(c) {
+			if data := fetchCandidate(c); len(data.Bytes) > 0 {
+				return data, len(candidates) > 0
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		if mode != database.CoverSourceBangumi {
+			if data := s.fetchBookUserCover(ctx, item.book, item.meta, "ext"); len(data.Bytes) > 0 {
+				return data, len(candidates) > 0
+			}
+		}
+		if item.meta.BgmSubjectID > 0 {
+			if data, _ := s.getBookBangumiCover(ctx, item.meta); len(data.Bytes) > 0 {
+				return data, len(candidates) > 0
+			}
+		}
+	}
+	for _, c := range candidates {
+		if !preferred(c) {
+			if data := fetchCandidate(c); len(data.Bytes) > 0 {
+				return data, len(candidates) > 0
+			}
+		}
+	}
+	return Data{}, len(candidates) > 0
 }
 
 func (s *Service) visibleBookCover(ctx context.Context, id string, data Data) (Data, bool, error) {
@@ -171,6 +244,10 @@ func (s *Service) fetchBookUserCover(ctx context.Context, book database.Book, m 
 SELECT ext_entry_id FROM series_metadata WHERE series_id=? AND ext_source_id=?`, book.SeriesID, sourceID).Scan(&parentEntryID)
 		}
 	}
+	return s.fetchExternalBookCover(ctx, sourceID, entryID, parentEntryID, coverURL)
+}
+
+func (s *Service) fetchExternalBookCover(ctx context.Context, sourceID, entryID, parentEntryID, coverURL string) Data {
 	s.externalMu.RLock()
 	fetch := s.bookExternalFetcher
 	s.externalMu.RUnlock()
@@ -209,12 +286,13 @@ LEFT JOIN book_metadata m ON m.book_id=b.id WHERE b.series_id=?`, series.ID)
 	if rows.Err() != nil {
 		return Data{}
 	}
+	rows.Close()
 	matches, err := s.MatchTankobons(ctx, series, seriesMeta, volumes, false)
 	if err != nil {
 		return Data{}
 	}
 	for _, match := range matches {
-		if match.BookID == book.ID {
+		if match.BookID == book.ID && match.NSFWKnown {
 			data, _, _ := s.CacheBookBangumiCover(ctx, book.ID, meta, &match, false)
 			return data
 		}
@@ -226,13 +304,16 @@ LEFT JOIN book_metadata m ON m.book_id=b.id WHERE b.series_id=?`, series.ID)
 func (s *Service) CacheBookBangumiCover(ctx context.Context, bookID string, meta database.BookMetadata, match *VolumeMatchResult, force bool) (Data, bool, error) {
 	if match != nil && match.SubjectID > 0 && (meta.BgmSubjectID == 0 || force) {
 		if !match.NSFWKnown {
-			if match.NSFW && !s.store.ShowNSFW(ctx) {
+			if !s.store.ShowNSFW(ctx) {
 				return Data{}, false, nil
 			}
 			path := filepath.Join(s.bookBgmDir, fmt.Sprintf("bgm_%d_unverified.jpg", match.SubjectID))
 			cached := len(s.readBangumiCover(path, !s.store.ShowNSFW(ctx))) > 0
 			data, err := s.fetchBangumiCover(ctx, match.SubjectID, match.CoverURL, path, match.NSFW, false)
 			return data, !cached && len(data.Bytes) > 0, err
+		}
+		if match.NSFW && !s.store.ShowNSFW(ctx) {
+			return Data{}, false, nil
 		}
 		var err error
 		meta, err = s.bindBookBangumiCover(ctx, bookID, meta.BgmSubjectID, *match, force)
@@ -372,6 +453,10 @@ func (s *Service) readBookThumbnail(ctx context.Context, book database.Book) (Da
 
 // GenerateBookThumbnail caches the first page already read by a reader or maintenance job.
 func (s *Service) GenerateBookThumbnail(ctx context.Context, book database.Book, page []byte) error {
+	return s.GenerateBookThumbnailWithOptions(ctx, book, page, false)
+}
+
+func (s *Service) GenerateBookThumbnailWithOptions(ctx context.Context, book database.Book, page []byte, force bool) error {
 	started := time.Now()
 	s.bookThumbnailMu.Lock()
 	defer s.bookThumbnailMu.Unlock()
@@ -385,7 +470,7 @@ func (s *Service) GenerateBookThumbnail(ctx context.Context, book database.Book,
 	}
 	if item, ok, err := s.bookThumbnail(ctx, book); err != nil {
 		return err
-	} else if ok {
+	} else if ok && !force {
 		if _, err := os.Stat(filepath.Join(s.bookThumbnailDir, filepath.Base(item.Path))); err == nil {
 			return nil
 		}

@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ import (
 
 	"github.com/xJogger/fake-komga-115/internal/archive"
 	"github.com/xJogger/fake-komga-115/internal/database"
+	"github.com/xJogger/fake-komga-115/internal/importedcover"
 )
 
 type ExternalCoverFetcher func(ctx context.Context, sourceID, entryID, coverURL string) ([]byte, string, error)
@@ -99,11 +101,12 @@ type Service struct {
 	nsfwFallbackFetcher    NSFWFallbackCoverFetcher
 	invalidateNSFWFallback func()
 
-	bookThumbnailDir string
-	bookCoverDir     string
-	bookBgmDir       string
-	bookCoverMu      sync.RWMutex
-	bookThumbnailMu  sync.RWMutex
+	importedCoversDir string
+	bookThumbnailDir  string
+	bookCoverDir      string
+	bookBgmDir        string
+	bookCoverMu       sync.RWMutex
+	bookThumbnailMu   sync.RWMutex
 
 	operationMu sync.RWMutex
 	inflightMu  sync.Mutex
@@ -124,14 +127,15 @@ func NewWithDataDir(store *database.Store, root, dataDir string, logger *slog.Lo
 	}
 	service := &Service{
 		store: store, root: root, bgmDir: bgmDir, logger: logger,
-		bookThumbnailDir: filepath.Join(dataDir, "book-thumbnails"),
-		bookCoverDir:     filepath.Join(dataDir, "book-covers"),
-		bookBgmDir:       filepath.Join(dataDir, "bangumi"),
-		bgmSem:           make(chan struct{}, 6),
-		bgmFailures:      make(map[string]time.Time),
-		bgmNSFWFailures:  make(map[string]bgmNSFWFailure),
-		bgmUserEpoch:     make(map[string]uint64),
-		inflight:         make(map[string]struct{}),
+		importedCoversDir: filepath.Join(dataDir, "imported-covers"),
+		bookThumbnailDir:  filepath.Join(dataDir, "book-thumbnails"),
+		bookCoverDir:      filepath.Join(dataDir, "book-covers"),
+		bookBgmDir:        filepath.Join(dataDir, "bangumi"),
+		bgmSem:            make(chan struct{}, 6),
+		bgmFailures:       make(map[string]time.Time),
+		bgmNSFWFailures:   make(map[string]bgmNSFWFailure),
+		bgmUserEpoch:      make(map[string]uint64),
+		inflight:          make(map[string]struct{}),
 	}
 	if err := service.cleanupOrphans(context.Background()); err != nil && logger != nil {
 		logger.Warn("clean orphan series thumbnails", "error", err)
@@ -154,7 +158,7 @@ func (s *Service) SetExternalCoverFetcher(fetcher ExternalCoverFetcher) {
 	s.bookExternalFetcher = nil
 	if fetcher != nil {
 		s.bookExternalFetcher = func(ctx context.Context, sourceID, entryID, parentEntryID, coverURL string) ([]byte, string, error) {
-			if parentEntryID != "" && !strings.HasPrefix(coverURL, "sqlite-blob://") {
+			if parentEntryID != "" {
 				entryID = parentEntryID
 			}
 			return fetcher(ctx, sourceID, entryID, coverURL)
@@ -275,17 +279,11 @@ func (s *Service) Get(ctx context.Context, seriesID string) (Data, bool, error) 
 		return Data{}, false, err
 	}
 	seriesID = series.ID
-	preferred, ok, preferOnlyBgm, externalAttempted := s.getPreferredCover(ctx, seriesID)
-	if ok {
-		if externalAttempted {
-			if _, err := s.store.SeriesByID(ctx, seriesID); err != nil {
-				return Data{}, false, err
-			}
+	if preferred := s.getPreferredCover(ctx, seriesID); len(preferred.Bytes) > 0 {
+		if _, err := s.store.SeriesByID(ctx, seriesID); err != nil {
+			return Data{}, false, err
 		}
 		return preferred, true, nil
-	}
-	if preferOnlyBgm {
-		return Data{}, false, nil
 	}
 
 	return s.getBookCover(ctx, seriesID)
@@ -326,17 +324,20 @@ func (s *Service) getOwnBookCover(ctx context.Context, seriesID string, includeH
 		return Data{}, false, err
 	}
 	item, ok, err := s.metadata(ctx, seriesID)
-	if err != nil || !ok {
+	if err != nil {
 		return Data{}, false, err
+	}
+	if !ok {
+		return s.readBookThumbnail(ctx, first)
 	}
 	if item.SourceBookID != first.ID || item.SourceVersion != archive.BookVersion(first) {
 		s.delete(ctx, seriesID, item)
-		return Data{}, false, nil
+		return s.readBookThumbnail(ctx, first)
 	}
 	data, err := os.ReadFile(s.path(item.Path))
 	if errors.Is(err, fs.ErrNotExist) {
 		s.delete(ctx, seriesID, item)
-		return Data{}, false, nil
+		return s.readBookThumbnail(ctx, first)
 	}
 	if err != nil {
 		return Data{}, false, err
@@ -578,67 +579,135 @@ func (s *Service) invalidateFallbackCoverCache() {
 	}
 }
 
-func (s *Service) getPreferredCover(ctx context.Context, seriesID string) (data Data, ok, onlyBangumi, attemptedExternal bool) {
-	var (
-		bgmID                       sql.NullInt64
-		coverSource                 string
-		coverPath                   string
-		sourceID, entryID, coverURL string
-		isNSFW                      bool
-	)
+func (s *Service) importedCover(ref string) Data {
+	raw, mediaType, _ := importedcover.Read(s.importedCoversDir, ref)
+	return Data{Bytes: raw, MediaType: mediaType}
+}
+
+func (s *Service) coverRatingAllowed(ctx context.Context, nsfw, known bool) bool {
+	return s.store.ShowNSFW(ctx) || (known && !nsfw)
+}
+
+func (s *Service) getPreferredCover(ctx context.Context, seriesID string) Data {
+	var bgmID sql.NullInt64
+	var mode, coverPath, sourceID, entryID, coverURL string
+	var nsfw bool
 	err := s.store.DB().QueryRowContext(ctx, `
-SELECT sm.bgm_subject_id,sm.cover_source,sm.bgm_cover_path,sm.ext_source_id,sm.ext_entry_id,sm.ext_cover_url,sm.is_nsfw
-FROM series_metadata sm WHERE sm.series_id=?`, seriesID).Scan(&bgmID, &coverSource, &coverPath, &sourceID, &entryID, &coverURL, &isNSFW)
-	if err != nil || coverSource == database.CoverSourceBook {
-		return Data{}, false, false, false
+SELECT bgm_subject_id,cover_source,bgm_cover_path,ext_source_id,ext_entry_id,ext_cover_url,is_nsfw
+FROM series_metadata WHERE series_id=?`, seriesID).Scan(&bgmID, &mode, &coverPath, &sourceID, &entryID, &coverURL, &nsfw)
+	if err != nil {
+		return Data{}
+	}
+	if _, scoped := database.UserScopeFromContext(ctx); !scoped {
+		ctx = database.WithUserScope(ctx, database.UserScope{UserID: database.PrimaryAdminUserID, IsAdmin: true, AllowNSFW: true, ShowNSFW: s.store.ShowNSFW(ctx)})
+	}
+	candidates, err := s.store.ListSeriesCoverCandidates(ctx, seriesID)
+	if err != nil {
+		return Data{}
 	}
 	s.externalMu.RLock()
-	fetcher := s.externalFetcher
+	fetch := s.externalFetcher
 	fallback := s.nsfwFallbackFetcher
 	s.externalMu.RUnlock()
-	nsfwBangumi := isNSFW && bgmID.Valid && bgmID.Int64 > 0
-	if fetcher != nil && sourceID != "" && entryID != "" && coverURL != "" {
-		if scope, ok := database.UserScopeFromContext(ctx); ok && !scope.AllowNSFW && isNSFW {
-			return Data{}, false, false, true
+
+	fetchExternal := func(sourceID, entryID, ref string) Data {
+		if fetch == nil || sourceID == "" || entryID == "" || ref == "" {
+			return Data{}
 		}
-		raw, mediaType, err := fetcher(ctx, sourceID, entryID, coverURL)
-		if err == nil && len(raw) > 0 {
-			return Data{Bytes: raw, MediaType: mediaType}, true, false, true
-		}
-		return Data{}, false, false, true
+		raw, mediaType, _ := fetch(ctx, sourceID, entryID, ref)
+		return Data{Bytes: raw, MediaType: mediaType}
 	}
-	if !bgmID.Valid || bgmID.Int64 <= 0 {
-		return Data{}, false, false, false
-	}
-	forceOnlyBgm := coverSource == database.CoverSourceBangumi
-	subjectID := bgmID.Int64
-	expectedFile := fmt.Sprintf("bgm_%d.jpg", subjectID)
-	if _, scoped := database.UserScopeFromContext(ctx); !scoped {
-		ctx = database.WithUserScope(ctx, database.UserScope{
-			UserID: database.PrimaryAdminUserID, AllowNSFW: true, ShowNSFW: s.store.ShowNSFW(ctx),
-		})
-	}
-	effectiveScope, _ := database.UserScopeFromContext(ctx)
-	nsfwEligible := nsfwBangumi && effectiveScope.EffectiveShowNSFW()
-	data, fetchErr := s.getOrFetchBangumiCover(ctx, subjectID, "", nsfwEligible)
-	if fetchErr != nil {
-		if s.logger != nil && !errors.Is(fetchErr, errBangumiCoverUnavailable) {
-			s.logger.Debug("lazy fetch Bangumi cover failed", "series", seriesID, "subject", subjectID, "error", fetchErr)
-		}
-		if nsfwEligible && fallback != nil {
-			raw, mediaType, err := fallback(ctx, seriesID)
-			if err == nil {
-				if _, _, err := image.DecodeConfig(bytes.NewReader(raw)); err == nil {
-					return Data{Bytes: raw, MediaType: mediaType}, true, forceOnlyBgm, true
-				}
+	fetchBangumi := func(subjectID int64, isNSFW bool) Data {
+		data, err := s.getOrFetchBangumiCover(ctx, subjectID, "", isNSFW && s.store.ShowNSFW(ctx))
+		if err == nil && subjectID == bgmID.Int64 {
+			expected := fmt.Sprintf("bgm_%d.jpg", subjectID)
+			if coverPath != expected {
+				_ = s.store.SetSeriesBgmCoverPath(ctx, seriesID, subjectID, expected)
 			}
 		}
-		return Data{}, false, forceOnlyBgm, false
+		return data
 	}
-	if coverPath != expectedFile {
-		_ = s.store.SetSeriesBgmCoverPath(ctx, seriesID, subjectID, expectedFile)
+	fetchCandidate := func(c database.SeriesCoverCandidate) Data {
+		if !s.coverRatingAllowed(ctx, c.IsNSFW, c.NSFWKnown) {
+			return Data{}
+		}
+		switch c.CoverKind {
+		case database.CoverKindImportedFile:
+			return s.importedCover(c.CoverRef)
+		case database.CoverKindBangumi:
+			id, _ := strconv.ParseInt(c.EntryID, 10, 64)
+			return fetchBangumi(id, c.IsNSFW)
+		case database.CoverKindHTTPURL:
+			return fetchExternal(c.SourceID, c.EntryID, c.CoverRef)
+		}
+		return Data{}
 	}
-	return data, true, forceOnlyBgm, false
+	for _, candidate := range candidates {
+		if candidate.SourceID == database.CoverCandidateSourceManual {
+			if data := fetchCandidate(candidate); len(data.Bytes) > 0 {
+				return data
+			}
+		}
+	}
+	if mode == database.CoverSourceBook {
+		return Data{}
+	}
+	preferred := func(c database.SeriesCoverCandidate) bool {
+		switch mode {
+		case database.CoverSourceBangumi:
+			return c.CoverKind == database.CoverKindBangumi
+		case "external", "ext":
+			return c.CoverKind != database.CoverKindBangumi
+		default:
+			return true
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate.SourceID != database.CoverCandidateSourceManual && preferred(candidate) {
+			if data := fetchCandidate(candidate); len(data.Bytes) > 0 {
+				return data
+			}
+		}
+	}
+	// An explicit legacy Bangumi choice still applies when a series gains its first external candidate.
+	if mode == database.CoverSourceBangumi && bgmID.Int64 > 0 &&
+		!slices.ContainsFunc(candidates, func(c database.SeriesCoverCandidate) bool { return c.CoverKind == database.CoverKindBangumi }) {
+		if data := fetchBangumi(bgmID.Int64, nsfw); len(data.Bytes) > 0 {
+			return data
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate.SourceID != database.CoverCandidateSourceManual && !preferred(candidate) {
+			if data := fetchCandidate(candidate); len(data.Bytes) > 0 {
+				return data
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		if mode != database.CoverSourceBangumi {
+			if data := fetchExternal(sourceID, entryID, coverURL); len(data.Bytes) > 0 {
+				return data
+			}
+			if bgmID.Int64 > 0 {
+				if data := fetchBangumi(bgmID.Int64, nsfw); len(data.Bytes) > 0 {
+					return data
+				}
+			}
+		} else if coverURL != "" {
+			if data := fetchExternal(sourceID, entryID, coverURL); len(data.Bytes) > 0 {
+				return data
+			}
+		}
+	}
+	if nsfw && bgmID.Int64 > 0 && s.store.ShowNSFW(ctx) && fallback != nil {
+		raw, mediaType, err := fallback(ctx, seriesID)
+		if err == nil {
+			if _, _, err := image.DecodeConfig(bytes.NewReader(raw)); err == nil {
+				return Data{Bytes: raw, MediaType: mediaType}
+			}
+		}
+	}
+	return Data{}
 }
 
 func (s *Service) BangumiStats(ctx context.Context) (Stats, error) {

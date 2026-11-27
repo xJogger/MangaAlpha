@@ -31,38 +31,42 @@ const (
 )
 
 type ScrapeRun struct {
-	ID            string `json:"id"`
-	LibraryID     string `json:"libraryId"`
-	LibraryName   string `json:"libraryName,omitempty"`
-	CurrentSeries string `json:"currentSeries,omitempty"`
-	Mode          string `json:"mode"`
-	Status        string `json:"status"`
-	AllowOnline   bool   `json:"allowOnline"`
-	StartedAt     string `json:"startedAt"`
-	CompletedAt   string `json:"completedAt,omitempty"`
-	TotalSeries   int    `json:"totalSeries"`
-	Processed     int    `json:"processedSeries"`
-	Matched       int    `json:"matchedCount"`
-	Mapped        int    `json:"mappingCount"`
-	Unmatched     int    `json:"unmatchedCount"`
-	Skipped       int    `json:"skippedCount"`
-	Failed        int    `json:"failedCount"`
-	Error         string `json:"error,omitempty"`
+	ID            string   `json:"id"`
+	LibraryID     string   `json:"libraryId"`
+	LibraryIDs    []string `json:"libraryIds,omitempty"`
+	LibraryName   string   `json:"libraryName,omitempty"`
+	CurrentSeries string   `json:"currentSeries,omitempty"`
+	Mode          string   `json:"mode"`
+	Status        string   `json:"status"`
+	AllowOnline   bool     `json:"allowOnline"`
+	StartedAt     string   `json:"startedAt"`
+	CompletedAt   string   `json:"completedAt,omitempty"`
+	TotalSeries   int      `json:"totalSeries"`
+	Processed     int      `json:"processedSeries"`
+	Matched       int      `json:"matchedCount"`
+	Mapped        int      `json:"mappingCount"`
+	Unmatched     int      `json:"unmatchedCount"`
+	Skipped       int      `json:"skippedCount"`
+	Failed        int      `json:"failedCount"`
+	Error         string   `json:"error,omitempty"`
 }
 
 type scrapeSeries struct {
 	series    database.Series
 	coverSHA1 string
 	bound     bool
+	subjectID int64
+	origin    string
 }
 
 type scrapePlan struct {
-	sources       map[string]database.MetadataSource
-	chains        map[string][]database.LibraryMetadataSource
-	mappings      *MappingIndex
-	readySidecars map[string]bool
-	bySchema      map[string][]string
-	online        []database.MetadataSource
+	bangumiDisabled bool
+	sources         map[string]database.MetadataSource
+	chains          map[string][]database.LibraryMetadataSource
+	mappings        *MappingIndex
+	readySidecars   map[string]bool
+	bySchema        map[string][]string
+	online          []database.MetadataSource
 }
 
 func (p scrapePlan) chain(libraryID string) []database.LibraryMetadataSource {
@@ -78,7 +82,7 @@ func (p scrapePlan) hasReadyChain(libraryID string, bgmReady bool) bool {
 			continue
 		}
 		if p.readySidecars[link.SourceID] ||
-			(bgmReady && (link.SourceID == TargetSourceBangumi || p.sources[link.SourceID].Kind == KindBangumiArchive)) {
+			(bgmReady && ((link.SourceID == TargetSourceBangumi && !p.bangumiDisabled) || (p.sources[link.SourceID].Kind == KindBangumiArchive && p.sources[link.SourceID].Ready))) {
 			return true
 		}
 	}
@@ -86,6 +90,14 @@ func (p scrapePlan) hasReadyChain(libraryID string, bgmReady bool) bool {
 }
 
 func (m *Manager) HasReadySourcesForLibrary(ctx context.Context, libraryID string, allowOnline bool) (bool, error) {
+	var ids []string
+	if libraryID != "" {
+		ids = []string{libraryID}
+	}
+	return m.HasReadySourcesForLibraries(ctx, ids, allowOnline)
+}
+
+func (m *Manager) HasReadySourcesForLibraries(ctx context.Context, ids []string, allowOnline bool) (bool, error) {
 	if err := checkAdmin(ctx); err != nil {
 		return false, err
 	}
@@ -93,12 +105,17 @@ func (m *Manager) HasReadySourcesForLibrary(ctx context.Context, libraryID strin
 	if err != nil {
 		return false, err
 	}
-	if (allowOnline && len(plan.online) > 0) || plan.mappings.Len() > 0 {
+	if allowOnline && len(plan.online) > 0 {
 		return true, nil
 	}
 	bgmReady := m.bangumi != nil && m.bangumi.ArchiveStatus().Ready
-	if libraryID != "" {
-		return plan.hasReadyChain(libraryID, bgmReady), nil
+	if len(ids) != 0 {
+		for _, id := range ids {
+			if plan.hasReadyChain(id, bgmReady) {
+				return true, nil
+			}
+		}
+		return false, nil
 	}
 	rows, err := m.store.DB().QueryContext(ctx, "SELECT l.id FROM libraries l WHERE "+topLevelLibraryFilter)
 	if err != nil {
@@ -122,7 +139,45 @@ func (m *Manager) HasReadySourcesForLibrary(ctx context.Context, libraryID strin
 	return !hasLibraries && (bgmReady || len(plan.readySidecars) > 0), nil
 }
 
-func (m *Manager) StartMultiScrape(ctx context.Context, libraryID, mode string, allowOnline bool) (ScrapeRun, error) {
+type scrapeLibrary struct{ id, name string }
+
+func (m *Manager) topLevelLibraries(ctx context.Context) ([]scrapeLibrary, error) {
+	rows, err := m.store.DB().QueryContext(ctx, "SELECT l.id,l.name FROM libraries l WHERE "+topLevelLibraryFilter+" ORDER BY l.id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var libs []scrapeLibrary
+	for rows.Next() {
+		var lib scrapeLibrary
+		if err := rows.Scan(&lib.id, &lib.name); err != nil {
+			return nil, err
+		}
+		libs = append(libs, lib)
+	}
+	return libs, rows.Err()
+}
+
+func scrapeLibraryLabel(ids []string, names map[string]string) string {
+	labels := make([]string, 0, len(ids))
+	for _, id := range ids {
+		labels = append(labels, names[id])
+	}
+	return formatScrapeLibraryNames(labels)
+}
+
+func formatScrapeLibraryNames(names []string) string {
+	switch len(names) {
+	case 0:
+		return "全部未隐藏书库"
+	case 1, 2:
+		return strings.Join(names, "、")
+	default:
+		return fmt.Sprintf("%s 等 %d 个书库", strings.Join(names[:2], "、"), len(names))
+	}
+}
+
+func (m *Manager) StartMultiScrape(ctx context.Context, libraryID, mode string, allowOnline bool, requested ...[]string) (ScrapeRun, error) {
 	if err := checkAdmin(ctx); err != nil {
 		return ScrapeRun{}, err
 	}
@@ -136,23 +191,71 @@ func (m *Manager) StartMultiScrape(ctx context.Context, libraryID, mode string, 
 	default:
 		return ScrapeRun{}, ErrInvalidConfig
 	}
-	libraryName := "全部未隐藏书库"
-	if libraryID != "" {
-		lib, err := m.store.LibraryBasic(ctx, libraryID)
-		if err != nil {
-			return ScrapeRun{}, err
-		}
-		if !lib.Enabled || lib.UnionParentID != "" {
+	var ids []string
+	if len(requested) > 0 {
+		ids = requested[0]
+	}
+	if len(ids) == 0 && libraryID != "" {
+		ids = []string{libraryID}
+	}
+
+	eligible, err := m.topLevelLibraries(ctx)
+	if err != nil {
+		return ScrapeRun{}, err
+	}
+	names := make(map[string]string, len(eligible))
+	for _, lib := range eligible {
+		names[lib.id] = lib.name
+	}
+	selected := make([]string, 0, len(ids))
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if _, ok := names[id]; !ok {
+			if _, err := m.store.LibraryBasic(ctx, id); err != nil {
+				return ScrapeRun{}, err
+			}
 			return ScrapeRun{}, ErrUnavailable
 		}
-		libraryName = lib.Name
+		if !seen[id] {
+			selected = append(selected, id)
+			seen[id] = true
+		}
 	}
-	ready, err := m.HasReadySourcesForLibrary(ctx, libraryID, allowOnline)
+	ready, err := m.HasReadySourcesForLibraries(ctx, selected, allowOnline)
 	if err != nil {
 		return ScrapeRun{}, err
 	}
 	if !ready {
 		return ScrapeRun{}, ErrNoReadySources
+	}
+	all := len(selected) == 0 || (len(selected) > 1 && len(selected) == len(eligible))
+	if len(selected) == 0 {
+		for _, lib := range eligible {
+			selected = append(selected, lib.id)
+		}
+	}
+	versions := make(map[string]string, len(selected))
+	states, err := m.store.ListAllLibraryMetadataChainStates(ctx)
+	if err != nil {
+		return ScrapeRun{}, err
+	}
+	for _, id := range selected {
+		versions[id] = states[id].ChainVersion
+	}
+	storedIDs := selected
+	if all {
+		storedIDs = nil
+	}
+	libraryID = ""
+	if len(storedIDs) == 1 {
+		libraryID = storedIDs[0]
+	}
+	libraryName := scrapeLibraryLabel(storedIDs, names)
+	idsJSON := ""
+	if len(storedIDs) > 0 {
+		raw, _ := json.Marshal(storedIDs)
+		idsJSON = string(raw)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -163,7 +266,7 @@ func (m *Manager) StartMultiScrape(ctx context.Context, libraryID, mode string, 
 		return ScrapeRun{}, ErrBusy
 	}
 	run := ScrapeRun{
-		ID: "ext_" + newRunID(), LibraryID: libraryID, LibraryName: libraryName, Mode: mode, AllowOnline: allowOnline,
+		ID: "ext_" + newRunID(), LibraryID: libraryID, LibraryName: libraryName, LibraryIDs: storedIDs, Mode: mode, AllowOnline: allowOnline,
 		Status: "running", StartedAt: timestamp(),
 	}
 	storedMode := mode
@@ -171,8 +274,8 @@ func (m *Manager) StartMultiScrape(ctx context.Context, libraryID, mode string, 
 		storedMode += "+online"
 	}
 	if _, err := m.store.DB().ExecContext(ctx, `
-INSERT INTO bangumi_scrape_runs(id,library_id,mode,force,status,started_at,created_at)
-VALUES(?,nullif(?,''),?,?,'running',?,?)`, run.ID, libraryID, storedMode, mode == bangumi.ScrapeModeForce,
+INSERT INTO bangumi_scrape_runs(id,library_id,library_ids_json,mode,force,status,started_at,created_at)
+VALUES(?,nullif(?,''),?,?,?,'running',?,?)`, run.ID, libraryID, idsJSON, storedMode, mode == bangumi.ScrapeModeForce,
 		run.StartedAt, run.StartedAt); err != nil {
 		return ScrapeRun{}, err
 	}
@@ -186,12 +289,14 @@ VALUES(?,nullif(?,''),?,?,'running',?,?)`, run.ID, libraryID, storedMode, mode =
 	flush := m.scrapeFlush
 	m.wg.Go(func() {
 		defer cancel()
-		m.executeScrape(jobCtx, run, flush)
+		m.executeScrape(jobCtx, run, flush, selected, versions)
 	})
-	return run, nil
+	response := run
+	response.LibraryIDs = slices.Clone(run.LibraryIDs)
+	return response, nil
 }
 
-func (m *Manager) executeScrape(ctx context.Context, run ScrapeRun, flush <-chan struct{}) {
+func (m *Manager) executeScrape(ctx context.Context, run ScrapeRun, flush <-chan struct{}, selected []string, versions map[string]string) {
 	started := time.Now()
 	flushCtx, stopFlush := context.WithCancel(ctx)
 	flushed := make(chan struct{})
@@ -201,7 +306,7 @@ func (m *Manager) executeScrape(ctx context.Context, run ScrapeRun, flush <-chan
 		m.flushScrapeProgress(flushCtx, initial, flush)
 	}()
 
-	err := m.multiScrape(database.WithAutomaticMetadata(ctx), &run)
+	err := m.multiScrape(database.WithAutomaticMetadata(ctx), &run, selected)
 	stopFlush()
 	<-flushed
 	m.mu.Lock()
@@ -221,6 +326,13 @@ func (m *Manager) executeScrape(ctx context.Context, run ScrapeRun, flush <-chan
 		run.Status, run.Error = "failed", "could not save metadata scrape status"
 		if m.logger != nil {
 			m.logger.Warn(run.Error, "runId", run.ID)
+		}
+	}
+	if run.Status == "success" && run.Mode == bangumi.ScrapeModeForce {
+		for id, version := range versions {
+			if err := m.store.MarkLibraryMetadataChainApplied(context.Background(), id, version); err != nil && m.logger != nil {
+				m.logger.Warn("could not mark metadata chain applied", "libraryId", id)
+			}
 		}
 	}
 	diagnostics.Default().Record(diagnostics.Event{
@@ -250,7 +362,7 @@ func (m *Manager) flushScrapeProgress(ctx context.Context, saved ScrapeRun, flus
 		m.mu.RLock()
 		run := m.scrapes[len(m.scrapes)-1]
 		m.mu.RUnlock()
-		if run != saved && m.saveScrapeRun(ctx, run) == nil {
+		if (run.Processed != saved.Processed || run.TotalSeries != saved.TotalSeries || run.CurrentSeries != saved.CurrentSeries) && m.saveScrapeRun(ctx, run) == nil {
 			saved = run
 		}
 	}
@@ -271,20 +383,32 @@ WHERE id=?`, run.Status, run.CompletedAt, run.TotalSeries, run.Processed, run.Ma
 }
 
 const selectScrapeRuns = `
-SELECT r.id,coalesce(r.library_id,''),coalesce(l.name,'全部未隐藏书库'),r.mode,r.status,
+SELECT r.id,coalesce(r.library_id,''),r.library_ids_json,coalesce((
+ SELECT json_group_array(coalesce(l.name, x.value)) FROM json_each(
+ CASE WHEN r.library_ids_json<>'' THEN r.library_ids_json
+      WHEN r.library_id IS NOT NULL THEN json_array(r.library_id) ELSE '[]' END
+ ) x LEFT JOIN libraries l ON l.id=x.value
+),'[]'),r.mode,r.status,
  coalesce(r.started_at,''),coalesce(r.completed_at,''),r.total_series,r.processed_series,
  r.matched_count,r.unmatched_count,r.skipped_count,r.failed_count,r.current_series,r.errors_json
-FROM bangumi_scrape_runs r LEFT JOIN libraries l ON l.id=r.library_id
+FROM bangumi_scrape_runs r
 WHERE r.id LIKE 'ext_%'`
 
 func scanStoredScrapeRun(row interface{ Scan(...any) error }) (ScrapeRun, error) {
 	var run ScrapeRun
-	var errorsJSON string
-	if err := row.Scan(&run.ID, &run.LibraryID, &run.LibraryName, &run.Mode, &run.Status, &run.StartedAt,
+	var errorsJSON, idsJSON, namesJSON string
+	if err := row.Scan(&run.ID, &run.LibraryID, &idsJSON, &namesJSON, &run.Mode, &run.Status, &run.StartedAt,
 		&run.CompletedAt, &run.TotalSeries, &run.Processed, &run.Matched, &run.Unmatched, &run.Skipped,
 		&run.Failed, &run.CurrentSeries, &errorsJSON); err != nil {
 		return ScrapeRun{}, err
 	}
+	_ = json.Unmarshal([]byte(idsJSON), &run.LibraryIDs)
+	if len(run.LibraryIDs) == 0 && run.LibraryID != "" {
+		run.LibraryIDs = []string{run.LibraryID}
+	}
+	var names []string
+	_ = json.Unmarshal([]byte(namesJSON), &names)
+	run.LibraryName = formatScrapeLibraryNames(names)
 	run.Mode, run.AllowOnline = strings.CutSuffix(run.Mode, "+online")
 	var messages []string
 	if json.Unmarshal([]byte(errorsJSON), &messages) == nil && len(messages) > 0 {
@@ -299,6 +423,7 @@ func (m *Manager) mergeScrapeProgress(run ScrapeRun) ScrapeRun {
 	for _, live := range m.scrapes {
 		if live.ID == run.ID {
 			live.LibraryName = run.LibraryName
+			live.LibraryIDs = slices.Clone(live.LibraryIDs)
 			return live
 		}
 	}
@@ -350,8 +475,11 @@ func (m *Manager) CancelScrape(runID string) error {
 func (m *Manager) CancelLibrary(libraryID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.scrapeCancel != nil && m.scrapes[len(m.scrapes)-1].LibraryID == libraryID {
-		m.scrapeCancel()
+	if m.scrapeCancel != nil {
+		run := m.scrapes[len(m.scrapes)-1]
+		if run.LibraryID == libraryID || slices.Contains(run.LibraryIDs, libraryID) {
+			m.scrapeCancel()
+		}
 	}
 	// An all-library run checks visibility at each write and before online requests.
 }
@@ -374,6 +502,9 @@ func (m *Manager) scrapePlan(ctx context.Context) (scrapePlan, error) {
 	}
 	for _, src := range sources {
 		if !src.Enabled {
+			if src.ID == TargetSourceBangumi {
+				plan.bangumiDisabled = true
+			}
 			continue
 		}
 		plan.sources[src.ID] = src
@@ -389,20 +520,23 @@ func (m *Manager) scrapePlan(ctx context.Context) (scrapePlan, error) {
 	return plan, nil
 }
 
-func (m *Manager) scrapeTargets(ctx context.Context, libraryID, mode string) ([]scrapeSeries, error) {
+func (m *Manager) scrapeTargets(ctx context.Context, ids []string, mode string) ([]scrapeSeries, error) {
 	query := `
 SELECT s.id,s.library_id,s.name,s.relative_path,s.one_shot,
        coalesce(sm.ext_cover_url,''),
-       (coalesce(sm.bgm_subject_id,0)>0 OR coalesce(sm.ext_entry_id,'')<>'')
+       (coalesce(sm.bgm_subject_id,0)>0 OR coalesce(sm.ext_entry_id,'')<>''),coalesce(sm.bgm_subject_id,0),coalesce(sm.match_origin,'')
 FROM series s JOIN libraries l ON l.id=s.library_id
 LEFT JOIN series_metadata sm ON sm.series_id=s.id
 WHERE ` + topLevelLibraryFilter + `
   AND coalesce(sm.match_origin,'') NOT IN ('manual','agent')
-  AND NOT (coalesce(sm.match_origin,'')='' AND (coalesce(sm.bgm_subject_id,0)>0 OR coalesce(sm.ext_entry_id,'')<>''))`
-	var args []any
-	if libraryID != "" {
-		query += " AND s.library_id=?"
-		args = append(args, libraryID)
+`
+	if ids == nil {
+		ids = []string{}
+	}
+	raw, _ := json.Marshal(ids)
+	query += " AND s.library_id IN (SELECT value FROM json_each(?))"
+	if mode != bangumi.ScrapeModeForce {
+		query += " AND NOT (coalesce(sm.match_origin,'')='' AND (coalesce(sm.bgm_subject_id,0)>0 OR coalesce(sm.ext_entry_id,'')<>''))"
 	}
 	switch mode {
 	case bangumi.ScrapeModeIncremental:
@@ -410,7 +544,7 @@ WHERE ` + topLevelLibraryFilter + `
 	case bangumi.ScrapeModeRetryUnmatched:
 		query += " AND coalesce(sm.scrape_status,'none')<>'matched'"
 	}
-	rows, err := m.store.DB().QueryContext(ctx, query+" ORDER BY s.library_id,s.id", args...)
+	rows, err := m.store.DB().QueryContext(ctx, query+" ORDER BY s.library_id,s.id", string(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -420,7 +554,7 @@ WHERE ` + topLevelLibraryFilter + `
 		var target scrapeSeries
 		var coverURL string
 		if err := rows.Scan(&target.series.ID, &target.series.LibraryID, &target.series.Name,
-			&target.series.RelativePath, &target.series.OneShot, &coverURL, &target.bound); err != nil {
+			&target.series.RelativePath, &target.series.OneShot, &coverURL, &target.bound, &target.subjectID, &target.origin); err != nil {
 			return nil, err
 		}
 		target.coverSHA1 = ExtractThumbSHA1(coverURL)
@@ -429,12 +563,12 @@ WHERE ` + topLevelLibraryFilter + `
 	return out, rows.Err()
 }
 
-func (m *Manager) multiScrape(ctx context.Context, run *ScrapeRun) error {
+func (m *Manager) multiScrape(ctx context.Context, run *ScrapeRun, selected []string) error {
 	plan, err := m.scrapePlan(ctx)
 	if err != nil {
 		return err
 	}
-	targets, err := m.scrapeTargets(ctx, run.LibraryID, run.Mode)
+	targets, err := m.scrapeTargets(ctx, selected, run.Mode)
 	if err != nil {
 		return err
 	}
@@ -447,12 +581,24 @@ func (m *Manager) multiScrape(ctx context.Context, run *ScrapeRun) error {
 		}
 		run.CurrentSeries = target.series.Name
 		m.publishScrapeProgress(run)
-		incoming, matched, err := m.matchOffline(ctx, target, plan)
-		if err == nil && !matched && run.AllowOnline && len(plan.online) > 0 {
+		hits, err := m.matchOffline(ctx, target, plan, run.Mode == bangumi.ScrapeModeForce)
+		if err == nil && len(hits) == 0 && !target.bound && run.AllowOnline && len(plan.online) > 0 {
 			pending = append(pending, target)
-		} else {
-			m.finishSeries(ctx, run, target, incoming, matched, err)
+			continue
 		}
+		var incoming database.ScrapedMetadata
+		if err == nil && len(hits) > 0 {
+			incoming, _, err = m.applyOfflineHits(ctx, target.series, hits, run.Mode == bangumi.ScrapeModeForce, &target.subjectID)
+		} else if err == nil && run.Mode == bangumi.ScrapeModeForce && target.bound && target.subjectID == 0 && target.origin != "" {
+			inferred := bangumi.InferPathNSFW(target.series.Name, target.series.RelativePath)
+			_, _, err = m.store.ApplyMetadataChain(ctx, target.series, database.ChainSeriesMatch{
+				Metadata: database.ScrapedMetadata{IsNSFW: inferred}, Replace: true, MarkUnmatched: true, ExpectedSubjectID: &target.subjectID,
+			})
+		} else if err == nil && !target.bound {
+			inferred := bangumi.InferPathNSFW(target.series.Name, target.series.RelativePath)
+			err = m.store.MarkSeriesScrapeStatusWithNSFW(ctx, target.series, database.ScrapeStatusUnmatched, 0, inferred)
+		}
+		m.recordScrapeResult(run, incoming, len(hits) > 0, err)
 	}
 	return m.enrichOnline(ctx, run, plan.online, pending)
 }
@@ -462,17 +608,17 @@ func (m *Manager) finishSeries(ctx context.Context, run *ScrapeRun, target scrap
 		switch {
 		case matched:
 			_, err = m.store.ApplyScrapedMetadata(ctx, target.series, incoming)
-			if err == nil && incoming.ExtSourceID != "" && incoming.ExtEntryID != "" {
-				err = m.syncSeriesBooks(ctx, target.series, incoming.ExtSourceID, incoming.ExtEntryID, incoming.MatchOrigin)
-				if err != nil && !errors.Is(err, database.ErrMetadataChanged) && m.logger != nil {
-					m.logger.Warn("failed to align series books metadata", "seriesId", target.series.ID, "sourceId", incoming.ExtSourceID, "error", err)
-				}
-			}
+
 		case !target.bound:
 			inferred := bangumi.InferPathNSFW(target.series.Name, target.series.RelativePath)
 			err = m.store.MarkSeriesScrapeStatusWithNSFW(ctx, target.series, database.ScrapeStatusUnmatched, 0, inferred)
 		}
 	}
+	m.recordScrapeResult(run, incoming, matched, err)
+	return err
+}
+
+func (m *Manager) recordScrapeResult(run *ScrapeRun, incoming database.ScrapedMetadata, matched bool, err error) {
 	run.Processed++
 	switch {
 	case errors.Is(err, database.ErrMetadataChanged):
@@ -489,7 +635,6 @@ func (m *Manager) finishSeries(ctx context.Context, run *ScrapeRun, target scrap
 		run.Unmatched++
 	}
 	m.publishScrapeProgress(run)
-	return err
 }
 
 func (m *Manager) publishScrapeProgress(run *ScrapeRun) {
@@ -503,110 +648,6 @@ func (m *Manager) publishScrapeProgress(run *ScrapeRun) {
 		}
 	}
 	m.scrapes[i] = *run
-}
-
-func (m *Manager) matchOffline(ctx context.Context, target scrapeSeries, plan scrapePlan) (database.ScrapedMetadata, bool, error) {
-	series := target.series
-	chain := plan.chain(series.LibraryID)
-	parsed := bangumi.ParseSeriesWithPath(series.Name, series.RelativePath)
-	titles := append(slices.Clone(parsed.Candidates), series.Name)
-	var embedded *EmbeddedMeta
-	var readCachedMeta bool
-	var sourceErr error
-	for _, link := range chain {
-		if !link.Enabled {
-			continue
-		}
-		src := plan.sources[link.SourceID]
-		if link.SourceID == TargetSourceBangumi || src.Kind == KindBangumiArchive {
-			if m.bangumi == nil {
-				continue
-			}
-			meta, found, err := m.bangumi.OfflineMatch(ctx, series)
-			if found {
-				meta.MatchOrigin = "auto"
-				return meta, true, nil
-			}
-			if err != nil {
-				sourceErr = err
-			}
-		}
-		if !plan.readySidecars[link.SourceID] {
-			continue
-		}
-		if !readCachedMeta {
-			readCachedMeta = true
-			embedded = m.cachedEmbeddedMetaFromDB(ctx, series.ID)
-		}
-		entry, confidence, err := m.matchSidecar(ctx, src.ID, titles, parsed.Authors, target.coverSHA1, embedded)
-		if err != nil {
-			sourceErr = err
-			continue
-		}
-		if entry != nil {
-			return m.externalMetadata(ctx, src, entry, "auto", confidence), true, nil
-		}
-	}
-	meta, found, err := m.matchMapping(ctx, target.series, parsed, chain, plan)
-	if found {
-		return meta, true, nil
-	}
-	return meta, false, errors.Join(sourceErr, err)
-}
-
-func (m *Manager) matchMapping(ctx context.Context, series database.Series, parsed bangumi.ParsedQuery, chain []database.LibraryMetadataSource, plan scrapePlan) (database.ScrapedMetadata, bool, error) {
-	key := firstNonEmpty(append(slices.Clone(parsed.Candidates), series.Name)...)
-	authors := parsed.Authors
-	if len(authors) == 0 {
-		authors = []string{""}
-	}
-	for _, author := range authors {
-		if rec, ok := plan.mappings.Lookup(key, series.Name, author, TargetSourceBangumi); ok && m.bangumi != nil {
-			if id, err := strconv.ParseInt(rec.TargetID, 10, 64); err == nil && id > 0 {
-				meta, found, err := m.bangumi.OfflineSubject(ctx, series, id)
-				if found || err != nil {
-					meta.MatchOrigin = "mapping"
-					return meta, found, err
-				}
-			}
-		}
-		for _, schema := range []string{TargetSourceMetaV1, SchemaMangaAlphaMetaV2, SchemaKomgaSQLiteV1, TargetSourceGalleryV1} {
-			rec, ok := plan.mappings.Lookup(key, series.Name, author, schema)
-			if !ok {
-				continue
-			}
-			bySchemaIDs := append([]string(nil), plan.bySchema[schema]...)
-			if schema == SchemaMangaAlphaMetaV2 {
-				for _, v1ID := range plan.bySchema[TargetSourceMetaV1] {
-					if !slices.Contains(bySchemaIDs, v1ID) {
-						bySchemaIDs = append(bySchemaIDs, v1ID)
-					}
-				}
-			}
-			ids := make([]string, 0, len(bySchemaIDs))
-			for _, link := range chain {
-				if link.Enabled && slices.Contains(bySchemaIDs, link.SourceID) {
-					ids = append(ids, link.SourceID)
-				}
-			}
-			for _, id := range bySchemaIDs {
-				if !slices.Contains(ids, id) {
-					ids = append(ids, id)
-				}
-			}
-			for _, id := range ids {
-				entry, err := m.entry(ctx, id, rec.TargetID)
-				if errors.Is(err, ErrEntryNotFound) || errors.Is(err, ErrUnavailable) {
-					continue
-				}
-				if err != nil {
-					return database.ScrapedMetadata{}, false, err
-				}
-				return m.externalMetadata(ctx, plan.sources[id], entry, "mapping", 1), true, nil
-			}
-		}
-	}
-	return database.ScrapedMetadata{}, false, nil
 }
 
 func (m *Manager) matchSidecar(ctx context.Context, id string, titles, authors []string, sha1 string, embedded *EmbeddedMeta) (*Entry, float64, error) {
@@ -886,14 +927,19 @@ func (m *Manager) BindSeriesExternal(ctx context.Context, seriesID, sourceID, en
 	if err != nil {
 		return database.SeriesMetadata{}, err
 	}
-	saved, err := m.store.ApplyScrapedMetadata(ctx, series, m.externalMetadata(ctx, src, entry, origin, 1))
+	hit := offlineHit{source: src, sourceID: src.ID, entry: entry, meta: m.externalMetadata(ctx, src, entry, origin, 1)}
+	chain, err := m.store.ListLibraryMetadataSources(ctx, series.LibraryID)
 	if err != nil {
-		return saved, err
+		return database.SeriesMetadata{}, err
 	}
-	if err := m.syncSeriesBooks(ctx, series, src.ID, entry.EntryID, origin); err != nil {
-		return saved, err
+	for rank, link := range chain {
+		if link.SourceID == src.ID {
+			hit.rank = rank
+			break
+		}
 	}
-	return saved, nil
+	_, saved, err := m.applyOfflineHits(ctx, series, []offlineHit{hit}, false, nil)
+	return saved, err
 }
 
 func (m *Manager) sourceTagDictionary(ctx context.Context, sourceID string) *TagDictionary {
@@ -993,7 +1039,7 @@ func (m *Manager) externalMetadata(ctx context.Context, src database.MetadataSou
 	return database.ScrapedMetadata{
 		ExtSourceID:      src.ID,
 		ExtEntryID:       entry.EntryID,
-		ExtCoverURL:      entry.CoverURL,
+		ExtCoverURL:      "",
 		MatchOrigin:      origin,
 		Confidence:       confidence,
 		Status:           entry.Status,
@@ -1062,25 +1108,29 @@ func (m *Manager) cachedEmbeddedMetaFromDB(ctx context.Context, seriesID string)
 }
 
 type localBookCandidate struct {
-	ID         string
-	Name       string
-	FileID     string
-	NumberSort float64
+	ID             string
+	Name           string
+	FileID         string
+	NumberSort     float64
+	MetadataNumber string
 }
 
 type remoteBookEntry struct {
-	EntryID     string
-	FileNames   []string
-	Title       string
-	Summary     string
-	Number      string
-	NumberSort  *float64
-	ReleaseDate string
-	ISBN        string
-	Authors     []database.Author
-	Tags        []string
-	Links       []database.Link
-	CoverURL    string
+	EntryID      string
+	FileNames    []string
+	Title        string
+	Summary      string
+	Number       string
+	NumberSort   *float64
+	ReleaseDate  string
+	ISBN         string
+	Authors      []database.Author
+	Tags         []string
+	Links        []database.Link
+	CoverURL     string
+	DefaultTitle bool
+	ThumbnailID  string
+	HasCoverBlob bool
 }
 
 type bookMatchPair struct {
@@ -1105,282 +1155,30 @@ var (
 	bookSeparatorsClean = strings.NewReplacer("_", " ", "　", " ")
 )
 
-func (m *Manager) syncSeriesBooks(ctx context.Context, series database.Series, sourceID, entryID, origin string) error {
-	if sourceID == "" || sourceID == TargetSourceBangumi || entryID == "" {
-		return nil
-	}
-	src, err := m.store.GetMetadataSource(ctx, sourceID)
-	if err != nil {
-		return err
-	}
-	// Online-only enrichment has no offline book catalog to align.
-	if !src.Ready {
-		return nil
-	}
-	m.mu.RLock()
-	sidecar := m.sidecars[sourceID]
-	m.mu.RUnlock()
-	if sidecar == nil || sidecar.upstreamDB == nil {
-		return ErrUnavailable
-	}
-
-	displayMode := TagDisplayMode(src.TagDisplayMode)
-	dict := m.sourceTagDictionary(ctx, src.TagDictSourceID)
-
-	var remotes []remoteBookEntry
-	switch sidecar.Schema() {
-	case SchemaKomgaSQLiteV1:
-		ks, err := ReadKomgaSeries(ctx, sidecar.upstreamDB, entryID)
-		if errors.Is(err, ErrEntryNotFound) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		remotes = make([]remoteBookEntry, 0, len(ks.Books))
-		for _, bk := range ks.Books {
-			tags := dedupeStrings(bk.Tags)
-			if dict != nil && len(tags) > 0 {
-				tags = dict.TranslateList(tags, displayMode)
-			}
-			var authors []database.Author
-			if len(bk.Authors) > 0 {
-				authors = make([]database.Author, 0, len(bk.Authors))
-				for _, a := range bk.Authors {
-					if name := strings.TrimSpace(a.Name); name != "" {
-						role := strings.TrimSpace(a.Role)
-						if role == "" {
-							role = "writer"
-						}
-						authors = append(authors, database.Author{Name: name, Role: role})
-					}
-				}
-			}
-			var links []database.Link
-			if len(bk.Links) > 0 {
-				links = make([]database.Link, 0, len(bk.Links))
-				for _, l := range bk.Links {
-					if u := strings.TrimSpace(l.URL); u != "" {
-						links = append(links, database.Link{Label: strings.TrimSpace(l.Label), URL: u})
-					}
-				}
-			}
-			var coverURL string
-			if bk.SelectedThumbnailID != "" {
-				coverURL = EncodeSQLiteBlobCoverRef(sourceID, SQLiteBlobKindKomgaBook, bk.SelectedThumbnailID)
-			}
-			var files []string
-			if bk.Name != "" {
-				files = append(files, bk.Name)
-			}
-			if tail := komgaPathTail(bk.URL); tail != "" {
-				files = append(files, tail)
-			}
-			remotes = append(remotes, remoteBookEntry{
-				EntryID:     bk.KomgaBookID,
-				FileNames:   files,
-				Title:       bk.Title,
-				Summary:     bk.Summary,
-				Number:      bk.Number,
-				NumberSort:  bk.NumberSort,
-				ReleaseDate: bk.ReleaseDate,
-				ISBN:        bk.ISBN,
-				Authors:     authors,
-				Tags:        tags,
-				Links:       links,
-				CoverURL:    coverURL,
-			})
-		}
-	case SchemaMangaAlphaMetaV1, SchemaMangaAlphaMetaV2:
-		openBooks, err := ReadOpenOfflineBooks(ctx, sidecar.upstreamDB, entryID)
-		if err != nil {
-			return err
-		}
-		if len(openBooks) == 0 {
-			return nil
-		}
-		remotes = make([]remoteBookEntry, 0, len(openBooks))
-		for _, bk := range openBooks {
-			tags := dedupeStrings(bk.Tags)
-			if dict != nil && len(tags) > 0 {
-				tags = dict.TranslateList(tags, displayMode)
-			}
-			var authors []database.Author
-			if len(bk.Authors) > 0 {
-				authors = make([]database.Author, 0, len(bk.Authors))
-				for _, a := range bk.Authors {
-					if name := strings.TrimSpace(a.Name); name != "" {
-						role := strings.TrimSpace(a.Role)
-						if role == "" {
-							role = "writer"
-						}
-						authors = append(authors, database.Author{Name: name, Role: role})
-					}
-				}
-			}
-			var links []database.Link
-			if len(bk.Links) > 0 {
-				links = make([]database.Link, 0, len(bk.Links))
-				for _, l := range bk.Links {
-					if u := strings.TrimSpace(l.URL); u != "" {
-						links = append(links, database.Link{Label: strings.TrimSpace(l.Label), URL: u})
-					}
-				}
-			}
-			coverURL := strings.TrimSpace(bk.CoverURL)
-			if coverURL == "" && bk.HasCoverBlob {
-				coverURL = EncodeSQLiteBlobCoverRef(sourceID, SQLiteBlobKindOpenBook, openBookCoverKey(bk.SeriesEntryID, bk.BookKey))
-			}
-			var files []string
-			if bk.FileName != "" {
-				files = append(files, bk.FileName)
-			}
-			if bk.BookKey != "" {
-				files = append(files, bk.BookKey)
-			}
-			remotes = append(remotes, remoteBookEntry{
-				EntryID:     bk.BookKey,
-				FileNames:   files,
-				Title:       bk.Title,
-				Summary:     bk.Summary,
-				Number:      bk.Number,
-				NumberSort:  bk.NumberSort,
-				ReleaseDate: bk.ReleaseDate,
-				ISBN:        bk.ISBN,
-				Authors:     authors,
-				Tags:        tags,
-				Links:       links,
-				CoverURL:    coverURL,
-			})
-		}
-	default:
-		return nil
-	}
-
-	if len(remotes) == 0 {
-		return nil
-	}
-
+func (m *Manager) localSeriesBooks(ctx context.Context, seriesID string) ([]localBookCandidate, error) {
 	rows, err := m.store.DB().QueryContext(ctx, `
-SELECT id, name, coalesce(file_id,''), number_sort
-FROM books
-WHERE series_id=?
-ORDER BY number_sort ASC, name COLLATE NOCASE ASC, id ASC`, series.ID)
+SELECT b.id,b.name,coalesce(b.file_id,''),b.number_sort,coalesce(m.number,'')
+FROM books b LEFT JOIN book_metadata m ON m.book_id=b.id
+WHERE b.series_id=?
+ORDER BY b.number_sort ASC, b.name COLLATE NOCASE ASC, b.id ASC`, seriesID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var locals []localBookCandidate
 	for rows.Next() {
 		var item localBookCandidate
-		if scanErr := rows.Scan(&item.ID, &item.Name, &item.FileID, &item.NumberSort); scanErr != nil {
+		if scanErr := rows.Scan(&item.ID, &item.Name, &item.FileID, &item.NumberSort, &item.MetadataNumber); scanErr != nil {
 			rows.Close()
-			return scanErr
+			return nil, scanErr
 		}
 		locals = append(locals, item)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return err
+		return nil, err
 	}
 	rows.Close()
-	if len(locals) == 0 {
-		return nil
-	}
-
-	pairs := alignSeriesBooks(locals, remotes)
-	if len(pairs) == 0 {
-		return nil
-	}
-	return m.writeAlignedSeriesBooks(ctx, series.ID, sourceID, entryID, origin, locals, remotes, pairs)
-}
-
-func (m *Manager) writeAlignedSeriesBooks(ctx context.Context, seriesID, sourceID, entryID, origin string, locals []localBookCandidate, remotes []remoteBookEntry, pairs []bookMatchPair) error {
-	// The store starts immediate transactions. Hold the writer lock from the
-	// parent binding check through all book writes so a rebind cannot interleave.
-	tx, err := m.store.DB().BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	var bound bool
-	if err := tx.QueryRowContext(ctx, `
-SELECT EXISTS(SELECT 1 FROM series_metadata WHERE series_id=? AND ext_source_id=? AND ext_entry_id=? AND match_origin=?)`,
-		seriesID, sourceID, entryID, origin).Scan(&bound); err != nil {
-		return err
-	}
-	if !bound {
-		return database.ErrMetadataChanged
-	}
-	automatic := origin == "auto" || origin == "mapping"
-	for _, pair := range pairs {
-		loc, rem := locals[pair.localIdx], remotes[pair.remoteIdx]
-		if rem.NumberSort != nil && (math.IsNaN(*rem.NumberSort) || math.IsInf(*rem.NumberSort, 0)) {
-			return errors.New("book number sort must be finite")
-		}
-		authors, tags, links := bookEnrichmentJSON(rem)
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO book_metadata(book_id,title,summary,number,number_sort,release_date,isbn,authors_json,tags_json,links_json,
- ext_source_id,ext_entry_id,ext_cover_url,match_origin,updated_at)
-SELECT id,?,?,?,?,?,?,coalesce(?,'[]'),coalesce(?,'[]'),coalesce(?,'[]'),?,?,?,?,?
-FROM books WHERE id=? AND series_id=?
-ON CONFLICT(book_id) DO UPDATE SET
- title=CASE WHEN NOT book_metadata.title_lock AND excluded.title<>'' THEN excluded.title ELSE book_metadata.title END,
- summary=CASE WHEN NOT book_metadata.summary_lock AND excluded.summary<>'' THEN excluded.summary ELSE book_metadata.summary END,
- number=CASE WHEN NOT book_metadata.number_lock AND excluded.number<>'' THEN excluded.number ELSE book_metadata.number END,
- number_sort=CASE WHEN NOT book_metadata.number_sort_lock THEN coalesce(excluded.number_sort,book_metadata.number_sort) ELSE book_metadata.number_sort END,
- release_date=CASE WHEN NOT book_metadata.release_date_lock AND excluded.release_date<>'' THEN excluded.release_date ELSE book_metadata.release_date END,
- isbn=CASE WHEN NOT book_metadata.isbn_lock AND excluded.isbn<>'' THEN excluded.isbn ELSE book_metadata.isbn END,
- authors_json=CASE WHEN NOT book_metadata.authors_lock AND excluded.authors_json<>'[]' THEN excluded.authors_json ELSE book_metadata.authors_json END,
- tags_json=CASE WHEN NOT book_metadata.tags_lock AND excluded.tags_json<>'[]' THEN excluded.tags_json ELSE book_metadata.tags_json END,
- links_json=CASE WHEN NOT book_metadata.links_lock AND excluded.links_json<>'[]' THEN excluded.links_json ELSE book_metadata.links_json END,
- ext_cover_path=CASE WHEN (book_metadata.ext_source_id,book_metadata.ext_entry_id,book_metadata.ext_cover_url)
-  IS (excluded.ext_source_id,excluded.ext_entry_id,excluded.ext_cover_url) THEN book_metadata.ext_cover_path ELSE '' END,
- ext_source_id=excluded.ext_source_id,ext_entry_id=excluded.ext_entry_id,ext_cover_url=excluded.ext_cover_url,
- match_origin=excluded.match_origin,updated_at=excluded.updated_at
-WHERE NOT ? OR (book_metadata.match_origin NOT IN ('manual','agent')
- AND (book_metadata.match_origin<>'' OR (book_metadata.bgm_subject_id=0 AND book_metadata.ext_entry_id='')))`,
-			strings.TrimSpace(rem.Title), strings.TrimSpace(rem.Summary), strings.TrimSpace(rem.Number),
-			rem.NumberSort, strings.TrimSpace(rem.ReleaseDate), strings.TrimSpace(rem.ISBN), authors, tags, links,
-			sourceID, rem.EntryID, rem.CoverURL, origin, timestamp(), loc.ID, seriesID, automatic); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
-func bookEnrichmentJSON(rem remoteBookEntry) (authorsJSON, tagsJSON, linksJSON any) {
-	var authors []database.Author
-	seenAuthors := make(map[string]bool, len(rem.Authors))
-	for _, author := range rem.Authors {
-		author.Role = firstNonEmpty(strings.ToLower(author.Role), "writer")
-		key := strings.ToLower(author.Name) + "\x00" + author.Role
-		if !seenAuthors[key] {
-			seenAuthors[key] = true
-			authors = append(authors, author)
-		}
-	}
-	var links []database.Link
-	seenLinks := make(map[string]bool, len(rem.Links))
-	for _, link := range rem.Links {
-		link.Label = firstNonEmpty(link.Label, "Link")
-		if !seenLinks[link.URL] {
-			seenLinks[link.URL] = true
-			links = append(links, link)
-		}
-	}
-	if len(authors) > 0 {
-		raw, _ := json.Marshal(authors)
-		authorsJSON = string(raw)
-	}
-	if tags := dedupeStrings(rem.Tags); len(tags) > 0 {
-		raw, _ := json.Marshal(tags)
-		tagsJSON = string(raw)
-	}
-	if len(links) > 0 {
-		raw, _ := json.Marshal(links)
-		linksJSON = string(raw)
-	}
-	return authorsJSON, tagsJSON, linksJSON
+	return locals, nil
 }
 
 func alignSeriesBooks(locals []localBookCandidate, remotes []remoteBookEntry) []bookMatchPair {
@@ -1613,7 +1411,13 @@ func (m *Manager) ClearSeriesExternal(ctx context.Context, seriesID string) (dat
 	if err != nil {
 		return database.SeriesMetadata{}, err
 	}
-	return m.store.ClearSeriesExternalBinding(ctx, series)
+	m.importedMu.Lock()
+	defer m.importedMu.Unlock()
+	saved, refs, err := m.store.ClearSeriesExternalBindingWithCoverRefs(ctx, series)
+	if err == nil {
+		m.removeUnusedImportedCovers(ctx, refs)
+	}
+	return saved, err
 }
 
 type MappingExport struct {

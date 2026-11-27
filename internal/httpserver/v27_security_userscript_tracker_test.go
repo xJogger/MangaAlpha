@@ -28,6 +28,14 @@ import (
 
 func setupV27TestServer(t *testing.T, trustedProxies string) (*Server, *database.Store, *bangumi.Service, *httptest.Server) {
 	t.Helper()
+	srv, store, bgmSvc := newV27TestServer(t, trustedProxies)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return srv, store, bgmSvc, ts
+}
+
+func newV27TestServer(t *testing.T, trustedProxies string) (*Server, *database.Store, *bangumi.Service) {
+	t.Helper()
 	tempDir := t.TempDir()
 	store, err := database.Open(filepath.Join(tempDir, "v27.db"))
 	if err != nil {
@@ -70,9 +78,7 @@ func setupV27TestServer(t *testing.T, trustedProxies string) (*Server, *database
 		}, logger,
 	).WithServices(webdavMgr, bgmSvc)
 
-	ts := httptest.NewServer(srv.Handler())
-	t.Cleanup(ts.Close)
-	return srv, store, bgmSvc, ts
+	return srv, store, bgmSvc
 }
 
 func TestV27PublicSecurityHardeningAndLANCompatibility(t *testing.T) {

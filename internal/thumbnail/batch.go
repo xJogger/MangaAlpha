@@ -529,7 +529,7 @@ func randomBatchID() string {
 	return hex.EncodeToString(value[:])
 }
 
-const batchBoundCover = `coalesce(sm.bgm_subject_id,0)>0 OR
+const batchBoundCover = `EXISTS(SELECT 1 FROM series_cover_candidates c WHERE c.series_id=s.id) OR coalesce(sm.bgm_subject_id,0)>0 OR
  (coalesce(sm.ext_source_id,'')<>'' AND coalesce(sm.ext_entry_id,'')<>'' AND coalesce(sm.ext_cover_url,'')<>'')`
 
 func (m *BatchManager) selectMissingUnbound(ctx context.Context, libraryID string, all bool, limit int) ([]batchSeries, error) {
@@ -585,7 +585,7 @@ func (m *BatchManager) runSeries(ctx context.Context, seriesID string, missingUn
 	if missingUnbound {
 		var bound bool
 		err := m.store.DB().QueryRowContext(ctx,
-			"SELECT EXISTS(SELECT 1 FROM series_metadata sm WHERE sm.series_id=? AND ("+batchBoundCover+"))", seriesID).Scan(&bound)
+			"SELECT EXISTS(SELECT 1 FROM series s LEFT JOIN series_metadata sm ON sm.series_id=s.id WHERE s.id=? AND ("+batchBoundCover+"))", seriesID).Scan(&bound)
 		if err != nil || bound {
 			return false, err
 		}

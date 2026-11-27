@@ -20,6 +20,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/xJogger/fake-komga-115/internal/database"
+	"github.com/xJogger/fake-komga-115/internal/importedcover"
 	_ "modernc.org/sqlite"
 )
 
@@ -284,7 +285,7 @@ VALUES(?,?,?,?,?,?,1024,'','sha1fixture',?,?,?,'scan1')`,
 		id, seriesID, libID, seriesID+"/"+name, seriesID, name, numberSort, now, now)
 }
 
-func TestKomgaSQLiteSyncIndexScrapeBooksAndBlobCoverCache(t *testing.T) {
+func TestKomgaSQLiteSyncIndexScrapeBooksAndImportedCovers(t *testing.T) {
 	ctx := context.Background()
 	store, m, root := newTestManager(t, ManagerOptions{})
 	var err error
@@ -306,7 +307,7 @@ func TestKomgaSQLiteSyncIndexScrapeBooksAndBlobCoverCache(t *testing.T) {
 	src := addManagerSource(t, m, database.MetadataSource{
 		Name:      "Local Komga",
 		Kind:      KindOfflineSQLite,
-		LocalPath: komgaPath,
+		LocalPath: komgaPath, ImportCovers: true,
 	})
 	if src.SchemaType != FormatKomgaSQLite {
 		t.Fatalf("AddCustomSource auto SchemaType = %q, want %q", src.SchemaType, FormatKomgaSQLite)
@@ -334,8 +335,8 @@ func TestKomgaSQLiteSyncIndexScrapeBooksAndBlobCoverCache(t *testing.T) {
 		if err != nil || len(hits) == 0 || hits[0].EntryID != "k-s1" {
 			t.Fatalf("SearchWithHints(%q) = %+v, err=%v", q, hits, err)
 		}
-		if !strings.HasPrefix(hits[0].CoverURL, "sqlite-blob://"+src.ID+"/komga-series/") {
-			t.Fatalf("expected virtual blob cover ref in SearchMatch, got %q", hits[0].CoverURL)
+		if hits[0].CoverURL != "" {
+			t.Fatalf("index included a cover reference: %q", hits[0].CoverURL)
 		}
 	}
 
@@ -419,19 +420,19 @@ VALUES('aria',539,'https://bgm.example.test/539.jpg','auto','none','2026-01-01T0
 		sm.ReleaseDate != "2002-10-10" || sm.TotalBookCount == nil || *sm.TotalBookCount != 12 ||
 		sm.AgeRating == nil || *sm.AgeRating != 13 || len(sm.Links) != 1 || len(sm.SharingLabels) != 1 ||
 		len(sm.Genres) != 2 || len(sm.Authors) != 2 ||
-		sm.ExtCoverURL != "sqlite-blob://"+src.ID+"/komga-series/ts-1" {
+		sm.ExtCoverURL != "" {
 		t.Fatalf("incomplete Komga series metadata: %+v", sm)
 	}
 
 	// Check book alignment + locks + manual guard.
 	bm1, ok1, err := store.BookMetadataByID(ctx, "mb1")
 	if err != nil || !ok1 || bm1.ExtEntryID != "kb1" || bm1.ISBN != "978-4901926126" ||
-		bm1.ExtCoverURL != "sqlite-blob://"+src.ID+"/komga-book/tb-1" || len(bm1.Authors) != 2 || len(bm1.Links) != 1 {
+		bm1.ExtCoverURL != "" || len(bm1.Authors) != 2 || len(bm1.Links) != 1 {
 		t.Fatalf("unexpected mb1 metadata: ok=%v err=%v %+v", ok1, err, bm1)
 	}
 	bm2, ok2, err := store.BookMetadataByID(ctx, "mb2")
 	if err != nil || !ok2 || bm2.ExtEntryID != "kb2" || bm2.Title != lockedTitle || bm2.ISBN != lockedISBN ||
-		bm2.Summary != "Second volume summary" || bm2.ExtCoverURL != "sqlite-blob://"+src.ID+"/komga-book/tb-2" {
+		bm2.Summary != "Second volume summary" || bm2.ExtCoverURL != "" {
 		t.Fatalf("mb2 did not align unlocked fields or clobbered locks: ok=%v err=%v %+v", ok2, err, bm2)
 	}
 	bm3, ok3, err := store.BookMetadataByID(ctx, "mb3")
@@ -449,72 +450,34 @@ VALUES('aria',539,'https://bgm.example.test/539.jpg','auto','none','2026-01-01T0
 		t.Fatalf("cached book_metadata fallback failed: %+v, err=%v", uMeta, err)
 	}
 
-	// Lazy BLOB cover loading & disk cache hit verification.
-	adminCtx := database.WithUserScope(ctx, database.UserScope{UserID: "admin", IsAdmin: true, AllowNSFW: true, ShowNSFW: true})
-	sfBytes, sfMime, err := m.FetchCover(adminCtx, src.ID, "k-s1", sm.ExtCoverURL)
-	if err != nil || sfMime != "image/jpeg" || !bytes.Equal(sfBytes, jpgBytes) {
-		t.Fatalf("FetchCover komga-series failed: mime=%q err=%v", sfMime, err)
+	seriesCovers, err := store.ListSeriesCoverCandidates(ctx, "aria")
+	if err != nil || len(seriesCovers) != 1 {
+		t.Fatalf("series candidates: %+v, %v", seriesCovers, err)
 	}
-	currentSource, err := store.GetMetadataSource(ctx, src.ID)
-	if err != nil {
-		t.Fatal(err)
+	assertImportedTestCover(t, m.importedCovers, seriesCovers[0].CoverRef, "image/jpeg", jpgBytes)
+	bookCovers, err := store.ListBookCoverCandidates(ctx, "mb1")
+	if err != nil || len(bookCovers) != 1 {
+		t.Fatalf("book candidates: %+v, %v", bookCovers, err)
 	}
-	cacheKey := strings.Join([]string{sm.ExtCoverURL, currentSource.LocalSHA256, currentSource.LastUpdatedAt}, "\x00")
-	cachedData, hit := m.covers.readCachedFromDisk(src.ID, "k-s1", cacheKey)
-	if !hit || !cachedData.FromCache || !bytes.Equal(cachedData.Bytes, jpgBytes) {
-		t.Fatalf("expected disk cache hit after lazy BLOB fetch, hit=%v", hit)
-	}
-	bkBytes, bkMime, err := m.FetchCover(adminCtx, src.ID, "kb1", bm1.ExtCoverURL)
-	if err != nil || bkMime != "image/png" || !bytes.Equal(bkBytes, pngBytes) {
-		t.Fatalf("FetchCover komga-book failed: mime=%q err=%v", bkMime, err)
+	assertImportedTestCover(t, m.importedCovers, bookCovers[0].CoverRef, "image/png", pngBytes)
+	duplicate, err := store.ListSeriesCoverCandidates(ctx, "unrecognized-dir")
+	if err != nil || len(duplicate) != 1 || duplicate[0].CoverRef != seriesCovers[0].CoverRef {
+		t.Fatalf("shared series cover: %+v, %v", duplicate, err)
 	}
 
-	// NSFW user restriction must block Komga NSFW series & book BLOB covers.
-	safeCtx := database.WithUserScope(ctx, database.UserScope{UserID: "reader", AllowNSFW: true, ShowNSFW: false})
-	if _, _, err := m.FetchCover(safeCtx, src.ID, "k-s1", sm.ExtCoverURL); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("cached cover was authorized by a potentially stale checkpoint: %v", err)
-	}
+	// Change metadata before force so the fixture reaches the update trigger.
 	if err := os.Remove(komgaPath + "-wal"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := m.FetchCover(safeCtx, src.ID, "k-s1", sm.ExtCoverURL); err != nil {
-		t.Fatalf("checkpointed public cover unavailable: %v", err)
-	}
-	nsfwSeriesCover := EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindKomgaSeries, "ts-2")
-	nsfwBookCover := EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindKomgaBook, "tb-sec")
-	if _, _, err := m.FetchCover(safeCtx, src.ID, "k-s2", nsfwSeriesCover); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("expected ErrUnavailable for NSFW series cover, got %v", err)
-	}
-	if _, _, err := m.FetchCover(safeCtx, src.ID, "kb-sec", nsfwBookCover); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("expected ErrUnavailable for NSFW book cover, got %v", err)
-	}
-	if gotBytes, gotMime, err := m.FetchCover(adminCtx, src.ID, "kb-sec", nsfwBookCover); err != nil || gotMime != "image/png" || !bytes.Equal(gotBytes, pngBytes) {
-		t.Fatalf("expected admin NSFW book cover fetch to succeed, mime=%q err=%v", gotMime, err)
-	}
-	for _, tc := range []struct{ entry, ref string }{{"k-s1", nsfwSeriesCover}, {"kb1", nsfwBookCover}} {
-		if _, _, err := m.FetchCover(adminCtx, src.ID, tc.entry, tc.ref); !errors.Is(err, ErrUnavailable) {
-			t.Fatalf("mismatched Komga cover owner accepted: %v", err)
-		}
-	}
-
-	// Both locally stored references and their cached bytes predate the new rating.
 	upstream, err := sql.Open("sqlite", komgaPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	execManagerFixture(t, upstream, `UPDATE SERIES_METADATA SET AGE_RATING=18 WHERE SERIES_ID='k-s1'`)
+	execManagerFixture(t, upstream, `UPDATE BOOK_METADATA SET SUMMARY='Refreshed' WHERE BOOK_ID='kb1'`)
 	if err := upstream.Close(); err != nil {
 		t.Fatal(err)
 	}
 	syncManagerFixture(t, m, src, true, "success")
-	for _, tc := range []struct{ entry, ref string }{{"k-s1", sm.ExtCoverURL}, {"kb1", bm1.ExtCoverURL}} {
-		if _, _, err := m.FetchCover(adminCtx, src.ID, tc.entry, tc.ref); err != nil {
-			t.Fatalf("authorized user could not warm the refreshed cache: %v", err)
-		}
-		if _, _, err := m.FetchCover(safeCtx, src.ID, tc.entry, tc.ref); !errors.Is(err, ErrUnavailable) {
-			t.Fatalf("refreshed NSFW Komga cover served to user with showNSFW off: %v", err)
-		}
-	}
 
 	// Surface a genuine write error in scrape statistics.
 	execManagerFixture(t, store.DB(), `
@@ -523,6 +486,10 @@ BEGIN SELECT RAISE(ABORT,'fixture book write failure'); END`)
 	failedRun, err := m.StartMultiScrape(ctx, "lib-main", "force", false)
 	if err != nil {
 		t.Fatal(err)
+	}
+	state, err := store.GetLibraryMetadataChainState(ctx, "lib-main")
+	if err != nil || !state.NeedsRematch {
+		t.Fatalf("source sync did not invalidate chain: %+v %v", state, err)
 	}
 	waitForManager(t, func() bool {
 		for _, current := range m.ScrapeRuns() {
@@ -535,10 +502,14 @@ BEGIN SELECT RAISE(ABORT,'fixture book write failure'); END`)
 		}
 		return false
 	})
+	afterFailure, err := store.GetLibraryMetadataChainState(ctx, "lib-main")
+	if err != nil || afterFailure != state {
+		t.Fatalf("partial force modified chain state: %+v %v", afterFailure, err)
+	}
 
 }
 
-func TestMangaAlphaMetaV2ExtendedColsBooksAndBlobCache(t *testing.T) {
+func TestMangaAlphaMetaV2ExtendedColsBooksAndImportedCovers(t *testing.T) {
 	ctx := context.Background()
 	store, m, root := newTestManager(t, ManagerOptions{})
 	var err error
@@ -555,7 +526,7 @@ func TestMangaAlphaMetaV2ExtendedColsBooksAndBlobCache(t *testing.T) {
 	src := addManagerSource(t, m, database.MetadataSource{
 		Name:      "Open Meta V2",
 		Kind:      KindOfflineSQLite,
-		LocalPath: v2Path,
+		LocalPath: v2Path, ImportCovers: true,
 	})
 	if src.SchemaType != FormatOpenV2 {
 		t.Fatalf("detected SchemaType = %q, want %q", src.SchemaType, FormatOpenV2)
@@ -574,74 +545,45 @@ func TestMangaAlphaMetaV2ExtendedColsBooksAndBlobCache(t *testing.T) {
 	if saved.Status != "ENDED" || saved.TitleSort != "Ginga Tetsudou" || saved.Publisher != "少年画報社" ||
 		saved.TotalBookCount == nil || *saved.TotalBookCount != 18 || saved.AgeRating == nil || *saved.AgeRating != 12 ||
 		len(saved.Links) != 1 || len(saved.SharingLabels) != 1 ||
-		saved.ExtCoverURL != "sqlite-blob://"+src.ID+"/open-entry/s1" {
+		saved.ExtCoverURL != "" {
 		t.Fatalf("unexpected open-v2 series metadata: %+v", saved)
 	}
 
 	bm, ok, err := store.BookMetadataByID(ctx, "gb1")
 	if err != nil || !ok || bm.Title != "Departing Earth" || bm.ISBN != "978-1111111111" ||
-		bm.ExtCoverURL != EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindOpenBook, openBookCoverKey("s1", "vol-1")) {
+		bm.ExtCoverURL != "" {
 		t.Fatalf("unexpected open-v2 aligned book metadata: ok=%v err=%v %+v", ok, err, bm)
 	}
 
-	// Cover BLOB fetch for open-entry and open-book must return exact series' BLOB (not s2's colliding vol-1).
-	eb, em, err := m.FetchCover(ctx, src.ID, "s1", saved.ExtCoverURL)
-	if err != nil || em != "image/jpeg" || !bytes.Equal(eb, jpgBytes) {
-		t.Fatalf("FetchCover open-entry failed: mime=%q err=%v", em, err)
+	candidates, err := store.ListSeriesCoverCandidates(ctx, "galaxy-series")
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("series candidates: %+v, %v", candidates, err)
 	}
-	bb, bmime, err := m.FetchCover(ctx, src.ID, "vol-1", bm.ExtCoverURL)
-	if err != nil || bmime != "image/png" || !bytes.Equal(bb, pngBytes) {
-		t.Fatalf("FetchCover open-book failed (or collided with s2): mime=%q err=%v", bmime, err)
+	assertImportedTestCover(t, m.importedCovers, candidates[0].CoverRef, "image/jpeg", jpgBytes)
+	books, err := store.ListBookCoverCandidates(ctx, "gb1")
+	if err != nil || len(books) != 1 {
+		t.Fatalf("book candidates: %+v, %v", books, err)
 	}
-	safeCtx := database.WithUserScope(ctx, database.UserScope{UserID: "reader", AllowNSFW: true})
-	adminCtx := database.WithUserScope(ctx, database.UserScope{IsAdmin: true, AllowNSFW: true, ShowNSFW: true})
-	otherRef := EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindOpenBook, openBookCoverKey("s2", "vol-1"))
-	for _, tc := range []struct {
-		ref      string
-		expected []byte
-	}{
-		{bm.ExtCoverURL, pngBytes},
-		{otherRef, jpgBytes},
-		{EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindOpenBook, "s1:vol-1"), pngBytes},
-	} {
-		if raw, _, err := m.FetchCover(safeCtx, src.ID, "vol-1", tc.ref); err != nil || !bytes.Equal(raw, tc.expected) {
-			t.Fatalf("open book cover picked the wrong series: err=%v", err)
-		}
-	}
-	legacyBare := EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindOpenBook, "vol-1")
-	if _, _, err := m.FetchCover(adminCtx, src.ID, "vol-1", legacyBare); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("ambiguous legacy book key accepted: %v", err)
-	}
-	if raw, _, err := m.FetchBookCover(safeCtx, src.ID, "vol-1", "s1", legacyBare); err != nil || !bytes.Equal(raw, pngBytes) {
-		t.Fatalf("legacy key did not resolve through the book's parent binding: %v", err)
-	}
-	if _, _, err := m.FetchBookCover(adminCtx, src.ID, "vol-1", "s2", bm.ExtCoverURL); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("mismatched parent binding accepted: %v", err)
-	}
-	upstream, err := sql.Open("sqlite", v2Path)
-	if err != nil {
+	// The second series has the same remote book key with different bytes.
+	assertImportedTestCover(t, m.importedCovers, books[0].CoverRef, "image/png", pngBytes)
+
+	if _, err := m.ClearSeriesExternal(ctx, "galaxy-series"); err != nil {
 		t.Fatal(err)
 	}
-	execManagerFixture(t, upstream, `UPDATE entries SET is_nsfw=1 WHERE id='s1'`)
-	if err := upstream.Close(); err != nil {
-		t.Fatal(err)
-	}
-	syncManagerFixture(t, m, src, true, "success")
-	if _, _, err := m.FetchCover(adminCtx, src.ID, "vol-1", bm.ExtCoverURL); err != nil {
-		t.Fatalf("authorized user could not warm the refreshed cache: %v", err)
-	}
-	for _, ref := range []string{bm.ExtCoverURL, EncodeSQLiteBlobCoverRef(src.ID, SQLiteBlobKindOpenBook, "s1:vol-1")} {
-		if _, _, err := m.FetchCover(safeCtx, src.ID, "vol-1", ref); !errors.Is(err, ErrUnavailable) {
-			t.Fatalf("refreshed NSFW open book cover served to user with showNSFW off: %v", err)
+	for _, ref := range []string{candidates[0].CoverRef, books[0].CoverRef} {
+		if _, _, err := importedcover.Read(m.importedCovers, ref); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("unreferenced import survived unbind: %v", err)
 		}
-	}
-	if _, _, err := m.FetchCover(safeCtx, src.ID, "s1", saved.ExtCoverURL); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("refreshed NSFW open entry cover served to user with showNSFW off: %v", err)
-	}
-	if raw, _, err := m.FetchCover(safeCtx, src.ID, "vol-1", otherRef); err != nil || !bytes.Equal(raw, jpgBytes) {
-		t.Fatalf("other series with the same key was affected: %v", err)
 	}
 
+}
+
+func assertImportedTestCover(t *testing.T, root, ref, mime string, expected []byte) {
+	t.Helper()
+	raw, media, err := importedcover.Read(root, ref)
+	if err != nil || media != mime || !bytes.Equal(raw, expected) {
+		t.Fatalf("import %q: MIME=%q size=%d err=%v", ref, media, len(raw), err)
+	}
 }
 
 func TestImportUploadedSQLiteFormatsAndValidation(t *testing.T) {
@@ -772,7 +714,7 @@ func TestAlignSeriesBooksRejectsConflictingVolumesAndLeftoverExtras(t *testing.T
 }
 
 func TestAlignedBookWriteRejectsStaleSeriesBinding(t *testing.T) {
-	store, m, _ := newTestManager(t, ManagerOptions{})
+	store, _, _ := newTestManager(t, ManagerOptions{})
 	ctx := t.Context()
 	seedMetadataLibrary(t, store, "catalog", true)
 	seedMetadataSeries(t, store, "series", "catalog", "Work")
@@ -800,7 +742,12 @@ VALUES ('series','source','old','auto','')`)
 	started, done := make(chan struct{}), make(chan error, 1)
 	go func() {
 		close(started)
-		done <- m.writeAlignedSeriesBooks(ctx, "series", "source", "old", "auto", locals, remotes, pairs)
+		_, _, err := store.ApplyMetadataChain(database.WithAutomaticMetadata(ctx),
+			database.Series{ID: "series", LibraryID: "catalog", Name: "Work"}, database.ChainSeriesMatch{
+				Metadata: database.ScrapedMetadata{ExtSourceID: "source", ExtEntryID: "old", MatchOrigin: "auto"},
+				Books:    []database.ChainBookMatch{{BookID: "book", Metadata: database.BookScrapedMetadata{Title: remotes[0].Title}}},
+			})
+		done <- err
 	}()
 	<-started
 	if err := rebind.Commit(); err != nil {

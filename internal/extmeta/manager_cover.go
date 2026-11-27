@@ -3,8 +3,8 @@ package extmeta
 import (
 	"cmp"
 	"context"
+	"database/sql"
 	"errors"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -38,12 +38,8 @@ func (m *Manager) FetchBookCover(ctx context.Context, sourceID, entryID, parentE
 }
 
 func (m *Manager) fetchCover(ctx context.Context, sourceID, entryID, parentEntryID, coverURL string) ([]byte, string, error) {
-	blobSourceID, kind, key, isBlob := ParseSQLiteBlobCoverRef(coverURL)
-	if isBlob {
-		if blobSourceID != sourceID {
-			return nil, "", ErrInvalidConfig
-		}
-		return m.fetchBlobCover(ctx, sourceID, strings.TrimSpace(entryID), strings.TrimSpace(parentEntryID), kind, key)
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(coverURL)), SQLiteBlobCoverPrefix) {
+		return nil, "", ErrUnavailable
 	}
 	src, err := m.store.GetMetadataSource(ctx, sourceID)
 	if err != nil {
@@ -63,82 +59,6 @@ func (m *Manager) fetchCover(ctx context.Context, sourceID, entryID, parentEntry
 		return nil, "", ErrInvalidConfig
 	}
 	data, err := m.covers.GetOrFetch(ctx, sourceID, firstNonEmpty(parentEntryID, entryID), coverURL)
-	return data.Bytes, data.MediaType, err
-}
-
-func (m *Manager) fetchBlobCover(ctx context.Context, sourceID, entryID, parentEntryID, kind, key string) ([]byte, string, error) {
-	// Hold the source generation stable through authorization and cache lookup.
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	src, err := m.store.GetMetadataSource(ctx, sourceID)
-	if err != nil {
-		return nil, "", err
-	}
-	if !src.Enabled || !src.Ready || src.Kind != KindOfflineSQLite || m.covers == nil {
-		return nil, "", ErrUnavailable
-	}
-	upstream := m.upstreamPath(src)
-	if upstream == "" {
-		return nil, "", ErrUnavailable
-	}
-	if src.LocalPath != "" && filepath.Clean(src.LocalPath) != m.sqlitePath(src.ID) {
-		if _, err := checkedLocalFile(upstream); err != nil {
-			return nil, "", ErrUnavailable
-		}
-	}
-	db, checkpointedOnly, err := openKomgaSQLiteSnapshot(upstream)
-	if err != nil {
-		return nil, "", ErrUnavailable
-	}
-	defer db.Close()
-	showNSFW := m.store.ShowNSFW(ctx)
-	if checkpointedOnly && !showNSFW {
-		return nil, "", ErrUnavailable
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, "", ErrUnavailable
-	}
-	defer tx.Rollback()
-
-	var nsfw bool
-	var seriesID, bookKey string
-	load := func(loadCtx context.Context) ([]byte, string, error) {
-		switch kind {
-		case SQLiteBlobKindKomgaSeries, SQLiteBlobKindKomgaBook:
-			return readKomgaThumbnailBLOB(loadCtx, tx, kind, key)
-		default:
-			return readOpenCoverBLOB(loadCtx, tx, kind, seriesID, bookKey)
-		}
-	}
-	switch kind {
-	case SQLiteBlobKindKomgaSeries, SQLiteBlobKindKomgaBook:
-		nsfw, err = komgaCoverRating(ctx, tx, kind, key, entryID, parentEntryID)
-	case SQLiteBlobKindOpenEntry, SQLiteBlobKindOpenBook:
-		seriesID = key
-		if kind == SQLiteBlobKindOpenBook {
-			seriesID, bookKey, err = resolveOpenBookCover(ctx, tx, key, entryID, parentEntryID)
-			key = openBookCoverKey(seriesID, bookKey)
-		} else if entryID != "" && entryID != seriesID {
-			err = ErrEntryNotFound
-		}
-		if err == nil {
-			var entry *Entry
-			entry, err = getMangaAlphaMetaV1Entry(ctx, tx, sourceID, seriesID)
-			if err == nil {
-				nsfw = entry.IsNSFW
-			}
-		}
-	}
-	if err != nil || (nsfw && !showNSFW) {
-		return nil, "", ErrUnavailable
-	}
-	if entryID == "" {
-		entryID = kind + "-" + key
-	}
-	ref := EncodeSQLiteBlobCoverRef(sourceID, kind, key)
-	cacheKey := strings.Join([]string{ref, src.LocalSHA256, src.LastUpdatedAt}, "\x00")
-	data, err := m.covers.GetOrLoadLocal(ctx, sourceID, entryID, cacheKey, maxSQLiteBlobCoverBytes, load)
 	return data.Bytes, data.MediaType, err
 }
 
@@ -273,9 +193,66 @@ func (m *Manager) EntryCover(ctx context.Context, sourceID, entryID string) ([]b
 	if err := checkAdmin(ctx); err != nil {
 		return nil, "", err
 	}
+	src, err := m.store.GetMetadataSource(ctx, sourceID)
+	if err != nil {
+		return nil, "", err
+	}
+	if !src.Ready || !src.Enabled {
+		return nil, "", ErrUnavailable
+	}
 	entry, err := m.entry(ctx, sourceID, strings.TrimSpace(entryID))
 	if err != nil {
 		return nil, "", err
 	}
-	return m.FetchCover(ctx, sourceID, entry.EntryID, entry.CoverURL)
+	if entry.CoverURL != "" {
+		return m.FetchCover(ctx, sourceID, entry.EntryID, entry.CoverURL)
+	}
+	if !src.ImportCovers {
+		return nil, "", ErrEntryNotFound
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	sidecar := m.sidecars[sourceID]
+	current, err := m.store.GetMetadataSource(ctx, sourceID)
+	if err != nil || !current.Enabled || !current.ImportCovers || sourceGeneration(current) != sourceGeneration(src) || sidecar == nil {
+		return nil, "", ErrUnavailable
+	}
+	if sidecar.checkpointedOnly && !m.store.ShowNSFW(ctx) {
+		return nil, "", ErrUnavailable
+	}
+	tx, err := sidecar.upstreamDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, "", err
+	}
+	defer tx.Rollback()
+	switch sidecar.Schema() {
+	case SchemaKomgaSQLiteV1:
+		info, err := DetectKomgaSchema(ctx, tx)
+		if err != nil {
+			return nil, "", err
+		}
+		series, err := readKomgaSeries(ctx, tx, info, entry.EntryID, true, true)
+		if err != nil {
+			return nil, "", err
+		}
+		if series.NSFW && !m.store.ShowNSFW(ctx) {
+			return nil, "", ErrUnavailable
+		}
+		return readKomgaSeriesThumbnail(ctx, tx, series)
+	case SchemaMangaAlphaMetaV1, SchemaMangaAlphaMetaV2:
+		snapshot, err := getMangaAlphaMetaV1Entry(ctx, tx, sourceID, entry.EntryID)
+		if err != nil {
+			return nil, "", err
+		}
+		if !snapshot.HasCoverBlob {
+			return nil, "", ErrEntryNotFound
+		}
+		if snapshot.IsNSFW && !m.store.ShowNSFW(ctx) {
+			return nil, "", ErrUnavailable
+		}
+		return readOpenCoverBLOB(ctx, tx, SQLiteBlobKindOpenEntry, entry.EntryID, "")
+	default:
+		return nil, "", ErrEntryNotFound
+	}
 }

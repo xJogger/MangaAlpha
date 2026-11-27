@@ -676,6 +676,12 @@ func (s *Service) TankobonsForSubject(ctx context.Context, parentSubjectID int64
 	return s.live.SubjectRelations(ctx, parentSubjectID)
 }
 
+func (s *Service) VerifyTankobonRatings(ctx context.Context, matches []VolumeMatchResult) {
+	if s.live != nil {
+		s.live.VerifyTankobonRatings(ctx, matches)
+	}
+}
+
 // AutoScrapeOne runs automatic title parsing & matching on a single Series.
 func (s *Service) AutoScrapeOne(
 	ctx context.Context,

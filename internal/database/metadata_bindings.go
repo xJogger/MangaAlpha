@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/xJogger/fake-komga-115/internal/importedcover"
 )
 
 const (
@@ -316,7 +318,11 @@ func writeMetadataRows[T any](ctx context.Context, db *sql.DB, rows []T, write f
 
 func validateCoverCandidate(kind, ref string) error {
 	switch kind {
-	case CoverKindImportedFile, CoverKindBangumi, CoverKindHTTPURL:
+	case CoverKindImportedFile:
+		if !importedcover.ValidRef(ref) {
+			return fmt.Errorf("invalid imported cover reference")
+		}
+	case CoverKindBangumi, CoverKindHTTPURL:
 	default:
 		return fmt.Errorf("invalid cover candidate kind %q", kind)
 	}

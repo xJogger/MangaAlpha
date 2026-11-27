@@ -387,8 +387,11 @@ func TestAdminV34BookCustomCoverActivatesFromExternal(t *testing.T) {
 	if r <= b {
 		t.Fatal("thumbnail did not switch to the uploaded cover")
 	}
-
-	pickExternal(t)
+	f.jsonRequest(t, "owner", http.MethodPatch, cover+"-source", `{"coverSource":"ext"}`, http.StatusOK)
+	thumb = f.request(t, "reader", http.MethodGet, thumbnailPath, "", http.StatusOK)
+	if bytes.Equal(thumb.Body.Bytes(), external) {
+		t.Fatal("explicit external cover displaced the custom upload")
+	}
 	rec = f.jsonRequest(t, "owner", http.MethodPost, cover, `{"url":"`+customURL+`"}`, http.StatusOK)
 	assertAdminV34Fields(t, decodeV33[map[string]any](t, rec), map[string]any{
 		"coverSource": "custom", "hasCustomCover": true, "customCoverUrl": customURL,

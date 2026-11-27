@@ -166,13 +166,19 @@ func New(_ context.Context, options Options) (*App, error) {
 			volumes[i] = bangumi.VolumeMatchBook{BookID: book.BookID, Name: book.Name, Number: book.Number}
 		}
 		matches := bangumi.MatchBooksToTankobons(subjectID, series.EffectiveOneShot(), volumes, items)
-		out := make([]thumbnail.VolumeMatchResult, 0, len(matches))
-		for _, match := range matches {
+		for i := range matches {
+			match := &matches[i]
 			if match.MatchedBy == "oneshot_fallback" {
 				official, found, err := bangumiService.OfflineSubject(offlineCtx, series, subjectID)
 				match.NSFWKnown = err == nil && found
 				match.NSFW = meta.IsNSFW || (match.NSFWKnown && official.IsNSFW)
 			}
+		}
+		if allowLive {
+			bangumiService.VerifyTankobonRatings(ctx, matches)
+		}
+		out := make([]thumbnail.VolumeMatchResult, 0, len(matches))
+		for _, match := range matches {
 			out = append(out, thumbnail.VolumeMatchResult{
 				BookID: match.BookID, SubjectID: match.SubjectID, CoverURL: match.CoverURL, NSFW: match.NSFW, NSFWKnown: match.NSFWKnown,
 			})
@@ -188,7 +194,7 @@ func New(_ context.Context, options Options) (*App, error) {
 	var metadataManager *extmeta.Manager
 	if err == nil {
 		metadataManager, err = extmeta.NewManager(store, bangumiService, externalCovers, dataDir, options.Logger, extmeta.ManagerOptions{
-			ProxyURLProvider: proxyURLProvider,
+			ProxyURLProvider: proxyURLProvider, ImportedCoversDir: filepath.Join(dataDir, "imported-covers"),
 		})
 	}
 	if err != nil {
@@ -198,6 +204,7 @@ func New(_ context.Context, options Options) (*App, error) {
 		store.Close()
 		return nil, err
 	}
+	store.SetImportedCoverCleanup(metadataManager.RemoveUnusedImportedCovers)
 	thumbnailService.SetExternalCoverFetcher(metadataManager.FetchCover)
 	publicCovers := rate.NewLimiter(12, 8)
 	thumbnailService.SetPublicBangumiCoverFetcher(func(ctx context.Context, coverURL string, subjectID int64) ([]byte, error) {
@@ -207,7 +214,7 @@ func New(_ context.Context, options Options) (*App, error) {
 		return fetchPublicBangumiCover(ctx, proxyURLProvider(ctx), coverURL, subjectID)
 	})
 	thumbnailService.SetBookExternalCoverFetcher(func(ctx context.Context, sourceID, entryID, parentEntryID, coverURL string) ([]byte, string, error) {
-		if sourceID == "" && !strings.HasPrefix(coverURL, extmeta.SQLiteBlobCoverPrefix) {
+		if sourceID == "" {
 			cover, err := externalCovers.GetOrFetch(ctx, "book-custom", entryID, coverURL)
 			return cover.Bytes, cover.MediaType, err
 		}

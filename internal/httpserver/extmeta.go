@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/xJogger/fake-komga-115/internal/bangumi"
 	"github.com/xJogger/fake-komga-115/internal/database"
 	"github.com/xJogger/fake-komga-115/internal/extmeta"
 )
@@ -129,10 +130,20 @@ func (s *Server) metadataOverview(w http.ResponseWriter, r *http.Request) {
 		s.metadataError(w, err)
 		return
 	}
+	states, err := s.store.ListAllLibraryMetadataChainStates(ctx)
+	if err != nil {
+		s.metadataError(w, err)
+		return
+	}
+	var archive bangumi.ArchiveStatus
+	if s.bangumi != nil {
+		archive = s.bangumi.ArchiveStatus()
+	}
 	syncs, online := s.metadata.Syncs(), s.metadata.OnlineEnrichStatus()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"recommendedRepoUrl": extmeta.RecommendedRepoURL,
-		"repos":              repos, "sources": s.metadata.SourceViews(ctx, sources), "libraryChains": chains,
+		"libraryChainStates": states, "archive": archive,
+		"repos": repos, "sources": s.metadata.SourceViews(ctx, sources), "libraryChains": chains,
 		"syncs": syncs, "activeSyncs": syncs, "scrapeRuns": s.metadata.ScrapeRuns(),
 		"onlineEnrich": online, "onlineEnrichStatus": online,
 	})
@@ -259,7 +270,7 @@ func (s *Server) uploadMetadataSource(w http.ResponseWriter, r *http.Request) {
 				s.metadataError(w, &http.MaxBytesError{Limit: maxMetadataUploadFileBytes})
 				return
 			}
-		case "sourceId", "name", "description", "kind", "enabled", "tagDictSourceId", "tagDisplayMode", "autoUpdate":
+		case "importCovers", "sourceId", "name", "description", "kind", "enabled", "tagDictSourceId", "tagDisplayMode", "autoUpdate":
 			if _, duplicate := fields[name]; duplicate || part.FileName() != "" {
 				writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid or repeated multipart field.")
 				return
@@ -318,6 +329,14 @@ func (s *Server) uploadMetadataSource(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg.Enabled = &enabled
+	}
+	if v, ok := fields["importCovers"]; ok {
+		enabled, valid := parseUploadBool(v)
+		if !valid {
+			s.metadataError(w, extmeta.ErrInvalidConfig)
+			return
+		}
+		cfg.ImportCovers = &enabled
 	}
 	// An omitted multipart field preserves the binding. A present empty field clears it.
 	tagDictSourceID, hasTagDictField := fields["tagDictSourceId"]
@@ -406,19 +425,26 @@ func (s *Server) setLibraryMetadataSources(w http.ResponseWriter, r *http.Reques
 		SourceIDs []string `json:"sourceIds"`
 	}
 	if decodeJSON(w, r, &req) {
-		chain, err := s.metadata.SetLibrarySources(r.Context(), chi.URLParam(r, "libraryID"), req.SourceIDs)
-		s.metadataResult(w, http.StatusOK, map[string]any{"sources": chain}, err)
+		id := chi.URLParam(r, "libraryID")
+		chain, err := s.metadata.SetLibrarySources(r.Context(), id, req.SourceIDs)
+		if err != nil {
+			s.metadataError(w, err)
+			return
+		}
+		state, err := s.store.GetLibraryMetadataChainState(r.Context(), id)
+		s.metadataResult(w, http.StatusOK, map[string]any{"sources": chain, "chainState": state}, err)
 	}
 }
 
 func (s *Server) startMetadataScrape(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		LibraryID   string `json:"libraryId"`
-		Mode        string `json:"mode"`
-		AllowOnline bool   `json:"allowOnline"`
+		LibraryID   string   `json:"libraryId"`
+		LibraryIDs  []string `json:"libraryIds"`
+		Mode        string   `json:"mode"`
+		AllowOnline bool     `json:"allowOnline"`
 	}
 	if decodeJSON(w, r, &req) {
-		run, err := s.metadata.StartMultiScrape(r.Context(), req.LibraryID, req.Mode, req.AllowOnline)
+		run, err := s.metadata.StartMultiScrape(r.Context(), req.LibraryID, req.Mode, req.AllowOnline, req.LibraryIDs)
 		s.metadataResult(w, http.StatusAccepted, run, err)
 	}
 }

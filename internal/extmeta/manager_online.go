@@ -171,7 +171,9 @@ func (m *Manager) onlineMatch(ctx context.Context, client *http.Client, sourceID
 				entry.IsNSFW = IsGalleryCategoryNSFW(entry.Category)
 			}
 		}
-		return m.externalMetadata(ctx, source, entry, "auto", 1), true, nil
+		meta := m.externalMetadata(ctx, source, entry, "auto", 1)
+		_, meta.ExtCoverURL = offlineCoverRef("", entry.CoverURL)
+		return meta, true, nil
 	}
 }
 

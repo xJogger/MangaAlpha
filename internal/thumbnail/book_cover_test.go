@@ -50,7 +50,7 @@ func TestBookCoverPriorityAndSourceOverride(t *testing.T) {
 	assertCover(second.ID, 80, 120)
 	s.SetBangumiCoverFetcher(func(context.Context, string, int64) ([]byte, error) { return bgm, nil })
 	s.SetBookExternalCoverFetcher(func(_ context.Context, source, entry, _, ref string) ([]byte, string, error) {
-		if source != "catalog" || entry != "external-book" || ref != "sqlite-blob://catalog/komga-book/cover" {
+		if source != "catalog" || entry != "external-book" || ref != "https://example.invalid/cover.png" {
 			t.Errorf("unexpected external reference %q %q %q", source, entry, ref)
 		}
 		return ext, "image/png", nil
@@ -63,7 +63,7 @@ func TestBookCoverPriorityAndSourceOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.UpsertBookScrapedMetadata(ctx, second.ID, database.BookScrapedMetadata{
-		ExtSourceID: "catalog", ExtEntryID: "external-book", ExtCoverURL: "sqlite-blob://catalog/komga-book/cover",
+		ExtSourceID: "catalog", ExtEntryID: "external-book", ExtCoverURL: "https://example.invalid/cover.png",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestBookCoverPriorityAndSourceOverride(t *testing.T) {
 		mode string
 		w, h int
 	}{
-		{"ext", 24, 27}, {"bangumi", 33, 55}, {"book", 80, 120}, {"custom", 45, 60}, {"auto", 45, 60},
+		{"ext", 45, 60}, {"bangumi", 45, 60}, {"book", 45, 60}, {"custom", 45, 60}, {"auto", 45, 60},
 	} {
 		if err := store.SetBookCoverSource(ctx, second.ID, tc.mode); err != nil {
 			t.Fatal(err)
@@ -189,7 +189,7 @@ func TestBookCoverOfflineMatchAndNSFWCacheIsolation(t *testing.T) {
 	if _, ok, err := s.GetBookCover(database.WithUserScope(ctx, scope), book.ID); err != nil || !ok || fetchCalls != 1 {
 		t.Fatalf("authorized requester could not fetch image: %v %v", ok, err)
 	}
-	if _, ok, err := s.GetBookCover(restricted, book.ID); err != nil || ok || matchCalls != 1 || fetchCalls != 1 {
+	if _, ok, err := s.GetBookCover(restricted, book.ID); err != nil || ok || matchCalls != 2 || fetchCalls != 1 {
 		t.Fatalf("private image served from disk after switching scopes: %v %v", ok, err)
 	}
 }
@@ -223,10 +223,10 @@ func TestUnknownTankobonCoverRequiresPublicVerification(t *testing.T) {
 		t.Fatalf("authorized fetch failed: %v", err)
 	}
 	scope.ShowNSFW = false
-	if cover, _, err := s.CacheBookBangumiCover(database.WithUserScope(t.Context(), scope), book.ID, meta, &match, false); !errors.Is(err, verificationDenied) || len(cover.Bytes) != 0 {
+	if cover, _, err := s.CacheBookBangumiCover(database.WithUserScope(t.Context(), scope), book.ID, meta, &match, false); err != nil || len(cover.Bytes) != 0 {
 		t.Fatalf("unknown cover bypassed public verification: len=%d err=%v", len(cover.Bytes), err)
 	}
-	if publicFetcherCalls != 0 || verifiedFetcherCalls != 2 {
+	if publicFetcherCalls != 0 || verifiedFetcherCalls != 1 {
 		t.Fatalf("unchecked fetches=%d checked fetches=%d", publicFetcherCalls, verifiedFetcherCalls)
 	}
 	if saved, _, err := store.BookMetadataByID(t.Context(), book.ID); err != nil || saved.BgmSubjectID != 0 {

@@ -63,6 +63,23 @@ WHERE (books.series_id,books.parent_cid,books.name,books.size,books.pick_code,bo
            excluded.file_created_at,excluded.file_modified_at,excluded.number_sort)`, runID); err != nil {
 		return err
 	}
+	cleanup := s.importedCoverCleanup()
+	var coverRefs []string
+	if cleanup != nil {
+		coverRefs, err = queryImportedCoverRefs(ctx, tx, `
+SELECT c.cover_ref FROM books b JOIN book_cover_candidates c ON c.book_id=b.id
+WHERE c.cover_kind='imported_file' AND b.library_id=?
+ AND NOT EXISTS (SELECT 1 FROM scan_books_staging t WHERE t.run_id=? AND t.library_id=b.library_id AND t.file_id=b.file_id)
+UNION
+SELECT c.cover_ref FROM series s JOIN series_cover_candidates c ON c.series_id=s.id
+WHERE c.cover_kind='imported_file' AND s.library_id=?
+ AND NOT EXISTS (SELECT 1 FROM scan_series_staging t WHERE t.run_id=? AND t.id=s.id)
+ AND NOT EXISTS (SELECT 1 FROM books b JOIN scan_books_staging t ON t.file_id=b.file_id AND t.library_id=b.library_id
+                 WHERE t.run_id=? AND b.series_id=s.id)`, libraryID, runID, libraryID, runID, runID)
+		if err != nil {
+			return err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM books WHERE library_id=?
  AND NOT EXISTS (SELECT 1 FROM scan_books_staging t WHERE t.run_id=? AND t.library_id=books.library_id AND t.file_id=books.file_id)`,
@@ -105,6 +122,9 @@ UPDATE shelf_revision SET bulk_mode=0,catalog=catalog+1,progress=progress+? WHER
 		return err
 	}
 	s.wakeSearchFTSWorker()
+	if len(coverRefs) > 0 {
+		cleanup(ctx, coverRefs)
+	}
 	return nil
 }
 

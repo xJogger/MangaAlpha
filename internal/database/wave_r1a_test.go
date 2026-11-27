@@ -328,17 +328,17 @@ VALUES('work-book-b','sqlite-blob://primary/open-book/stale')`)
 	}
 	importedSeries := SeriesCoverCandidate{
 		SeriesID: "work", SourceID: "primary", EntryID: "primary-series", CoverKind: CoverKindImportedFile,
-		CoverRef: "covers/shared.png", RankOrder: 11, IsNSFW: true, NSFWKnown: false, SourceGeneration: "g1", UpdatedAt: "initial",
+		CoverRef: strings.Repeat("b", 64) + ".png", RankOrder: 11, IsNSFW: true, NSFWKnown: false, SourceGeneration: "g1", UpdatedAt: "initial",
 	}
 	importedBook := BookCoverCandidate{
 		BookID: "work-book-a", SourceID: "next", SeriesEntryID: "next-series", EntryID: "next-book", CoverKind: CoverKindImportedFile,
-		CoverRef: "covers/book.png", RankOrder: 7, IsNSFW: false, NSFWKnown: true, SourceGeneration: "g2", UpdatedAt: "initial",
+		CoverRef: strings.Repeat("a", 64) + ".png", RankOrder: 7, IsNSFW: false, NSFWKnown: true, SourceGeneration: "g2", UpdatedAt: "initial",
 	}
 	nextHTTP := "https://example.invalid/next.png"
 	if err := store.UpsertSeriesCoverCandidates(ctx, []SeriesCoverCandidate{
 		importedSeries,
 		{SeriesID: "work", SourceID: "next", EntryID: "next-series", CoverKind: CoverKindHTTPURL, CoverRef: nextHTTP, RankOrder: 2},
-		{SeriesID: "work", SourceID: CoverCandidateSourceManual, CoverKind: CoverKindImportedFile, CoverRef: "covers/manual.png", RankOrder: 2},
+		{SeriesID: "work", SourceID: CoverCandidateSourceManual, CoverKind: CoverKindImportedFile, CoverRef: strings.Repeat("c", 64) + ".png", RankOrder: 2},
 		{SeriesID: "other", SourceID: "primary", CoverKind: CoverKindImportedFile, CoverRef: importedSeries.CoverRef},
 	}); err != nil {
 		t.Fatal(err)

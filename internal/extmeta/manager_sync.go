@@ -141,6 +141,7 @@ func (m *Manager) ImportConfiguredSQLite(ctx context.Context, sourceID, filename
 	setOption(&configured.Name, cfg.Name)
 	setOption(&configured.Description, cfg.Description)
 	setOption(&configured.Enabled, cfg.Enabled)
+	setOption(&configured.ImportCovers, cfg.ImportCovers)
 	setOption(&configured.TagDictSourceID, cfg.TagDictSourceID)
 	setOption(&configured.TagDisplayMode, cfg.TagDisplayMode)
 	setOption(&configured.AutoUpdate, cfg.AutoUpdate)
@@ -150,6 +151,7 @@ func (m *Manager) ImportConfiguredSQLite(ctx context.Context, sourceID, filename
 	if src.RepoID == "" {
 		src = configured
 	}
+	setOption(&src.ImportCovers, cfg.ImportCovers)
 	if cfg.Enabled == nil && !src.Ready && src.LastUpdatedAt == "" {
 		src.Enabled = true
 	}
