@@ -51,7 +51,7 @@
 - **收藏夹（`/collections`）与阅读列表（`/readlists`）**：完整持久化存储与 Komga REST CRUD，支持手动排序、作品/单卷页快捷加入并与 Koharia 双向同步。
 - **多版本切换与 Bangumi 油猴脚本**：支持按 Bangumi 排名排序与「合并相同 Bangumi ID」（仅网页书架生效）；作品页提供默认折叠的多版本切换面板，跨库卡片与详情页清晰标注书库与文件来源；内置 `/bgm/{subjectID}` 直达入口与个人账号页（`/account`）一键安装的 Bangumi 油猴脚本（`.user.js`），浏览 `bgm.tv` 时自动探测本库收录状态并直达。
 - **深度兼容 Koharia 与 Mihon**：支持 `(<q>) OR tag:(<q>)` 联合检索、Komga 字段检索与 `relevance` 排序、90 天进度重置墓碑保护、轻量 Komga SSE 事件流（`/api/v1/sse/v1/events`）、`/api/v2/authors` 分页作者接口与 HTTP `gzip` 压缩，数十万册大库依然流畅同步。
-- **KOReader 墨水屏 OPDS v1.2 + OPDS-PSE 双入口在线页流**：原生适配 [`opdsforcomic.koplugin`](https://github.com/hugo1120/opdsforcomic.koplugin)（`/api/opds/v1.2`，支持零提前建索引、点击章节直读、章末自动切下一章、前后 5 章导航与双向同步进度），同时提供标准 Komga OPDS v1.2（`/opds/v1.2/catalog`）与 `?convert=jpeg` 按需转码。
+- **墨水屏与 OPDS v1.2 + OPDS-PSE 双入口在线页流**：**封闭式墨水屏阅读器**（支持安装 KOReader 的设备）推荐使用 **[KOReader](https://koreader.rocks/) + [`opdsforcomic.koplugin`](https://github.com/hugo1120/opdsforcomic.koplugin/releases)**（[@hugo1120](https://github.com/hugo1120) 开发的漫画 OPDS 插件，接入 `/api/opds/v1.2`，支持零提前建索引、点击章节直读、章末自动切下一章、前后 5 章导航与双向同步进度）；**性能较强的 Android 墨水屏设备**推荐使用 **[Koharia](https://github.com/Mister-album/Koharia)** 并开启**无动画模式**；同时提供标准 Komga OPDS v1.2（`/opds/v1.2/catalog`）与 `?convert=jpeg` 按需转码。
 
 ### 3. 多存储源共存、分层联合库与自动化流水线
 
@@ -178,10 +178,10 @@ make build
 - **为什么个别作品点击 `bgm.tv` 链接提示“数据库中没有查询您所指定的条目”？** 这是 Bangumi 官网未登录访问限制，在浏览器登录 `bgm.tv` 账号后重新打开即可正常查看。
 
 ### 连接客户端（Koharia / Mihon / KOReader）与 AI Agent
-- **[Koharia](https://github.com/Mister-album/Koharia)（推荐 Android Komga 客户端）**：原生 Komga 支持，完整兼容本服务的搜索语法、收藏夹、阅读列表与 SSE 进度同步；新增 Komga 服务器填入 `http://<服务器IP>:25600` 与账号密码（或后台生成的 API Key）即可使用。
+- **[Koharia](https://github.com/Mister-album/Koharia)（推荐 Android Komga 客户端 / Android 墨水屏）**：原生 Komga 支持，完整兼容本服务的搜索语法、收藏夹、阅读列表与 SSE 进度同步；**性能较强的 Android 墨水屏设备**同样推荐使用 Koharia，并在设置中开启**无动画模式**以获得更佳的墨水屏翻页体验；新增 Komga 服务器填入 `http://<服务器IP>:25600` 与账号密码（或后台生成的 API Key）即可使用。
 - **[Mihon](https://mihon.app/)**：安装 Komga 扩展，填入 `http://<服务器IP>:25600` 与账号密码。
-- **[KOReader](https://koreader.rocks/)（墨水屏推荐）**：
-  - 强烈推荐安装漫画 OPDS 插件 **[`opdsforcomic.koplugin`](https://github.com/hugo1120/opdsforcomic.koplugin/releases)**，在 `OPDS catalog (Comic)` 中填入 `http://<服务器IP>:25600/api/opds/v1.2` 与账号密码，即可获得点击章节直读、章末自动切下一章、前后 5 章导航、零提前建索引与双向同步阅读进度体验；
+- **[KOReader](https://koreader.rocks/)（封闭式墨水屏阅读器推荐）**：
+  - **封闭式墨水屏阅读器**（支持安装 KOReader 的设备）推荐使用 **[KOReader](https://koreader.rocks/) + [`opdsforcomic.koplugin`](https://github.com/hugo1120/opdsforcomic.koplugin/releases)**（[@hugo1120](https://github.com/hugo1120) 开发的漫画 OPDS 插件），在 `OPDS catalog (Comic)` 中填入 `http://<服务器IP>:25600/api/opds/v1.2` 与账号密码，即可获得点击章节直读、章末自动切下一章、前后 5 章导航、零提前建索引与双向同步阅读进度体验；
   - 同时也提供标准 Komga OPDS v1.2 入口 `http://<服务器IP>:25600/opds/v1.2/catalog`（支持 OPDS-PSE 在线页流与 OpenSearch 搜索），兼容其他标准 OPDS 漫画客户端。
 - **AI Agent 治理**：携带 `Authorization: Bearer <API_KEY>` 请求 `GET /api/agent/v1/manifest` 即可发现全部管理能力，详见 [docs/AGENT_API.md](docs/AGENT_API.md)。
 

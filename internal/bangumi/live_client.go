@@ -33,22 +33,66 @@ func (coverUnavailableError) Error() string          { return "Bangumi cover una
 func (coverUnavailableError) CoverUnavailable() bool { return true }
 
 type LiveClient struct {
-	baseURL      string
-	clientMu     sync.RWMutex
-	http         *http.Client
-	proxyRaw     string
-	limiter      *rate.Limiter
-	coverLimiter *rate.Limiter
-	readToken    func(context.Context) string
+	baseURL         string
+	clientMu        sync.RWMutex
+	http            *http.Client
+	proxyRaw        string
+	limiter         *rate.Limiter
+	coverLimiter    *rate.Limiter
+	readToken       func(context.Context) string
+	coverRetryWaits []time.Duration
+	coverRetryWait  func(context.Context, time.Duration) error
 }
 
 func NewLiveClient() *LiveClient {
 	tr, _ := NewBangumiTransport("", 20*time.Second)
 	return &LiveClient{
-		baseURL:      "https://api.bgm.tv",
-		http:         newLiveHTTPClient(tr),
-		limiter:      rate.NewLimiter(rate.Limit(2.0), 2),
-		coverLimiter: rate.NewLimiter(rate.Limit(12.0), 8),
+		baseURL:         "https://api.bgm.tv",
+		http:            newLiveHTTPClient(tr),
+		limiter:         rate.NewLimiter(rate.Limit(2.0), 2),
+		coverLimiter:    rate.NewLimiter(rate.Limit(12.0), 8),
+		coverRetryWaits: []time.Duration{250 * time.Millisecond, 600 * time.Millisecond},
+		coverRetryWait:  waitCoverRetry,
+	}
+}
+
+func waitCoverRetry(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// IsPermanentCoverHTTPStatus reports whether an upstream cover HTTP status
+// indicates a permanently absent/denied cover that should not be retried.
+func IsPermanentCoverHTTPStatus(code int) bool {
+	switch code {
+	case http.StatusNoContent, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsTransientCoverHTTPStatus reports whether an upstream cover HTTP status is
+// transient and eligible for bounded retry.
+func IsTransientCoverHTTPStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return code >= 520 && code <= 524
 	}
 }
 
@@ -353,7 +397,7 @@ func (c *LiveClient) VerifyTankobonRatings(ctx context.Context, matches []Volume
 			checked[match.SubjectID] = result
 		}
 		if result.known {
-			match.NSFW, match.NSFWKnown = result.nsfw, true
+			match.NSFW, match.NSFWKnown = match.NSFW || result.nsfw, true
 			if result.coverURL != "" {
 				match.CoverURL = result.coverURL
 			}
@@ -484,41 +528,78 @@ func (c *LiveClient) FetchCoverBytes(ctx context.Context, coverURL string, subje
 	if target == "" {
 		return nil, ErrCoverUnavailable
 	}
-	if err := c.coverLimiter.Wait(ctx); err != nil {
-		return nil, err
+	waits := c.coverRetryWaits
+	if waits == nil {
+		waits = []time.Duration{250 * time.Millisecond, 600 * time.Millisecond}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-	if err != nil {
-		return nil, err
+	waitFn := c.coverRetryWait
+	if waitFn == nil {
+		waitFn = waitCoverRetry
 	}
-	req.Header.Set("User-Agent", archiveUserAgent)
-	token := ""
-	if target == imageEndpoint {
-		token = c.bearer(ctx, req.URL)
+	const maxCoverBytes = 16 << 20
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		if c.coverLimiter != nil {
+			if err := c.coverLimiter.Wait(ctx); err != nil {
+				return nil, err
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", archiveUserAgent)
+		token := ""
+		if target == imageEndpoint {
+			token = c.bearer(ctx, req.URL)
+		}
+		resp, err := c.doRead(req, token, true)
+		if err != nil {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+			lastErr = err
+		} else {
+			status := resp.StatusCode
+			switch {
+			case IsPermanentCoverHTTPStatus(status):
+				_ = resp.Body.Close()
+				return nil, ErrCoverUnavailable
+			case status == http.StatusOK:
+				if resp.Request != nil && strings.HasPrefix(path.Base(resp.Request.URL.Path), "no_icon_subject") {
+					_ = resp.Body.Close()
+					return nil, ErrCoverUnavailable
+				}
+				data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxCoverBytes+1))
+				_ = resp.Body.Close()
+				if readErr != nil {
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					lastErr = readErr
+				} else if len(data) == 0 || len(data) > maxCoverBytes {
+					return nil, ErrCoverUnavailable
+				} else {
+					return data, nil
+				}
+			case IsTransientCoverHTTPStatus(status):
+				_ = resp.Body.Close()
+				lastErr = fmt.Errorf("Bangumi cover download returned HTTP %d", status)
+			default:
+				_ = resp.Body.Close()
+				return nil, fmt.Errorf("Bangumi cover download returned HTTP %d", status)
+			}
+		}
+		if attempt >= len(waits) {
+			return nil, lastErr
+		}
+		if wErr := waitFn(ctx, waits[attempt]); wErr != nil {
+			return nil, wErr
+		}
 	}
-	resp, err := c.doRead(req, token, true)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case http.StatusNoContent, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone:
-		return nil, ErrCoverUnavailable
-	case http.StatusOK:
-	default:
-		return nil, fmt.Errorf("Bangumi cover download returned HTTP %d", resp.StatusCode)
-	}
-	if resp.Request != nil && strings.HasPrefix(path.Base(resp.Request.URL.Path), "no_icon_subject") {
-		return nil, ErrCoverUnavailable
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) == 0 {
-		return nil, ErrCoverUnavailable
-	}
-	return data, nil
 }
 
 func mapAPISubject(item apiSubjectResponse, persons []apiPersonRelation) SubjectCandidate {

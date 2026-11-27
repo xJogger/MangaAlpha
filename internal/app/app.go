@@ -65,6 +65,7 @@ type App struct {
 	listenAddr atomic.Value
 	warmCancel context.CancelFunc
 	warmDone   chan struct{}
+	publicCov  *publicBangumiCoverFetcher
 
 	lanMu     sync.Mutex
 	lanServer *http.Server
@@ -207,11 +208,12 @@ func New(_ context.Context, options Options) (*App, error) {
 	store.SetImportedCoverCleanup(metadataManager.RemoveUnusedImportedCovers)
 	thumbnailService.SetExternalCoverFetcher(metadataManager.FetchCover)
 	publicCovers := rate.NewLimiter(12, 8)
+	publicCoverFetcher := newPublicBangumiCoverFetcher()
 	thumbnailService.SetPublicBangumiCoverFetcher(func(ctx context.Context, coverURL string, subjectID int64) ([]byte, error) {
 		if err := publicCovers.Wait(ctx); err != nil {
 			return nil, err
 		}
-		return fetchPublicBangumiCover(ctx, proxyURLProvider(ctx), coverURL, subjectID)
+		return publicCoverFetcher.fetch(ctx, proxyURLProvider(ctx), coverURL, subjectID)
 	})
 	thumbnailService.SetBookExternalCoverFetcher(func(ctx context.Context, sourceID, entryID, parentEntryID, coverURL string) ([]byte, string, error) {
 		if sourceID == "" {
@@ -281,6 +283,7 @@ func New(_ context.Context, options Options) (*App, error) {
 		server: server, rawHandler: rawHandler, store: store, scanner: scanManager, pipelines: pipelineManager,
 		covers: coverManager, tasks: maintenanceManager, archive: archiveService, bangumi: bangumiService,
 		updater: updaterService, metadata: metadataManager, diag: diagRecorder, logger: options.Logger,
+		publicCov: publicCoverFetcher,
 	}, nil
 }
 
@@ -539,41 +542,166 @@ func (a *App) Close() error {
 	if a.bangumi != nil {
 		_ = a.bangumi.Close()
 	}
+	if a.publicCov != nil {
+		a.publicCov.closeIdleConnections()
+	}
 	return a.store.Close()
 }
 
-func fetchPublicBangumiCover(ctx context.Context, proxy, coverURL string, subjectID int64) ([]byte, error) {
-	if !bangumi.IsAllowedBangumiCoverURL(coverURL) {
-		coverURL = bangumi.CoverEndpointURL(subjectID)
+type publicBangumiCoverFetcher struct {
+	mu         sync.Mutex
+	proxy      string
+	client     *http.Client
+	newClient  func(proxy string) *http.Client
+	retryWaits []time.Duration
+	wait       func(context.Context, time.Duration) error
+}
+
+func newPublicBangumiCoverFetcher() *publicBangumiCoverFetcher {
+	return &publicBangumiCoverFetcher{
+		newClient: func(proxy string) *http.Client {
+			return extmeta.NewSafeHTTPClient(proxy, 20*time.Second)
+		},
+		retryWaits: []time.Duration{250 * time.Millisecond, 600 * time.Millisecond},
+		wait:       waitPublicCoverRetry,
 	}
-	client := extmeta.NewSafeHTTPClient(proxy, 20*time.Second)
+}
+
+func waitPublicCoverRetry(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (f *publicBangumiCoverFetcher) httpClient(proxy string) *http.Client {
+	proxy = strings.TrimSpace(proxy)
+	f.mu.Lock()
+	if f.client != nil && f.proxy == proxy {
+		client := f.client
+		f.mu.Unlock()
+		return client
+	}
+	newClient := f.newClient
+	if newClient == nil {
+		newClient = func(p string) *http.Client {
+			return extmeta.NewSafeHTTPClient(p, 20*time.Second)
+		}
+	}
+	client := newClient(proxy)
 	checkRedirect := client.CheckRedirect
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if !bangumi.IsAllowedBangumiCoverURL(req.URL.String()) {
 			return bangumi.ErrCoverUnavailable
 		}
-		return checkRedirect(req, via)
+		if checkRedirect != nil {
+			return checkRedirect(req, via)
+		}
+		return nil
 	}
-	defer client.CloseIdleConnections()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, coverURL, nil)
-	if err != nil {
-		return nil, err
+	prev := f.client
+	f.proxy = proxy
+	f.client = client
+	f.mu.Unlock()
+	if prev != nil {
+		prev.CloseIdleConnections()
 	}
-	req.Header.Set("User-Agent", "MangaAlpha")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
+	return client
+}
+
+func (f *publicBangumiCoverFetcher) closeIdleConnections() {
+	f.mu.Lock()
+	client := f.client
+	f.mu.Unlock()
+	if client != nil {
+		client.CloseIdleConnections()
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || strings.HasPrefix(path.Base(resp.Request.URL.Path), "no_icon_subject") {
-		return nil, bangumi.ErrCoverUnavailable
+}
+
+func (f *publicBangumiCoverFetcher) fetch(ctx context.Context, proxy, coverURL string, subjectID int64) ([]byte, error) {
+	if !bangumi.IsAllowedBangumiCoverURL(coverURL) {
+		if subjectID <= 0 {
+			return nil, bangumi.ErrCoverUnavailable
+		}
+		coverURL = bangumi.CoverEndpointURL(subjectID)
+	}
+	client := f.httpClient(proxy)
+	waits := f.retryWaits
+	if waits == nil {
+		waits = []time.Duration{250 * time.Millisecond, 600 * time.Millisecond}
+	}
+	waitFn := f.wait
+	if waitFn == nil {
+		waitFn = waitPublicCoverRetry
 	}
 	const maxCoverBytes = 16 << 20
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxCoverBytes+1))
-	if err == nil && (len(raw) == 0 || len(raw) > maxCoverBytes) {
-		return nil, bangumi.ErrCoverUnavailable
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, coverURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "MangaAlpha")
+		resp, err := client.Do(req)
+		if err != nil {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if errors.Is(err, bangumi.ErrCoverUnavailable) {
+				return nil, bangumi.ErrCoverUnavailable
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if errors.Is(err, extmeta.ErrInvalidProxyURL) || errors.Is(err, extmeta.ErrInvalidURL) {
+				return nil, err
+			}
+			lastErr = err
+		} else {
+			status := resp.StatusCode
+			switch {
+			case bangumi.IsPermanentCoverHTTPStatus(status):
+				_ = resp.Body.Close()
+				return nil, bangumi.ErrCoverUnavailable
+			case status == http.StatusOK:
+				if resp.Request != nil && strings.HasPrefix(path.Base(resp.Request.URL.Path), "no_icon_subject") {
+					_ = resp.Body.Close()
+					return nil, bangumi.ErrCoverUnavailable
+				}
+				raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxCoverBytes+1))
+				_ = resp.Body.Close()
+				if readErr != nil {
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					lastErr = readErr
+				} else if len(raw) == 0 || len(raw) > maxCoverBytes {
+					return nil, bangumi.ErrCoverUnavailable
+				} else {
+					return raw, nil
+				}
+			case bangumi.IsTransientCoverHTTPStatus(status):
+				_ = resp.Body.Close()
+				lastErr = fmt.Errorf("Bangumi cover download returned HTTP %d", status)
+			default:
+				_ = resp.Body.Close()
+				return nil, fmt.Errorf("Bangumi cover download returned HTTP %d", status)
+			}
+		}
+		if attempt >= len(waits) {
+			return nil, lastErr
+		}
+		if wErr := waitFn(ctx, waits[attempt]); wErr != nil {
+			return nil, wErr
+		}
 	}
-	return raw, err
 }
 
 func parseBookComicInfo(reader io.Reader) (database.BookScrapedMetadata, database.SeriesComicInfoBackfill, error) {

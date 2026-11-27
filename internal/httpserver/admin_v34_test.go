@@ -318,6 +318,41 @@ func TestAdminV34BookCustomCover(t *testing.T) {
 	assertRestored()
 }
 
+func TestAdminV34BookSummaryHidesNSFWBangumiIDWhenDisabled(t *testing.T) {
+	f := newAdminV34Fixture(t)
+	f.library(t, "catalog", "Catalog", true)
+	f.book(t, "catalog", "series", "book", false)
+	f.user(t, "reader", true, "catalog")
+	if err := f.store.UpsertBookScrapedMetadata(t.Context(), "book", database.BookScrapedMetadata{
+		BgmSubjectID: 909, BgmIsNSFW: true, MatchOrigin: "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	assertBgmID := func(showNSFW bool, want float64) {
+		t.Helper()
+		user, _, err := f.store.UserByUsername(t.Context(), "reader")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.SetUserShowNSFW(t.Context(), user.ID, showNSFW); err != nil {
+			t.Fatal(err)
+		}
+		bookRec := f.request(t, "reader", http.MethodGet, "/admin/api/books/book/detail", "", http.StatusOK)
+		bookPayload := decodeV33[struct{ RawBookMeta map[string]any }](t, bookRec)
+		assertAdminV34Fields(t, bookPayload.RawBookMeta, map[string]any{"bgmSubjectId": want})
+
+		seriesRec := f.request(t, "reader", http.MethodGet, "/admin/api/series/series/detail", "", http.StatusOK)
+		seriesPayload := decodeV33[struct {
+			BookExtras map[string]map[string]any
+		}](t, seriesRec)
+		assertAdminV34Fields(t, seriesPayload.BookExtras["book"], map[string]any{"bgmSubjectId": want})
+	}
+
+	assertBgmID(false, 0)
+	assertBgmID(true, 909)
+}
+
 func TestAdminV34BookCoverSource(t *testing.T) {
 	f := newAdminV34Fixture(t)
 	f.library(t, "catalog", "Catalog", true)

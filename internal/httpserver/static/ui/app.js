@@ -3791,7 +3791,7 @@
             <span class="badge ${ciMeta.cls}">${esc(ciMeta.label)}</span>
             ${rawBookMeta.seriesGroup ? `<span class="badge" title="来自 ComicInfo SeriesGroup">分组：${esc(rawBookMeta.seriesGroup)}</span>` : ''}
             ${rawBookMeta.storyArc ? `<span class="badge" title="来自 ComicInfo StoryArc">故事线：${esc(rawBookMeta.storyArc)}${rawBookMeta.storyArcNumber ? ` #${esc(rawBookMeta.storyArcNumber)}` : ''}</span>` : ''}
-            ${Number(rawBookMeta.bgmSubjectId || 0) > 0 ? `<span class="badge badge-bgm">BGM #${Number(rawBookMeta.bgmSubjectId)}</span>` : ''}
+            ${Number(rawBookMeta.bgmSubjectId || 0) > 0 ? `<a href="https://bgm.tv/subject/${Number(rawBookMeta.bgmSubjectId)}" target="_blank" rel="noopener noreferrer" class="badge badge-bgm" title="若打开提示“数据库中没有查询您所指定的条目”，说明该条目在 Bangumi 网页端受登录保护，请先在浏览器登录 bgm.tv 账号后再访问">Bangumi #${Number(rawBookMeta.bgmSubjectId)} ↗</a>` : ''}
             ${rawBookMeta.extSourceId && rawBookMeta.extEntryId ? `<span class="badge badge-accent">扩展源 #${esc(rawBookMeta.extEntryId)}</span>` : ''}
           </div>
 
@@ -4159,11 +4159,11 @@
           <p style="color:var(--text-secondary);font-size:13px">使用账号密码（HTTP Basic）或在右上角进入 <a href="/account" data-nav style="color:var(--accent)">「账号设置」</a> 生成专属 API Key 登录（KOReader 仅需填用户名密码）：</p>
           <div style="display:grid;gap:8px;margin-top:10px">
             <div style="font-size:12.5px;color:var(--text-secondary)">
-              <strong>Komga 客户端</strong>（推荐 <a href="https://github.com/Mister-album/Koharia" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">Koharia ↗</a> Android 阅读器，或 <a href="https://mihon.app/" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">Mihon ↗</a> Komga 扩展）
+              <strong>Komga 客户端</strong>（推荐 <a href="https://github.com/Mister-album/Koharia" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">Koharia ↗</a> Android 阅读器，性能较强的 Android 墨水屏设备同样推荐，建议在设置中开启无动画模式；或 <a href="https://mihon.app/" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">Mihon ↗</a> Komga 扩展）
             </div>
             ${(addrs.length ? addrs : [st.adminUrl || location.origin]).map((u) => `<div class="code-box">${esc(u)}</div>`).join('')}
             <div style="font-size:12.5px;color:var(--text-secondary);margin-top:4px">
-              <strong><a href="https://koreader.rocks/" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">KOReader ↗</a> 墨水屏</strong>（推荐插件 <a href="https://github.com/hugo1120/opdsforcomic.koplugin/releases" target="_blank" rel="noopener noreferrer" style="color:var(--accent)"><code>opdsforcomic.koplugin</code> ↗</a> · 点击直读 / 章节导航 / 零提前建索引 / 双向同步进度）
+              <strong><a href="https://koreader.rocks/" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">KOReader ↗</a> 墨水屏</strong>（封闭式墨水屏阅读器支持安装 KOReader 的设备，推荐搭配 <a href="https://github.com/hugo1120/opdsforcomic.koplugin/releases" target="_blank" rel="noopener noreferrer" style="color:var(--accent)"><code>opdsforcomic.koplugin</code> ↗</a> 插件 · 点击直读 / 章节导航 / 零提前建索引 / 双向同步进度）
             </div>
             ${(addrs.length ? addrs : [st.adminUrl || location.origin]).map((u) => `<div class="code-box">${esc(u.replace(/\/+$/, ''))}/api/opds/v1.2</div>`).join('')}
             <div style="font-size:12.5px;color:var(--text-secondary);margin-top:4px">
@@ -9503,14 +9503,14 @@
             <p style="font-size:12.5px;color:var(--text-secondary);margin-top:0">使用当前账号的用户名与密码（或右侧生成的个人 API Key）即可登录以下客户端，阅读进度与收藏夹与网页端实时同步：</p>
             <div style="display:grid;gap:10px">
               <div>
-                <div style="font-size:12px;color:var(--text-secondary);margin-bottom:4px"><strong>Komga 客户端</strong>（推荐 <a href="https://github.com/Mister-album/Koharia" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">Koharia ↗</a> Android 阅读器，或 <a href="https://mihon.app/" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">Mihon ↗</a> Komga 扩展）</div>
+                <div style="font-size:12px;color:var(--text-secondary);margin-bottom:4px"><strong>Komga 客户端</strong>（推荐 <a href="https://github.com/Mister-album/Koharia" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">Koharia ↗</a> Android 阅读器，性能较强的 Android 墨水屏设备同样推荐，建议在设置中开启无动画模式；或 <a href="https://mihon.app/" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">Mihon ↗</a> Komga 扩展）</div>
                 <div style="display:flex;gap:6px;align-items:center">
                   <div class="code-box" style="flex:1;min-width:0;margin:0">${esc(komgaURL)}</div>
                   <button type="button" class="btn btn-sm" style="flex-shrink:0" data-acc-copy="${esc(komgaURL)}">复制</button>
                 </div>
               </div>
               <div>
-                <div style="font-size:12px;color:var(--text-secondary);margin-bottom:4px"><strong><a href="https://koreader.rocks/" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">KOReader ↗</a> 墨水屏 OPDS</strong>（推荐插件 <a href="https://github.com/hugo1120/opdsforcomic.koplugin/releases" target="_blank" rel="noopener noreferrer" style="color:var(--accent)"><code>opdsforcomic.koplugin</code> ↗</a>）</div>
+                <div style="font-size:12px;color:var(--text-secondary);margin-bottom:4px"><strong><a href="https://koreader.rocks/" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">KOReader ↗</a> 墨水屏 OPDS</strong>（封闭式墨水屏阅读器支持安装 KOReader 的设备，推荐搭配 <a href="https://github.com/hugo1120/opdsforcomic.koplugin/releases" target="_blank" rel="noopener noreferrer" style="color:var(--accent)"><code>opdsforcomic.koplugin</code> ↗</a> 插件）</div>
                 <div style="display:flex;gap:6px;align-items:center">
                   <div class="code-box" style="flex:1;min-width:0;margin:0">${esc(koreaderURL)}</div>
                   <button type="button" class="btn btn-sm" style="flex-shrink:0" data-acc-copy="${esc(koreaderURL)}">复制</button>

@@ -502,3 +502,114 @@ VALUES(?,'offline','entry','https://example.test/cover',?)`, first.SeriesID, tim
 		t.Fatalf("cached fallback ok=%t err=%v external=%d archive=%d", ok, err, externalCalls, pageCalls)
 	}
 }
+
+func TestBangumiCoverNegativeCacheTiering(t *testing.T) {
+	store, first, _ := thumbnailTestStore(t)
+	service, err := New(store, filepath.Join(t.TempDir(), "thumbnails", "series"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 5; i++ {
+		id := fmt.Sprintf("tier-series-%d", i)
+		if _, err := store.DB().Exec(`
+INSERT INTO series(id,library_id,cid,name,relative_path,created_at,updated_at,seen_scan_id)
+VALUES(?,?,?,?,?,'','','scan')`, id, first.LibraryID, id, id, id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().Exec(`
+INSERT INTO series_metadata(series_id,bgm_subject_id,is_nsfw,cover_source,updated_at)
+VALUES(?,?,0,'bangumi','')`, id, 1000+i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := database.WithUserScope(t.Context(), database.UserScope{
+		UserID: "reader-tier", AllowNSFW: false, ShowNSFW: false, AllowedLibraryIDs: []string{first.LibraryID},
+	})
+	fetcher := func(_ context.Context, _ string, subjectID int64) ([]byte, error) {
+		switch subjectID {
+		case 1001, 2001:
+			return nil, fmt.Errorf("wrapped: %w", bangumi.ErrCoverUnavailable)
+		case 1002, 2002:
+			return []byte("not-an-image"), nil
+		case 1003, 2003:
+			return nil, errors.New("Bangumi cover download returned HTTP 503")
+		case 1004, 2004:
+			return nil, context.Canceled
+		default:
+			return nil, context.DeadlineExceeded
+		}
+	}
+	service.SetBangumiCoverFetcher(fetcher)
+	service.SetPublicBangumiCoverFetcher(fetcher)
+
+	expectTTL := func(seriesNum int, minTTL, maxTTL time.Duration) {
+		t.Helper()
+		seriesID := fmt.Sprintf("tier-series-%d", seriesNum)
+		subjTag := fmt.Sprintf("bgm_%d.jpg", 1000+seriesNum)
+		_, ok, err := service.Get(ctx, seriesID)
+		if err != nil || ok {
+			t.Fatalf("%s: ok=%v err=%v", seriesID, ok, err)
+		}
+		service.bgmMu.RLock()
+		var found bool
+		var remaining time.Duration
+		for k, until := range service.bgmFailures {
+			if bytes.Contains([]byte(k), []byte(subjTag)) {
+				found = true
+				remaining = time.Until(until)
+				break
+			}
+		}
+		service.bgmMu.RUnlock()
+		if maxTTL == 0 {
+			if found {
+				t.Fatalf("%s: expected no negative cache entry, got %v", seriesID, remaining)
+			}
+			return
+		}
+		if !found || remaining <= minTTL || remaining > maxTTL {
+			t.Fatalf("%s: negative cache TTL=%v (found=%v), want (%v, %v]", seriesID, remaining, found, minTTL, maxTTL)
+		}
+	}
+
+	expectTTL(1, bgmTransientFailureTTL, bgmFailureTTL) // ErrCoverUnavailable -> 5m
+	expectTTL(2, bgmTransientFailureTTL, bgmFailureTTL) // image decode error -> 5m
+	expectTTL(3, 0, bgmTransientFailureTTL)             // transient HTTP 503 -> 15s
+	expectTTL(4, 0, 0)                                  // context.Canceled -> none
+	expectTTL(5, 0, 0)                                  // context.DeadlineExceeded -> none
+
+	// Also verify public book cover path (knownPublic = true -> s.publicBgmFetcher).
+	for i, bookID := range []string{"first", "second"} {
+		subj := int64(2001 + i*2) // 2001 (permanent) and 2003 (transient)
+		if _, err := store.DB().Exec(`
+INSERT INTO book_metadata(book_id,bgm_subject_id,bgm_is_nsfw,cover_source,updated_at)
+VALUES(?,?,0,'bangumi','')`, bookID, subj); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := service.GetBookCover(ctx, bookID); err != nil || ok {
+			t.Fatalf("book %s: ok=%v err=%v", bookID, ok, err)
+		}
+	}
+	service.bgmMu.RLock()
+	for _, tc := range []struct {
+		subjTag        string
+		minTTL, maxTTL time.Duration
+	}{
+		{"bgm_2001.jpg", bgmTransientFailureTTL, bgmFailureTTL},
+		{"bgm_2003.jpg", 0, bgmTransientFailureTTL},
+	} {
+		var found bool
+		var remaining time.Duration
+		for k, until := range service.bgmFailures {
+			if bytes.Contains([]byte(k), []byte(tc.subjTag)) {
+				found = true
+				remaining = time.Until(until)
+				break
+			}
+		}
+		if !found || remaining <= tc.minTTL || remaining > tc.maxTTL {
+			t.Errorf("%s: book negative cache TTL=%v (found=%v), want (%v, %v]", tc.subjTag, remaining, found, tc.minTTL, tc.maxTTL)
+		}
+	}
+	service.bgmMu.RUnlock()
+}

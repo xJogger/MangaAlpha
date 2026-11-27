@@ -359,7 +359,7 @@ func waitTankobonCompletion(t *testing.T, svc *Service) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	want := archiveDumpSignature(svc.ArchiveStatus())
+	want := tankobonBackfillSignature(svc.ArchiveStatus())
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -371,5 +371,114 @@ func waitTankobonCompletion(t *testing.T, svc *Service) {
 			t.Fatalf("tankobon backfill did not finish: %+v", svc.ArchiveStatus())
 		case <-ticker.C:
 		}
+	}
+}
+
+func TestTankobonBackfillOneshotFallbackAndAlgoUpgrade(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	store, err := database.Open(filepath.Join(dir, "main.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	execTankobonFixture(t, store, `
+INSERT INTO libraries(id,name,root_cid,enabled,created_at,updated_at) VALUES ('default','Catalog','root',1,'','');
+`)
+	seedNamed := func(seriesID, bookID, bookName string, subjectID int64, seriesNSFW bool) {
+		execTankobonFixture(t, store, `
+INSERT INTO series(id,library_id,cid,name,relative_path,created_at,updated_at,seen_scan_id) VALUES (?,'default',?,?,?,?,?,'')`,
+			seriesID, seriesID, seriesID, seriesID, "", "")
+		execTankobonFixture(t, store, `
+INSERT INTO series_metadata(series_id,bgm_subject_id,is_nsfw,match_origin,updated_at) VALUES (?,?,?,'auto','')`,
+			seriesID, subjectID, seriesNSFW)
+		execTankobonFixture(t, store, `
+INSERT INTO books(id,series_id,library_id,file_id,parent_cid,name,size,pick_code,number_sort,created_at,updated_at,seen_scan_id)
+VALUES (?,?,'default',?,?,?,100,'',1,'','','')`, bookID, seriesID, bookID, seriesID, bookName)
+	}
+
+	// 1. Single-book series whose parent (100 in synthetic zip? Note: writeSyntheticBangumiZip creates 100 & 101 with relation 100->101!)
+	// Use a dedicated parent subject without tankobon relations: 200 (safe), 201 (parent NSFW=1), 202 (series NSFW=1), 999 (missing from archive).
+	seedNamed("s-safe", "b-safe", "Short Story.cbz", 200, false)
+	seedNamed("s-parent-nsfw", "b-parent-nsfw", "Adult Short.cbz", 201, false)
+	seedNamed("s-series-nsfw", "b-series-nsfw", "Local Flag Short.cbz", 200, true)
+	seedNamed("s-missing", "b-missing", "Missing Parent.cbz", 999, false)
+	seedNamed("s-chapter", "b-chapter", "第1话.cbz", 200, false)
+
+	// Multi-book series with 0 tankobon relations must NOT get oneshot_fallback.
+	seedNamed("s-multi", "b-multi-1", "Vol.01.cbz", 200, false)
+	execTankobonFixture(t, store, `
+INSERT INTO books(id,series_id,library_id,file_id,parent_cid,name,size,pick_code,number_sort,created_at,updated_at,seen_scan_id)
+VALUES ('b-multi-2','s-multi','default','b-multi-2','s-multi','Vol.02.cbz',100,'',2,'','','')`)
+
+	archiveDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archiveDB.Close()
+	archiveDB.SetMaxOpenConns(1)
+	if _, err := archiveDB.ExecContext(ctx, `
+CREATE TABLE bgm_subject_relations(subject_id,related_subject_id,relation_type,sort_order);
+CREATE TABLE bgm_subjects(id INTEGER PRIMARY KEY, name TEXT, name_cn TEXT, release_date TEXT, summary TEXT, is_nsfw INTEGER);
+INSERT INTO bgm_subjects(id,name,name_cn,release_date,summary,is_nsfw) VALUES
+ (200,'Safe Parent','安全单篇','','',0),
+ (201,'NSFW Parent','成人单篇','','',1);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	status := ArchiveStatus{Ready: true, DumpName: "dump-test.zip", DumpCreatedAt: "2026-01-01", DumpDigest: "sha256:abc"}
+	svc := &Service{store: store, archive: &ArchiveIndex{db: archiveDB, status: status}}
+
+	// Simulate an older v1/pre-algo completion signature stored before upgrade.
+	if err := store.SetSetting(ctx, settingArchiveSyncedBooksDump, archiveDumpSignature(status)); err != nil {
+		t.Fatal(err)
+	}
+	n, err := svc.syncOfflineTankobonBooks(ctx, false)
+	if err != nil || n != 3 {
+		t.Fatalf("expected 3 oneshot_fallback books backfilled on algo upgrade, got n=%d err=%v", n, err)
+	}
+	sig, err := store.GetSetting(ctx, settingArchiveSyncedBooksDump)
+	if err != nil || sig != tankobonBackfillSignature(status) {
+		t.Fatalf("expected upgraded signature %q, got %q err=%v", tankobonBackfillSignature(status), sig, err)
+	}
+
+	for _, tc := range []struct {
+		bookID    string
+		subjectID int64
+		wantNSFW  bool
+	}{
+		{"b-safe", 200, false},
+		{"b-parent-nsfw", 201, true},
+		{"b-series-nsfw", 200, true},
+	} {
+		bm, ok, err := store.BookMetadataByID(ctx, tc.bookID)
+		if err != nil || !ok || bm.BgmSubjectID != tc.subjectID || bm.BgmIsNSFW != tc.wantNSFW ||
+			bm.BgmCoverURL != CoverEndpointURL(tc.subjectID) {
+			t.Fatalf("%s metadata = %+v, ok=%v err=%v", tc.bookID, bm, ok, err)
+		}
+		bindings, err := store.ListBookSourceBindings(ctx, tc.bookID)
+		if err != nil || len(bindings) != 1 || bindings[0].EntryID != fmt.Sprint(tc.subjectID) {
+			t.Fatalf("%s bindings = %+v, err=%v", tc.bookID, bindings, err)
+		}
+		covers, err := store.ListBookCoverCandidates(ctx, tc.bookID)
+		if err != nil || len(covers) != 1 || !covers[0].NSFWKnown || covers[0].IsNSFW != tc.wantNSFW {
+			t.Fatalf("%s covers = %+v, err=%v", tc.bookID, covers, err)
+		}
+	}
+
+	for _, skipped := range []string{"b-missing", "b-chapter", "b-multi-1", "b-multi-2"} {
+		if bm, ok, err := store.BookMetadataByID(ctx, skipped); err != nil || ok {
+			t.Fatalf("%s should not be backfilled, got %+v ok=%v err=%v", skipped, bm, ok, err)
+		}
+	}
+
+	// Second pass with same algo signature is a no-op, and forced pass writes 0 rows.
+	if n2, err := svc.syncOfflineTankobonBooks(ctx, false); err != nil || n2 != 0 {
+		t.Fatalf("expected idempotent 0 on repeat, got %d, %v", n2, err)
+	}
+	if n3, err := svc.syncOfflineTankobonBooks(ctx, true); err != nil || n3 != 0 {
+		t.Fatalf("expected 0 diff writes on forced repeat, got %d, %v", n3, err)
 	}
 }

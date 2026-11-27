@@ -209,7 +209,159 @@ func TestVolumeMatchCompletionTagsAndDuplicateVolumes(t *testing.T) {
 		t.Fatalf("exact volume did not beat the range: %+v", matches)
 	}
 	books[0].Name = "作品 Vol.01 [Other Edition].cbz"
-	if matches := MatchBooksToTankobons(100, false, books, targets); len(matches) != 0 {
-		t.Fatalf("ambiguous duplicate volumes were bound: %+v", matches)
+	matches := MatchBooksToTankobons(100, false, books, targets)
+	if len(matches) != 2 || matches[0].SubjectID != 101 || matches[1].SubjectID != 101 {
+		t.Fatalf("expected equal-priority duplicate editions to share 101, got %+v", matches)
+	}
+
+	ccBooks := []VolumeMatchBook{
+		{BookID: "cc1", Name: "[C.C] Vol.35.zip"},
+		{BookID: "cc2", Name: "[Vol_35].zip"},
+		{BookID: "rev", Name: "作品 Vol.01 修正版.zip"},
+	}
+	ccTargets := []TankobonSubject{
+		{SubjectID: 201, Name: "作品 (1)"},
+		{SubjectID: 235, Name: "作品 (35)"},
+	}
+	ccGot := MatchBooksToTankobons(200, false, ccBooks, ccTargets)
+	if len(ccGot) != 3 || ccGot[0].SubjectID != 235 || ccGot[1].SubjectID != 235 || ccGot[2].SubjectID != 201 {
+		t.Fatalf("expected shared multi-edition matches, got %+v", ccGot)
+	}
+}
+
+func TestMatchBooksToTankobonsSeriesLevelExtraKeywords(t *testing.T) {
+	// IsVolumeExtra keeps its independent behavior on standalone strings.
+	if !IsVolumeExtra("魔法禁書目錄外傳 科學超電磁砲") {
+		t.Fatal("expected IsVolumeExtra to keep matching standalone strings with 外伝")
+	}
+
+	// 1. Series title itself contains 外伝 in both tankobons and books.
+	railgunTankobons := []TankobonSubject{
+		{SubjectID: 5001, Name: "とある魔術の禁書目録外伝 とある科学の超電磁砲 (1)", NameCN: "某科学的超电磁炮 (1)", Order: 1},
+		{SubjectID: 5002, Name: "とある魔術の禁書目録外伝 とある科学の超電磁砲 (2)", NameCN: "某科学的超电磁炮 (2)", Order: 2},
+		{SubjectID: 5003, Name: "とある科学の超電磁砲 公式ガイド", NameCN: "某科学的超电磁炮 公式书", Order: 3},
+	}
+	railgunBooks := []VolumeMatchBook{
+		{BookID: "r1", Name: "魔法禁書目錄外傳 科學超電磁砲 Vol.01.cbz"},
+		{BookID: "r2", Name: "魔法禁書目錄外傳 科學超電磁砲 Vol.02.cbz"},
+		{BookID: "r_bonus", Name: "魔法禁書目錄外傳 科學超電磁砲 特典小册子.cbz"},
+	}
+	got := MatchBooksToTankobons(5000, false, railgunBooks, railgunTankobons)
+	if len(got) != 2 || got[0].BookID != "r1" || got[0].SubjectID != 5001 || got[1].BookID != "r2" || got[1].SubjectID != 5002 {
+		t.Fatalf("series-title 外传 failed to match volumes cleanly or hijacked bonus: %+v", got)
+	}
+
+	// 2. Local books alone carry series-level 外传 prefix while tankobon names omit it.
+	plainTankobons := []TankobonSubject{
+		{SubjectID: 5101, NameCN: "某科学的超电磁炮 (1)", Order: 1},
+		{SubjectID: 5102, NameCN: "某科学的超电磁炮 (2)", Order: 2},
+	}
+	localOnlyBooks := []VolumeMatchBook{
+		{BookID: "l1", Name: "[汉化组A] 魔法禁书目录外传 科学超电磁炮 Vol.01.cbz"},
+		{BookID: "l2", Name: "[汉化组B] 魔法禁书目录外传 科学超电磁炮 Vol.02.cbz"},
+	}
+	gotLocal := MatchBooksToTankobons(5100, false, localOnlyBooks, plainTankobons)
+	if len(gotLocal) != 2 || gotLocal[0].SubjectID != 5101 || gotLocal[1].SubjectID != 5102 {
+		t.Fatalf("local-only series-level 外传 failed: %+v", gotLocal)
+	}
+
+	// 3. Trailing bonus marker across multiple books (NOT in common prefix) stays extra!
+	suffixExtras := []VolumeMatchBook{
+		{BookID: "e1", Name: "作品 Vol.01 特典.cbz"},
+		{BookID: "e2", Name: "作品 Vol.02 特典.cbz"},
+	}
+	if res := MatchBooksToTankobons(5100, false, suffixExtras, plainTankobons); len(res) != 0 {
+		t.Fatalf("trailing 特典 marker must not hijack numbered volumes: %+v", res)
+	}
+}
+
+func TestMatchBooksToTankobonsCircledFullwidthChineseAndMarkers(t *testing.T) {
+	tankobons := make([]TankobonSubject, 0, 50)
+	for i := 1; i <= 50; i++ {
+		tankobons = append(tankobons, TankobonSubject{
+			SubjectID: int64(6000 + i),
+			Name:      "テスト作品 (" + string(rune('0'+i/10)) + string(rune('0'+i%10)) + ")",
+			Order:     i,
+		})
+	}
+	// Replace a few tankobon titles with circled / fullwidth / Chinese / glued forms too.
+	tankobons[0].Name = "屍錄 御姐殭屍①"
+	tankobons[1].Name = "南島教師②"
+	tankobons[2].Name = "漫画③"
+	tankobons[10].Name = "作品 第十一卷"
+	tankobons[11].Name = "作品 12END"
+	tankobons[20].Name = "作品㉑"
+	tankobons[49].Name = "作品㊿"
+
+	cases := []struct {
+		id     string
+		name   string
+		wantID int64
+	}{
+		{"c1", "屍錄 御姐殭屍①.cbz", 6001},
+		{"c2", "南島教師②.cbz", 6002},
+		{"c3", "漫画③.zip", 6003},
+		{"c21", "作品㉑.cbz", 6021},
+		{"c50", "作品㊿.cbz", 6050},
+		{"fw1", "十月堂舊書事１.zip", 6001},
+		{"fw2", "十月堂舊書事 第２卷.cbz", 6002},
+		{"fw3", "十月堂舊書事（３）.cbz", 6003},
+		{"fw801", "塵８01.zip", 6001},
+		{"cn4", "作品 第四册.cbz", 6004},
+		{"cn11", "作品 第十一卷.cbz", 6011},
+		{"cn23", "作品 第二十三集.cbz", 6023},
+		{"cn1_suf", "作品 卷一.cbz", 6001},
+		{"cn12_suf", "作品 卷十二.cbz", 6012},
+		{"cn12_jp", "作品 第十二巻.cbz", 6012},
+		{"cn_ch", "作品 第一卷 第11话.cbz", 6001},
+		{"glued_end", "Gunrunner11End.rar", 6011},
+		{"mark", "Nekurogu_01 mark.rar", 6001},
+		{"wan", "作品 05完.zip", 6005},
+		{"end_upper", "作品 12END.cbz", 6012},
+		{"fix", "作品_03_fix.rar", 6003},
+		{"rev_zh", "作品 04 修正版.zip", 6004},
+	}
+
+	for _, tc := range cases {
+		got := MatchBooksToTankobons(6000, false, []VolumeMatchBook{{BookID: tc.id, Name: tc.name}}, tankobons)
+		if len(got) != 1 || got[0].BookID != tc.id || got[0].SubjectID != tc.wantID {
+			t.Errorf("book %s (%q) got %+v, want subject %d", tc.id, tc.name, got, tc.wantID)
+		}
+	}
+
+	// Circled range beats nothing when alone, and single circled volume beats circled range.
+	rangeVsSingle := MatchBooksToTankobons(6000, false, []VolumeMatchBook{
+		{BookID: "cr", Name: "作品①-②.cbz"},
+		{BookID: "cs", Name: "作品①.cbz"},
+	}, tankobons)
+	if len(rangeVsSingle) != 1 || rangeVsSingle[0].BookID != "cs" || rangeVsSingle[0].SubjectID != 6001 {
+		t.Fatalf("expected single circled volume to beat circled range, got %+v", rangeVsSingle)
+	}
+
+	// Negative guards: single chapters, noise tags, and title-embedded numbers must NEVER match!
+	negatives := []VolumeMatchBook{
+		{BookID: "ch_end", Name: "Ch.11End.cbz"},
+		{BookID: "ch_zh_end", Name: "第11话完.cbz"},
+		{BookID: "year", Name: "作品 (2023).cbz"},
+		{BookID: "res1", Name: "作品 1080p.cbz"},
+		{BookID: "res2", Name: "作品 200P.cbz"},
+		{BookID: "r18", Name: "作品 R18.cbz"},
+		{BookID: "c100", Name: "作品 C100.cbz"},
+		{BookID: "rev2", Name: "作品 rev2.cbz"},
+		{BookID: "lv999", Name: "LV999.cbz"},
+		{BookID: "title20", Name: "20世纪少年.cbz"},
+		{BookID: "title3", Name: "3月的狮子.cbz"},
+		{BookID: "dragonball", Name: "七龙珠.cbz"},
+		{BookID: "twelve", Name: "十二国记.cbz"},
+		{BookID: "fw_year", Name: "作品２０２３.cbz"},
+		{BookID: "fw_r18", Name: "作品 Ｒ１８.cbz"},
+	}
+	if negGot := MatchBooksToTankobons(6000, false, negatives, tankobons); len(negGot) != 0 {
+		t.Fatalf("expected negative guard titles not to match, got %+v", negGot)
+	}
+	// Full-10-volume series tag must not override Vol.02!
+	fullTen := []VolumeMatchBook{{BookID: "v2", Name: "作品 [全十卷] Vol.02.cbz"}}
+	if fullGot := MatchBooksToTankobons(6000, false, fullTen, tankobons); len(fullGot) != 1 || fullGot[0].SubjectID != 6002 {
+		t.Fatalf("expected Vol.02 to beat [全十卷], got %+v", fullGot)
 	}
 }

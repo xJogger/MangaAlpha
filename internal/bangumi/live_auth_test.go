@@ -117,6 +117,144 @@ func TestBangumiUnavailableCoverResponses(t *testing.T) {
 	}
 }
 
+type bangumiErrReader struct {
+	err error
+}
+
+func (r bangumiErrReader) Read([]byte) (int, error) {
+	return 0, r.err
+}
+
+func TestLiveClientFetchCoverRetriesAndPermanentFailures(t *testing.T) {
+	ctx := database.WithUserScope(t.Context(), database.UserScope{AllowNSFW: true, ShowNSFW: true})
+
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, 522} {
+		t.Run("transient_recover_"+http.StatusText(status), func(t *testing.T) {
+			var calls atomic.Int32
+			var waits []time.Duration
+			client := NewLiveClient()
+			client.coverLimiter = rate.NewLimiter(rate.Inf, 1)
+			client.coverRetryWait = func(_ context.Context, d time.Duration) error {
+				waits = append(waits, d)
+				return nil
+			}
+			client.http = newLiveHTTPClient(matchingTransport(func(r *http.Request) (*http.Response, error) {
+				if calls.Add(1) <= 2 {
+					return &http.Response{
+						StatusCode: status,
+						Body:       io.NopCloser(strings.NewReader("retry")),
+						Request:    r,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("ok-cover")),
+					Request:    r,
+				}, nil
+			}))
+			got, err := client.FetchCoverBytes(ctx, "https://lain.bgm.tv/pic/cover/c/fixture.jpg", 303)
+			if err != nil || string(got) != "ok-cover" || calls.Load() != 3 || len(waits) != 2 {
+				t.Fatalf("got=%q err=%v calls=%d waits=%v", got, err, calls.Load(), waits)
+			}
+		})
+	}
+
+	t.Run("transient_transport_and_read_error_recover", func(t *testing.T) {
+		var calls atomic.Int32
+		client := NewLiveClient()
+		client.coverLimiter = rate.NewLimiter(rate.Inf, 1)
+		client.coverRetryWait = func(context.Context, time.Duration) error { return nil }
+		client.http = newLiveHTTPClient(matchingTransport(func(r *http.Request) (*http.Response, error) {
+			switch calls.Add(1) {
+			case 1:
+				return nil, io.ErrUnexpectedEOF
+			case 2:
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(bangumiErrReader{err: io.ErrUnexpectedEOF}),
+					Request:    r,
+				}, nil
+			default:
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("recovered-cover")),
+					Request:    r,
+				}, nil
+			}
+		}))
+		got, err := client.FetchCoverBytes(ctx, "https://lain.bgm.tv/pic/cover/c/fixture.jpg", 303)
+		if err != nil || string(got) != "recovered-cover" || calls.Load() != 3 {
+			t.Fatalf("got=%q err=%v calls=%d", got, err, calls.Load())
+		}
+	})
+
+	t.Run("transient_exhausted_returns_non_permanent_error", func(t *testing.T) {
+		var calls atomic.Int32
+		client := NewLiveClient()
+		client.coverLimiter = rate.NewLimiter(rate.Inf, 1)
+		client.coverRetryWait = func(context.Context, time.Duration) error { return nil }
+		client.http = newLiveHTTPClient(matchingTransport(func(r *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       io.NopCloser(strings.NewReader("busy")),
+				Request:    r,
+			}, nil
+		}))
+		_, err := client.FetchCoverBytes(ctx, "https://lain.bgm.tv/pic/cover/c/fixture.jpg", 303)
+		if err == nil || errors.Is(err, ErrCoverUnavailable) || calls.Load() != 3 {
+			t.Fatalf("expected non-ErrCoverUnavailable after 3 attempts, got err=%v calls=%d", err, calls.Load())
+		}
+	})
+
+	for _, status := range []int{http.StatusNoContent, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone} {
+		t.Run("permanent_no_retry_"+http.StatusText(status), func(t *testing.T) {
+			var calls atomic.Int32
+			client := NewLiveClient()
+			client.coverLimiter = rate.NewLimiter(rate.Inf, 1)
+			client.coverRetryWait = func(context.Context, time.Duration) error {
+				t.Fatal("permanent status must not wait for retry")
+				return nil
+			}
+			client.http = newLiveHTTPClient(matchingTransport(func(r *http.Request) (*http.Response, error) {
+				calls.Add(1)
+				return &http.Response{
+					StatusCode: status,
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    r,
+				}, nil
+			}))
+			_, err := client.FetchCoverBytes(ctx, "https://lain.bgm.tv/pic/cover/c/fixture.jpg", 303)
+			if !errors.Is(err, ErrCoverUnavailable) || calls.Load() != 1 {
+				t.Fatalf("got err=%v calls=%d", err, calls.Load())
+			}
+		})
+	}
+
+	t.Run("cancel_during_retry_wait", func(t *testing.T) {
+		cancelCtx, cancel := context.WithCancel(ctx)
+		var calls atomic.Int32
+		client := NewLiveClient()
+		client.coverLimiter = rate.NewLimiter(rate.Inf, 1)
+		client.coverRetryWait = func(waitCtx context.Context, _ time.Duration) error {
+			cancel()
+			return waitCtx.Err()
+		}
+		client.http = newLiveHTTPClient(matchingTransport(func(r *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusBadGateway,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    r,
+			}, nil
+		}))
+		_, err := client.FetchCoverBytes(cancelCtx, "https://lain.bgm.tv/pic/cover/c/fixture.jpg", 303)
+		if !errors.Is(err, context.Canceled) || calls.Load() != 1 {
+			t.Fatalf("got err=%v calls=%d", err, calls.Load())
+		}
+	})
+}
+
 func TestCatalogAuthUsesCredentialOwnerAndSeriesScope(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()

@@ -40,12 +40,13 @@ type NSFWFallbackCoverFetcher func(ctx context.Context, seriesID string) ([]byte
 type CoverFetcher func(ctx context.Context, coverURL string, subjectID int64) ([]byte, error)
 
 const (
-	defaultMaxEdge  = 300
-	jpegQuality     = 75
-	maxImagePixels  = 100_000_000
-	bgmFailureTTL   = 5 * time.Minute
-	maxBgmFailures  = 2048
-	bgmNSFWCooldown = 30 * time.Minute
+	defaultMaxEdge         = 300
+	jpegQuality            = 75
+	maxImagePixels         = 100_000_000
+	bgmFailureTTL          = 5 * time.Minute
+	bgmTransientFailureTTL = 15 * time.Second
+	maxBgmFailures         = 2048
+	bgmNSFWCooldown        = 30 * time.Minute
 )
 
 var errBangumiCoverUnavailable = errors.New("Bangumi cover unavailable")
@@ -424,7 +425,11 @@ func (s *Service) fetchBangumiCover(ctx context.Context, subjectID int64, coverU
 				s.recordBangumiNSFWResult(scope.UserID, epoch, userEpoch, err)
 			}
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				s.cacheBangumiCoverFailure(flightKey, scope.UserID, epoch, userEpoch)
+				ttl := bgmTransientFailureTTL
+				if isPermanentBangumiCoverError(err) {
+					ttl = bgmFailureTTL
+				}
+				s.cacheBangumiCoverFailure(flightKey, scope.UserID, epoch, userEpoch, ttl)
 			}
 			return nil, err
 		}
@@ -433,7 +438,7 @@ func (s *Service) fetchBangumiCover(ctx context.Context, subjectID int64, coverU
 			s.recordBangumiNSFWResult(scope.UserID, epoch, userEpoch, err)
 		}
 		if err != nil {
-			s.cacheBangumiCoverFailure(flightKey, scope.UserID, epoch, userEpoch)
+			s.cacheBangumiCoverFailure(flightKey, scope.UserID, epoch, userEpoch, bgmFailureTTL)
 			return nil, err
 		}
 		s.bgmMu.Lock()
@@ -516,7 +521,12 @@ func readBangumiCoverFile(path string, publicOnly bool) []byte {
 	return raw
 }
 
-func (s *Service) cacheBangumiCoverFailure(key, userID string, epoch, userEpoch uint64) {
+func isPermanentBangumiCoverError(err error) bool {
+	var unavailable interface{ CoverUnavailable() bool }
+	return errors.As(err, &unavailable) && unavailable.CoverUnavailable()
+}
+
+func (s *Service) cacheBangumiCoverFailure(key, userID string, epoch, userEpoch uint64, ttl time.Duration) {
 	s.bgmMu.Lock()
 	defer s.bgmMu.Unlock()
 	if epoch != s.bgmEpoch || userEpoch != s.bgmUserEpoch[userID] {
@@ -536,7 +546,7 @@ func (s *Service) cacheBangumiCoverFailure(key, userID string, epoch, userEpoch 
 			}
 		}
 	}
-	s.bgmFailures[key] = now.Add(bgmFailureTTL)
+	s.bgmFailures[key] = now.Add(ttl)
 }
 
 func (s *Service) InvalidateBangumiCoverFailures() {

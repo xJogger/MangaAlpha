@@ -454,6 +454,7 @@ function createV34Harness(options = {}) {
   const accountSlice = extractSlice('  // --- Personal Account Settings Page (/account) ---', '  // --- AI Agent One-Click Authorization Page (/agent-auth/:requestID) ---');
   const seriesDetailSlice = extractSlice('  // --- Series Detail View (/series/:id) ---', '  // --- Metadata Edit Modal ---');
   const bookDetailSlice = extractSlice('  // --- Book Detail View (/book/:id & /books/:id) ---', '  // --- Admin Console (/admin) ---');
+  const adminOverviewSlice = options.includeAdminOverview ? extractSlice('  async function renderAdminOverview(', '  let sourcesRenderSeq = 0;') : '';
   const adminLibsSlice = extractSlice('  // --- Admin Libraries Tab ---', '  async function browse115Drawer(');
   const scraperSlice = extractSlice('  // --- Admin Bangumi Scraper Center ---', '  // --- Admin Jobs Tab (Adaptive Polling ONLY when active!) ---');
   const adminJobsSlice = extractSlice('  // --- Admin Jobs Tab (Adaptive Polling ONLY when active!) ---', '  // --- Admin Cache & Settings Tab ---');
@@ -631,6 +632,7 @@ function createV34Harness(options = {}) {
   if (options.includeSeriesDetail) vm.runInContext(seriesDetailSlice, ctx);
   else vm.runInContext(extractSlice('  function currentUserId()', '  function isSeriesPath('), ctx);
   if (options.includeBookDetail) vm.runInContext(bookDetailSlice, ctx);
+  if (options.includeAdminOverview) vm.runInContext(adminOverviewSlice, ctx);
   if (options.includeAdminLibraries) vm.runInContext(adminLibsSlice, ctx);
   if (options.includeScraper) vm.runInContext(scraperSlice, ctx);
   if (options.includeAdminJobs) vm.runInContext(adminJobsSlice, ctx);
@@ -1307,6 +1309,22 @@ test('book detail renders two-column metadata, edits 9 fields + 9 locks + clearN
   assert.match(pageHTML, /9784088800000/);
   assert.match(pageHTML, /插画乙 \(illustrator\)/);
   assert.match(pageHTML, /https:\/\/bgm\.tv\/subject\/100/);
+  const bgmBadgeLink = h.doc.getElementById('page-content').querySelector('.badge-bgm');
+  assert.ok(bgmBadgeLink, 'expected clickable .badge-bgm link on book detail');
+  assert.equal(bgmBadgeLink.tagName, 'A');
+  assert.equal(bgmBadgeLink.getAttribute('href'), 'https://bgm.tv/subject/100');
+  assert.equal(bgmBadgeLink.getAttribute('target'), '_blank');
+  assert.equal(bgmBadgeLink.getAttribute('rel'), 'noopener noreferrer');
+  assert.match(bgmBadgeLink.textContent, /Bangumi #100 ↗/);
+  assert.match(bgmBadgeLink.getAttribute('title'), /受登录保护/);
+  assert.doesNotMatch(pageHTML, />BGM #100</);
+
+  // When bgmSubjectId is 0 (e.g. hidden NSFW), no Bangumi badge link is rendered.
+  sampleBookDetail.rawBookMeta.bgmSubjectId = 0;
+  h.ctx.paintBookDetail('bk-1', sampleBookDetail, []);
+  assert.equal(h.doc.getElementById('page-content').querySelector('.badge-bgm'), null);
+  sampleBookDetail.rawBookMeta.bgmSubjectId = 100;
+  h.ctx.paintBookDetail('bk-1', sampleBookDetail, []);
 
   // 1. Cover source switch
   const bgmCoverBtn = h.doc.getElementById('page-content').querySelector('button[data-book-cover-src="bangumi"]');
@@ -1948,4 +1966,49 @@ test('real renderHome integrates with DISPLAY_PREFS 0 values end-to-end', async 
   assert.match(emptyHTML, /首页展示板块已全部关闭/);
   assert.match(emptyHTML, /浏览书库/);
   assert.match(emptyHTML, /账号设置/);
+});
+
+test('admin overview and account client cards include updated e-ink reader guidance', async () => {
+  const h = createV34Harness({
+    includeAdminOverview: true,
+    includeAccount: true,
+    apiHandler: async (url) => {
+      if (url === '/admin/api/status') {
+        return {
+          libraries: 1,
+          series: 2,
+          books: 3,
+          comicBytes: 1024,
+          bgmMatched: 1,
+          configured115: false,
+          webdavAccounts: 0,
+          mihonAddresses: ['http://example.invalid:25600'],
+          performance: {},
+        };
+      }
+      if (url === '/api/v1/client-settings/user/list') return {};
+      if (url === '/admin/api/me') {
+        return {
+          user: { id: 'u-admin', username: 'admin', role: 'admin', allowNsfw: false, showNsfw: false },
+          authorizedLibraries: [],
+          hiddenLibraryIds: [],
+          visibleLibraries: [],
+        };
+      }
+      if (url === '/admin/api/auth/api-keys' || url === '/admin/api/auth/sessions') return [];
+      if (url.startsWith('/admin/api/bangumi/tracker')) return null;
+      return {};
+    },
+  });
+
+  const adminBody = h.doc.createElement('div');
+  adminBody.id = 'admin-tab-body';
+  await h.ctx.renderAdminOverview(adminBody);
+  assert.match(adminBody.innerHTML, /性能较强的 Android 墨水屏设备同样推荐，建议在设置中开启无动画模式/);
+  assert.match(adminBody.innerHTML, /封闭式墨水屏阅读器.*opdsforcomic\.koplugin/);
+
+  await h.ctx.renderAccountPage();
+  const accountHTML = h.doc.getElementById('page-content').innerHTML;
+  assert.match(accountHTML, /性能较强的 Android 墨水屏设备同样推荐，建议在设置中开启无动画模式/);
+  assert.match(accountHTML, /封闭式墨水屏阅读器.*opdsforcomic\.koplugin/);
 });

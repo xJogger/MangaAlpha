@@ -13,7 +13,18 @@ import (
 	"github.com/xJogger/fake-komga-115/internal/diagnostics"
 )
 
-const tankobonSeriesBatchSize = 50
+const (
+	tankobonSeriesBatchSize     = 50
+	tankobonBackfillAlgoVersion = "v2"
+)
+
+func tankobonBackfillSignature(status ArchiveStatus) string {
+	base := archiveDumpSignature(status)
+	if base == "" {
+		base = "imported:" + status.ImportedAt + ":" + strconv.FormatInt(status.SubjectCount, 10)
+	}
+	return base + "|algo:" + tankobonBackfillAlgoVersion
+}
 
 type tankobonChain struct {
 	sourceID      string
@@ -79,6 +90,7 @@ func (s *Service) tankobonBackfillPlan(ctx context.Context) (tankobonBackfillPla
 type tankobonSeriesRow struct {
 	database.Series
 	rowID, subjectID int64
+	isNSFW           bool
 	chain            tankobonChain
 	chainVersion     string
 }
@@ -88,7 +100,7 @@ const visibleTankobonLibrary = `l.enabled=1 AND NOT EXISTS (
 
 func (s *Service) tankobonSeriesBatch(ctx context.Context, after int64, plan tankobonBackfillPlan) ([]tankobonSeriesRow, error) {
 	rows, err := s.store.DB().QueryContext(ctx, `
-SELECT sm.rowid, s.id, s.library_id, s.one_shot, s.one_shot_override, s.books_count, sm.bgm_subject_id
+SELECT sm.rowid, s.id, s.library_id, s.one_shot, s.one_shot_override, s.books_count, sm.bgm_subject_id, coalesce(sm.is_nsfw, 0)
 FROM series_metadata sm CROSS JOIN series s ON s.id=sm.series_id
 JOIN libraries l ON l.id=s.library_id
 WHERE sm.rowid>? AND sm.bgm_subject_id>0 AND `+visibleTankobonLibrary+`
@@ -100,7 +112,7 @@ ORDER BY sm.rowid LIMIT ?`, after, tankobonSeriesBatchSize)
 	batch := make([]tankobonSeriesRow, 0, tankobonSeriesBatchSize)
 	for rows.Next() {
 		var row tankobonSeriesRow
-		if err := rows.Scan(&row.rowID, &row.ID, &row.LibraryID, &row.OneShot, &row.OneShotOverride, &row.BooksCount, &row.subjectID); err != nil {
+		if err := rows.Scan(&row.rowID, &row.ID, &row.LibraryID, &row.OneShot, &row.OneShotOverride, &row.BooksCount, &row.subjectID, &row.isNSFW); err != nil {
 			return nil, err
 		}
 		chain, ok := plan.chains[row.LibraryID]
@@ -260,7 +272,33 @@ func diffTankobonBook(book tankobonBookRow, match VolumeMatchResult, chain tanko
 	return update, update.writeMetadata || update.writeBinding || update.writeCover
 }
 
-func diffTankobonBatch(ctx context.Context, books []tankobonBookRow, targets map[string]tankobonSeriesRow, items map[int64][]TankobonSubject) ([]tankobonBookUpdate, int, error) {
+func loadArchiveSubjectNSFWBatch(ctx context.Context, db *sql.DB, parents []int64) (map[int64]bool, error) {
+	if len(parents) == 0 {
+		return nil, nil
+	}
+	args := make([]any, len(parents))
+	for i, id := range parents {
+		args[i] = id
+	}
+	rows, err := db.QueryContext(ctx, `
+SELECT id, coalesce(is_nsfw, 0) FROM bgm_subjects WHERE id IN `+database.Placeholders(len(parents)), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64]bool, len(parents))
+	for rows.Next() {
+		var id int64
+		var isNSFW bool
+		if err := rows.Scan(&id, &isNSFW); err != nil {
+			return nil, err
+		}
+		out[id] = isNSFW
+	}
+	return out, rows.Err()
+}
+
+func diffTankobonBatch(ctx context.Context, books []tankobonBookRow, targets map[string]tankobonSeriesRow, items map[int64][]TankobonSubject, parentNSFW map[int64]bool) ([]tankobonBookUpdate, int, error) {
 	var updates []tankobonBookUpdate
 	matchedSeries := 0
 	for start := 0; start < len(books); {
@@ -291,8 +329,14 @@ func diffTankobonBatch(ctx context.Context, books []tankobonBookRow, targets map
 		if len(matches) != 0 {
 			matchedSeries++
 		}
-		for _, match := range matches {
-			if update, changed := diffTankobonBook(byID[match.BookID], match, target.chain); changed {
+		for i := range matches {
+			match := &matches[i]
+			if match.MatchedBy == "oneshot_fallback" {
+				nsfw, found := parentNSFW[target.subjectID]
+				match.NSFWKnown = found
+				match.NSFW = target.isNSFW || (found && nsfw)
+			}
+			if update, changed := diffTankobonBook(byID[match.BookID], *match, target.chain); changed {
 				updates = append(updates, update)
 			}
 		}
@@ -311,10 +355,7 @@ func (s *Service) syncOfflineTankobonBooks(ctx context.Context, force bool) (int
 	if db == nil || !status.Ready || status.NeedsTankobonReimport {
 		return 0, nil
 	}
-	signature := archiveDumpSignature(status)
-	if signature == "" {
-		signature = "imported:" + status.ImportedAt + ":" + strconv.FormatInt(status.SubjectCount, 10)
-	}
+	signature := tankobonBackfillSignature(status)
 	prev, err := s.store.GetSetting(ctx, settingArchiveSyncedBooksDump)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
@@ -365,16 +406,29 @@ func (s *Service) syncOfflineTankobonBooks(ctx context.Context, force bool) (int
 		if err != nil {
 			return updatedBooks, err
 		}
+		var oneshotParents []int64
+		oneshotSeen := make(map[int64]bool)
 		for id, target := range targets {
 			if len(items[target.subjectID]) == 0 {
-				delete(targets, id)
+				if target.BooksCount != 1 {
+					delete(targets, id)
+					continue
+				}
+				if !oneshotSeen[target.subjectID] {
+					oneshotSeen[target.subjectID] = true
+					oneshotParents = append(oneshotParents, target.subjectID)
+				}
 			}
 		}
 		if len(targets) == 0 {
 			continue
 		}
+		parentNSFW, err := loadArchiveSubjectNSFWBatch(ctx, db, oneshotParents)
+		if err != nil {
+			return updatedBooks, err
+		}
 
-		n, matched, err := s.applyTankobonBookBatch(ctx, db, targets, items, completed)
+		n, matched, err := s.applyTankobonBookBatch(ctx, db, targets, items, parentNSFW, completed)
 		if errors.Is(err, database.ErrMetadataChanged) && planRetries < 3 {
 			// A metadata-source sync can change a chain's version just after
 			// the archive import queued us. Retry this batch with a fresh plan.
@@ -430,13 +484,13 @@ WHERE settings.value<>excluded.value`, settingArchiveSyncedBooksDump, signature,
 	return s.commitForArchive(tx, archiveDB)
 }
 
-func (s *Service) applyTankobonBookBatch(ctx context.Context, archiveDB *sql.DB, targets map[string]tankobonSeriesRow, items map[int64][]TankobonSubject, clearCompletion bool) (int, int, error) {
+func (s *Service) applyTankobonBookBatch(ctx context.Context, archiveDB *sql.DB, targets map[string]tankobonSeriesRow, items map[int64][]TankobonSubject, parentNSFW map[int64]bool, clearCompletion bool) (int, int, error) {
 	for attempt := 0; attempt < 3; attempt++ {
 		books, err := loadTankobonBookBatch(ctx, s.store.DB(), targets)
 		if err != nil {
 			return 0, 0, err
 		}
-		updates, matched, err := diffTankobonBatch(ctx, books, targets, items)
+		updates, matched, err := diffTankobonBatch(ctx, books, targets, items, parentNSFW)
 		if err != nil || len(updates) == 0 {
 			return 0, matched, err
 		}
