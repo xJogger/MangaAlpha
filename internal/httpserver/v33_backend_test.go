@@ -153,6 +153,83 @@ func (f v33HTTPFixture) progress(t *testing.T, userID, bookID, date string, done
 SELECT ?,id,series_id,?,1,? FROM books WHERE id=?`, userID, done, date, bookID)
 }
 
+func TestKomgaSeriesBooksLegacyAliasMetadata(t *testing.T) {
+	f := newV33HTTPFixture(t, false, false)
+	ctx := context.Background()
+	f.library(t, "member", "Member", true)
+	const sourceID = "source-series"
+	const volumes = 60
+	physicalBooks := make([]database.Book, 0, volumes)
+	for i := range volumes {
+		id := "book-" + strconv.Itoa(i)
+		f.book(t, "member", sourceID, id, false)
+		physicalBooks = append(physicalBooks, database.Book{ID: id, SeriesID: sourceID, LibraryID: "member"})
+	}
+	union, _, err := f.store.CreateUnionLibrary(ctx, "Union", true, []string{"member"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	series, err := f.store.SeriesByID(ctx, sourceID)
+	if err != nil || series.ID == sourceID || series.LibraryID != union.ID {
+		t.Fatalf("series alias: %+v, %v", series, err)
+	}
+	const title = "Catalog Title"
+	authors := []database.Author{{Name: "Catalog Author", Role: "writer"}}
+	if _, err := f.store.ApplyScrapedMetadata(ctx, series, database.ScrapedMetadata{SubjectID: 42, Title: title, Authors: authors}); err != nil {
+		t.Fatal(err)
+	}
+	reader := f.user(t, "reader", false, union.ID)
+	if _, err := f.store.SetUserHiddenLibraries(ctx, reader.ID, []string{union.ID}); err != nil {
+		t.Fatal(err)
+	}
+	type bookPage struct {
+		TotalElements int `json:"totalElements"`
+		Content       []struct {
+			SeriesID    string `json:"seriesId"`
+			SeriesTitle string `json:"seriesTitle"`
+			Metadata    struct {
+				Title   string            `json:"title"`
+				Authors []database.Author `json:"authors"`
+			} `json:"metadata"`
+		} `json:"content"`
+	}
+	browse := decodeV33[bookPage](t, f.request(t, reader.Username, "GET", "/api/v1/books", "", 200))
+	if browse.TotalElements != 0 {
+		t.Fatalf("personally hidden union contributed %d books to browse", browse.TotalElements)
+	}
+	path := "/api/v1/series/" + sourceID + "/books?size=60"
+	page := decodeV33[bookPage](t, f.request(t, reader.Username, "GET", path, "", 200))
+	if page.TotalElements != volumes || len(page.Content) != volumes {
+		t.Fatalf("legacy series books: total=%d, page size=%d", page.TotalElements, len(page.Content))
+	}
+	for i, book := range page.Content {
+		if book.SeriesID != series.ID || book.SeriesTitle != title || book.Metadata.Title == "" ||
+			!slices.Equal(book.Metadata.Authors, authors) {
+			t.Fatalf("legacy series book %d: %+v", i, book)
+		}
+	}
+
+	// The HTTP route resolves the alias before loading books. Pass the physical
+	// IDs through the DTO path directly to exercise the batch-lookup fallback.
+	reader, err = f.store.UserByID(ctx, reader.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", path, nil).WithContext(database.WithUserScope(ctx, reader.Scope()))
+	server := &Server{store: f.store}
+	dtos, err := server.bookDTOs(req, physicalBooks)
+	if err != nil || len(dtos) != volumes {
+		t.Fatalf("physical book DTOs: count=%d err=%v", len(dtos), err)
+	}
+	for i, dto := range dtos {
+		book := dto.(map[string]any)
+		meta := book["metadata"].(map[string]any)
+		if book["seriesTitle"] != title || !slices.Equal(meta["authors"].([]database.Author), authors) {
+			t.Fatalf("physical book DTO %d: %+v", i, book)
+		}
+	}
+}
+
 func TestV33PersonalHiddenLibrariesAcrossClients(t *testing.T) {
 	f := newV33HTTPFixture(t, true, false)
 	ctx := context.Background()

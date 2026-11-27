@@ -13,7 +13,10 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-type shelfRevision struct{ catalog, progress int64 }
+type shelfRevision struct {
+	catalog, progress int64
+	bulk              bool
+}
 
 type shelfCacheEntry struct {
 	revision shelfRevision
@@ -113,6 +116,9 @@ func createShelfRevisions(db *sql.DB) error {
 			}
 		}
 	}
+	if _, err := tx.Exec(userShowNSFWShelfRevisionTrigger); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -155,7 +161,8 @@ func shelfProjectionCondition(table, op string) string {
 
 func (s *Store) shelfRevision(ctx context.Context, includesProgress bool) (shelfRevision, error) {
 	var r shelfRevision
-	err := s.db.QueryRowContext(ctx, "SELECT catalog,progress FROM shelf_revision WHERE id=1").Scan(&r.catalog, &r.progress)
+	err := s.db.QueryRowContext(ctx, "SELECT catalog,progress,bulk_mode<>0 FROM shelf_revision WHERE id=1").
+		Scan(&r.catalog, &r.progress, &r.bulk)
 	if !includesProgress {
 		r.progress = 0
 	}
@@ -165,13 +172,17 @@ func (s *Store) shelfRevision(ctx context.Context, includesProgress bool) (shelf
 // Result storage is bounded and process-local. Revisions are written in the
 // same transaction as data, including writes by scanner and Agent endpoints.
 func shelfCached[T any](ctx context.Context, s *Store, key string, progress bool, fn func(context.Context) (T, error)) (T, error) {
-	var zero T
 	visKey := s.VisibilityCacheKey(ctx)
 	if progress {
 		key = key + "|u=" + UserIDFromContext(ctx) + "|v=" + visKey
 	} else {
 		key = key + "|v=" + visKey
 	}
+	return shelfCachedByKey(ctx, s, key, progress, fn)
+}
+
+func shelfCachedByKey[T any](ctx context.Context, s *Store, key string, progress bool, fn func(context.Context) (T, error)) (T, error) {
+	var zero T
 	lookup := func(rev shelfRevision) (T, bool) {
 		s.shelf.mu.Lock()
 		defer s.shelf.mu.Unlock()
@@ -184,6 +195,9 @@ func shelfCached[T any](ctx context.Context, s *Store, key string, progress bool
 		rev, err := s.shelfRevision(ctx, progress)
 		if err != nil {
 			return zero, err
+		}
+		if rev.bulk {
+			return fn(ctx)
 		}
 		if val, ok := lookup(rev); ok {
 			return val, nil
@@ -227,9 +241,14 @@ func shelfCached[T any](ctx context.Context, s *Store, key string, progress bool
 			}
 		}
 	}
-	// Busy catalog updates shouldn't make requests wait forever. This direct
-	// uncached load uses current visibility settings, just like a cache miss.
+	// Fall back to a direct load when catalog updates keep changing the revision.
 	return fn(ctx)
+}
+
+func (s *Store) cachedBookCount(ctx context.Context, libraries []string, excludeNSFW bool, oneShot *bool, count func(context.Context) (int64, error)) (int64, error) {
+	libraries = slices.Sorted(slices.Values(libraries))
+	key, _ := json.Marshal([]any{libraries, excludeNSFW, oneShot})
+	return shelfCachedByKey(ctx, s, "books-count:"+string(key), false, count)
 }
 
 type seriesPageResult struct {

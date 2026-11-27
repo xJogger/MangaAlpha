@@ -2,10 +2,174 @@ package database
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"reflect"
 	"testing"
 )
+
+func TestBooksPageCountCache(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "book-count.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, id := range []string{"a", "b", "c"} {
+		if err := s.UpsertLibrary(ctx, Library{ID: id, Name: id, RootCID: id, Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedV33Book(t, s, "a", "regular", "regular-1")
+	seedV33Book(t, s, "a", "regular", "regular-2")
+	seedV33Book(t, s, "b", "adult", "adult-1")
+	seedV33Book(t, s, "b", "single", "single-1")
+	seedV33Book(t, s, "c", "denied", "denied-1")
+	execV33(t, s, "INSERT INTO series_metadata(series_id,is_nsfw,updated_at) VALUES('adult',1,'')")
+
+	newUser := func(name string, hidden []string, show bool) User {
+		t.Helper()
+		u, err := s.CreateUser(ctx, CreateUserInput{
+			Username: name, Password: "test-password", AllowedLibraryIDs: []string{"a", "b"}, AllowNSFW: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.SetUserPreferences(ctx, u.ID, &show, &hidden); err != nil {
+			t.Fatal(err)
+		}
+		u, err = s.UserByID(ctx, u.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	hiddenB := newUser("hidden-b", []string{"b"}, false)
+	hiddenA := newUser("hidden-a", []string{"a"}, false)
+	showAdult := newUser("show-adult", []string{"a"}, true)
+
+	check := func(ctx context.Context, q BookQuery, want int64, wantItems int) {
+		t.Helper()
+		items, total, err := s.BooksPage(ctx, q)
+		if err != nil || total != want || len(items) != wantItems {
+			t.Fatalf("user %s query %+v: total=%d items=%d err=%v, want %d/%d",
+				UserIDFromContext(ctx), q, total, len(items), err, want, wantItems)
+		}
+	}
+	bCtx := WithUserScope(ctx, hiddenB.Scope())
+	aCtx := WithUserScope(ctx, hiddenA.Scope())
+	adultCtx := WithUserScope(ctx, showAdult.Scope())
+	check(bCtx, BookQuery{Size: 1}, 2, 1)
+	check(bCtx, BookQuery{Size: 1}, 2, 1)
+
+	// A sentinel in the warmed entry proves the next page reads the cached count.
+	const key = `books-count:[["a"],true,null]`
+	s.shelf.mu.Lock()
+	entry, found := s.shelf.items[key]
+	if found {
+		s.shelf.items[key] = shelfCacheEntry{entry.revision, int64(13)}
+	}
+	s.shelf.mu.Unlock()
+	if !found {
+		t.Fatal("BooksPage did not cache the resolved count")
+	}
+	check(bCtx, BookQuery{Size: 2, Page: 1, Sort: "name,desc"}, 13, 0)
+	s.shelf.mu.Lock()
+	s.shelf.items[key] = entry
+	s.shelf.mu.Unlock()
+
+	check(aCtx, BookQuery{}, 1, 1)
+	check(adultCtx, BookQuery{}, 2, 2)
+	check(bCtx, BookQuery{LibraryIDs: []string{"b", "c"}}, 1, 1)
+	check(bCtx, BookQuery{LibraryIDs: []string{"c"}}, 0, 0)
+	check(WithUserScope(ctx, UserScope{UserID: "no-libraries"}), BookQuery{}, 0, 0)
+	check(adultCtx, BookQuery{LibraryIDs: []string{"b", "a", "b"}}, 4, 4)
+	check(adultCtx, BookQuery{LibraryIDs: []string{"a", "b"}}, 4, 4)
+	yes, no := true, false
+	onlyOneShot := BookQuery{OneShot: &yes}
+	regularOnly := BookQuery{OneShot: &no}
+	check(aCtx, onlyOneShot, 0, 0)
+	check(aCtx, regularOnly, 1, 1)
+
+	seedV33Book(t, s, "a", "regular", "regular-3")
+	check(bCtx, BookQuery{}, 3, 3)
+	execV33(t, s, "DELETE FROM books WHERE id='regular-3'")
+	check(bCtx, BookQuery{}, 2, 2)
+	execV33(t, s, "UPDATE series_metadata SET is_nsfw=0 WHERE series_id='adult'")
+	check(aCtx, BookQuery{}, 2, 2)
+	execV33(t, s, "UPDATE series_metadata SET is_nsfw=1 WHERE series_id='adult'")
+	check(aCtx, BookQuery{}, 1, 1)
+	if err := s.SetSeriesOneShotOverride(ctx, "single", true); err != nil {
+		t.Fatal(err)
+	}
+	check(aCtx, onlyOneShot, 1, 1)
+	check(aCtx, regularOnly, 0, 0)
+	seedV33Book(t, s, "b", "single", "single-2")
+	check(aCtx, onlyOneShot, 0, 0)
+	check(aCtx, regularOnly, 2, 2)
+	execV33(t, s, "DELETE FROM books WHERE id='single-2'")
+	check(aCtx, onlyOneShot, 1, 1)
+	if err := s.SetSeriesOneShotOverride(ctx, "single", false); err != nil {
+		t.Fatal(err)
+	}
+	check(aCtx, onlyOneShot, 0, 0)
+
+	// A reader bypasses both lookup and population while a bulk revision is active.
+	check(bCtx, BookQuery{}, 2, 2)
+	execV33(t, s, "UPDATE shelf_revision SET bulk_mode=1 WHERE id=1")
+	execV33(t, s, "DELETE FROM books WHERE id='regular-1'")
+	check(bCtx, BookQuery{}, 1, 1)
+	s.shelf.mu.Lock()
+	cachedDuringBulk := s.shelf.items[key].value
+	s.shelf.mu.Unlock()
+	if cachedDuringBulk != int64(2) {
+		t.Fatalf("bulk read replaced cached total with %v", cachedDuringBulk)
+	}
+	execV33(t, s, "UPDATE shelf_revision SET bulk_mode=0,catalog=catalog+1 WHERE id=1")
+	check(bCtx, BookQuery{}, 1, 1)
+	canceled, cancel := context.WithCancel(bCtx)
+	cancel()
+	if _, _, err := s.BooksPage(canceled, BookQuery{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled BooksPage: %v", err)
+	}
+}
+
+func TestUserShowNSFWShelfRevisionMigration(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "preferences.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.ClaimAdmin(ctx, "owner", "test-password"); err != nil {
+		t.Fatal(err)
+	}
+	user, err := s.CreateUser(ctx, CreateUserInput{Username: "reader", Password: "test-password", AllowNSFW: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execV33(t, s, "DROP TRIGGER fk115_shelf_users_show_nsfw_update")
+	for range 2 {
+		if err := applyMigrations(s.db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	revision := func() int64 {
+		t.Helper()
+		rev, err := s.shelfRevision(ctx, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rev.catalog
+	}
+	before := revision()
+	if _, err := s.SetUserShowNSFW(ctx, user.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if after := revision(); after != before+1 {
+		t.Fatalf("NSFW preference revision %d -> %d", before, after)
+	}
+}
 
 func TestShelfCacheGroupingRankAndCatalogVisibility(t *testing.T) {
 	ctx := context.Background()

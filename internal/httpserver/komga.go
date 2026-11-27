@@ -489,19 +489,24 @@ func (s *Server) bookDTOs(r *http.Request, items []database.Book) ([]any, error)
 	for _, sr := range seriesMap {
 		seriesSlice = append(seriesSlice, sr)
 	}
+	for _, id := range seriesIDs {
+		if _, ok := seriesMap[id]; ok {
+			continue
+		}
+		series, err := s.store.SeriesByID(r.Context(), id)
+		if err != nil {
+			return nil, err
+		}
+		seriesMap[id] = series
+		seriesSlice = append(seriesSlice, series)
+	}
 	metaMap, err := s.store.SeriesMetadatas(r.Context(), seriesSlice)
 	if err != nil {
 		return nil, err
 	}
 	for _, item := range items {
-		series, ok := seriesMap[item.SeriesID]
-		if !ok {
-			series, err = s.store.SeriesByID(r.Context(), item.SeriesID)
-			if err != nil {
-				return nil, err
-			}
-		}
-		meta := metaMap[item.SeriesID]
+		series := seriesMap[item.SeriesID]
+		meta := metaMap[series.ID]
 		progress, hasProg := progresses[item.ID]
 		out = append(out, bookDTOWithProgressAndMeta(item, series, meta, progress, hasProg, bookMetas[item.ID]))
 	}

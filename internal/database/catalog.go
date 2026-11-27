@@ -620,6 +620,8 @@ func (s *Store) queryBooksPage(ctx context.Context, q BookQuery) ([]Book, int64,
 	seriesFTSReady := needSeriesFTS && s.ensureSearchFTSFresh(ctx, "s")
 	booksFTSReady := needBooksFTS && s.ensureSearchFTSFresh(ctx, "b")
 
+	cacheCount := q.SeriesID == "" && q.Search == "" &&
+		len(q.ReadListIDs)+len(q.ReadStatus)+len(q.Tags)+len(q.Authors) == 0
 	progMode := progressTableMode(q.ReadStatus)
 	if progMode != "" {
 		q.ReadStatus = nil
@@ -761,9 +763,22 @@ LEFT JOIN zip_indexes z ON z.book_id=p.id`
 		return []Book{}, total, nil
 	}
 
-	var total int64
 	countArgs := append(append([]any(nil), sourceArgs...), args...)
-	if err := s.db.QueryRowContext(ctx, "SELECT count(*)"+source+where, countArgs...).Scan(&total); err != nil {
+	count := func(ctx context.Context) (int64, error) {
+		var total int64
+		err := s.db.QueryRowContext(ctx, "SELECT count(*)"+source+where, countArgs...).Scan(&total)
+		return total, err
+	}
+	var total int64
+	var err error
+	if cacheCount {
+		// Use the same library intersection as the SQL filters, including personal visibility.
+		libraries, _ := intersectLibraryIDs(q.LibraryIDs, enabledLibs)
+		total, err = s.cachedBookCount(ctx, libraries, excludeNSFW, q.OneShot, count)
+	} else {
+		total, err = count(ctx)
+	}
+	if err != nil {
 		return nil, 0, err
 	}
 	if total == 0 {

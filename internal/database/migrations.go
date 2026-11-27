@@ -9,6 +9,15 @@ import (
 
 const createSeriesMetadataExtIndex = `CREATE INDEX IF NOT EXISTS idx_series_metadata_ext ON series_metadata(ext_source_id, ext_entry_id) WHERE ext_source_id <> ''`
 
+const userShowNSFWShelfRevisionTrigger = `
+CREATE TRIGGER IF NOT EXISTS fk115_shelf_users_show_nsfw_update
+AFTER UPDATE OF show_nsfw ON users
+WHEN OLD.show_nsfw IS NOT NEW.show_nsfw AND (SELECT bulk_mode FROM shelf_revision WHERE id=1)=0
+BEGIN
+  UPDATE shelf_revision SET catalog=catalog+1 WHERE id=1;
+END;
+`
+
 const userHiddenLibrariesSchema = `
 CREATE TABLE IF NOT EXISTS user_hidden_libraries (
   user_id TEXT NOT NULL,
